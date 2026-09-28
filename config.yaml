@@ -1,0 +1,395 @@
+# FRIDAY configuration.
+# Everything here is safe to edit by hand; the daemon reloads on restart.
+
+daemon:
+  host: 127.0.0.1
+  port: 8765
+
+identity:
+  name: FRIDAY
+  wake_word: hey friday
+  user_name: ""          # how FRIDAY addresses you; blank = no name
+
+brain:
+  # Cosine similarity required to accept an intent match outright.
+  match_threshold: 0.62
+  # Below this, FRIDAY asks for clarification instead of guessing.
+  clarify_threshold: 0.45
+  embedding_model: BAAI/bge-small-en-v1.5
+
+permissions:
+  # Per-tier policy: auto | confirm | deny
+  # L0 read-only, L1 reversible write, L2 destructive, L3 external/irreversible
+  tiers:
+    L0: auto
+    L1: auto
+    L2: confirm
+    L3: confirm
+  # Highest tier an unattended (scheduled/triggered) job may execute.
+  unattended_ceiling: L1
+  # Tools listed here override their tier's default policy.
+  overrides: {}
+
+knowledge:
+  # Cosine similarity a document chunk needs to count as relevant.
+  match_threshold: 0.4
+  # Characters per chunk when splitting a document for embedding.
+  chunk_size: 1000
+  chunk_overlap: 150
+  # Safety cap when indexing a whole folder.
+  max_files: 500
+
+ocr:
+  # Full path to tesseract.exe; blank = autodetect via PATH / common Windows install dirs.
+  tesseract_cmd: ""
+  # Words below this OCR confidence (0-100) are dropped from the result.
+  min_confidence: 0
+
+browser:
+  # "chrome" = drive your real, installed Google Chrome (Playwright "channel"
+  # support) using FRIDAY's own profile below — never your normal signed-in
+  # Chrome profile. Blank = Playwright's bundled Chromium instead. Either way,
+  # if the requested channel isn't installed, FRIDAY falls back to bundled
+  # Chromium automatically rather than failing.
+  channel: chrome
+  # Run on-screen so you can see and take over a session (WhatsApp Web /
+  # ChatGPT login QR codes etc need this at least once).
+  headless: false
+  # Persistent profile — keeps you logged in between runs. Never read by
+  # FRIDAY or sent to any model; see friday/browser.py.
+  profile_dir: data/browser_profile
+  nav_timeout_ms: 20000
+  action_timeout_ms: 10000
+
+desktop_observer:
+  # Master switch for the `screen.observe` skill and the lightweight ambient
+  # context `plan.run` attaches to its planner prompt. Purely read-only —
+  # never moves the mouse, sends input, or performs any action, and never
+  # sends a screenshot or screen text anywhere off this machine.
+  enabled: true
+  # Off by default; screen.observe still works without it (deterministic
+  # window/OCR fields only). Saved to data/cache like screen.capture when on.
+  include_screenshot: false
+  # Needs Tesseract (see the ocr section below) — falls back to an empty,
+  # clearly marked result rather than failing when it isn't installed.
+  include_ocr: true
+  # Caps how much OCR text can flow into one observation, so a dense screen
+  # never turns into an oversized planner prompt.
+  max_ocr_chars: 1000
+  # Caps how many open windows are listed per observation.
+  max_windows: 20
+
+llm:
+  # Local-only provider. Requires Ollama installed and running separately:
+  # https://ollama.com/download — `ollama serve`, then `ollama pull <model>`.
+  provider: ollama
+  base_url: http://localhost:11434
+  # Blank = no default; callers must name a model they know is pulled.
+  model: "qwen2.5:3b"
+  temperature: 0.3
+  timeout_s: 60.0
+  # Phase 21.0: the context window (tokens) requested from Ollama on EVERY chat
+  # call (one central value: Ollama reloads the model when the window changes, so
+  # per-caller sizes would thrash a 4 GB GPU). Ollama's own default here is 4096
+  # and it SILENTLY truncates a longer prompt — measured: a 4337-token planner
+  # prompt was cut to 2050 tokens. 6144 truncated none of six production-shaped
+  # prompts (worst 4935 tokens), costs ~74 MiB more VRAM and no measurable speed
+  # (~21 ms/generated token at 4096, 6144 and 8192). 0 = send nothing (Ollama's
+  # default). Verify it reached Ollama with `ollama ps` (CONTEXT column).
+  num_ctx: 6144
+
+planner:
+  # Master switch for `plan.run` — the LLM-driven multi-step bridge.
+  enabled: true
+  # Phase 16.0: raised 8 -> 16 -- 8 left zero headroom for a real, entirely
+  # safe 12-step task (proven by scripts/smoke_long_horizon.py scenario D).
+  max_steps: 16
+  # Above Session's 60s confirmation wait, so a step needing human confirmation
+  # doesn't get timed out by the orchestrator before you can answer it.
+  step_timeout_s: 90.0
+  # Hard ceiling on the whole run, independent of max_steps * step_timeout_s.
+  total_timeout_s: 300.0
+  # Blank = use llm.model above. Provider is already global (llm.provider).
+  model: ""
+  # Phase 10: how many times a failed step is forgiven and replanned (the
+  # loop continues so the model can see the failure and try something else)
+  # instead of stopping the plan outright. A permission denial is never
+  # replanned regardless of this setting.
+  # Phase 16.0: raised 0 -> 2 -- proven too restrictive by
+  # scripts/smoke_long_horizon.py scenario I (a real, ordinary transient
+  # failure failed the whole plan outright, discarding real prior progress).
+  # Still bounded, never more than 2 forgiven failures per goal.
+  max_replans: 2
+  # Phase 11.3: upper bound on how many bounded subgoals a decomposed
+  # multi-step goal can be broken into before adaptive per-action execution
+  # takes over. Not every goal decomposes at all — see
+  # friday.intelligence.goals.looks_decomposable.
+  max_subgoals: 8
+  # Phase 20.0: intent -> action alignment (friday/intent.py). The planner's
+  # tool must fit the KIND of action your own request asked for: "inspect my
+  # project" can read and observe, but cannot click, type, write, delete or send
+  # even though L1 tools are auto-approved. Checked BEFORE permission and
+  # confirmation, never instead of them.
+  #   intent_guard         master switch (false = the pre-Phase-20 behaviour)
+  #   intent_prefilter     also hide out-of-scope tools from the model's prompt
+  #   max_intent_rejections  mismatched decisions one run may burn before it stops
+  intent_guard: true
+  intent_prefilter: true
+  max_intent_rejections: 3
+  # Phase 21.0: goal coverage & completion semantics (see PLAN.md Phase 21.0).
+  #   goal_coverage       a multi-part request ("check the time and battery") is split into
+  #                       its own parts; a premature "done" — or an evidence-driven stop —
+  #                       is not trusted while a part has no real evidence. A look-only
+  #                       request (nothing acting authorized) that already has its answer
+  #                       stops on its own instead of waiting for the model to say done.
+  #   max_coverage_nudges how many times one run may send a premature "done" back (then
+  #                       the planner is believed — coverage is keyword-based)
+  #   continuation_reads  "read more" / "next page" advances a page cursor instead of being
+  #                       blocked as an identical read (reads only; never a state-changing call)
+  #   scope_expansion     your own explicit follow-up ("yes, fix it") may widen the previous
+  #                       read-only goal's scope — same goal; every action still passes
+  #                       alignment, permission and confirmation
+  #   prompt_budget       before each planner call, shrink the prompt (ambient context, then
+  #                       old history, then tool descriptions — never the goal, tool names,
+  #                       arguments, scope, or your own instruction) to fit llm.num_ctx x
+  #                       prompt_budget_fraction; chars_per_token is the size estimate
+  goal_coverage: true
+  max_coverage_nudges: 1
+  continuation_reads: true
+  scope_expansion: true
+  prompt_budget: true
+  prompt_budget_fraction: 0.85
+  chars_per_token: 3.5
+  # Phase 22.0:
+  #   postcondition_verify  after a state-changing tool reports success, read the real state
+  #                         back (volume, window, schedule, memory...) — a step is verified,
+  #                         failed, or explicitly UNVERIFIED (no reliable read-back), never
+  #                         assumed. verify_timeout_s bounds one read-back.
+  #   tool_data_excerpts    the planner sees a bounded, secret-redacted excerpt of what a tool
+  #                         really returned (per step / whole prompt, in characters); 0 = off
+  #   semantic_repeat_guard the repeat guard compares what a call DOES (normalised paths/urls,
+  #                         a size cap on a paged read is ignored), not how it is spelled
+  #   confirmation_guard    a bare "yes" / "yes, fix it" with nothing to refer to asks what you
+  #                         mean instead of being matched to an unrelated skill (meta.undo)
+  postcondition_verify: true
+  verify_timeout_s: 4.0
+  tool_data_excerpts: true
+  tool_data_step_chars: 500
+  tool_data_total_chars: 1500
+  semantic_repeat_guard: true
+  confirmation_guard: true
+
+intelligence:
+  # Phase 10: bounded state/memory/experience layer — see friday/intelligence/.
+  # Every value below is a cap, not a feature switch.
+  max_recent_actions: 20
+  max_recent_results: 20
+  max_failures: 10
+  max_conversation_turns: 10
+  working_memory_max_chars: 400
+  working_memory_max_facts: 3
+  episode_retrieval_k: 3
+  episode_retrieval_threshold: 0.5
+  # Phase 11.1: experience retrieval fed into plan.run's planner context.
+  experience_enabled: true
+  experience_max_episodes: 3
+  experience_context_max_chars: 4000
+  # Phase 11.5: proactive situational intelligence — see
+  # friday/intelligence/proactive.py. Conservative defaults: at most one
+  # notification per fingerprint every 5 minutes, at most 3 in 15 minutes.
+  proactive_enabled: true
+  proactive_cooldown_seconds: 300
+  proactive_max_notifications: 3
+  proactive_window_minutes: 15
+
+voice:
+  enabled: true
+  # Press to talk — listens, transcribes, runs the command, speaks the result.
+  # Unrelated to the ctrl+alt+space command-bar hotkey (friday/gui/app.py).
+  activation_hotkey: "ctrl+alt+v"
+  # Safety backstop on how long a spoken response can be, regardless of what
+  # a skill's speech text contains. Lowered 320 -> 200 in Phase 7P: dense
+  # enumerations were measured taking 30+ seconds to speak at 320.
+  max_speech_chars: 200
+  # Never keep raw microphone recordings unless you turn this on for debugging.
+  save_recordings: false
+  stt:
+    # faster-whisper model size. Phase 7 optimization (PLAN.md Phase 7P)
+    # benchmarked tiny/base/small on a TTS-synthesized test set on this
+    # machine: "small" was ~3x slower than "base" AND less accurate (it
+    # misheard "Chrome" as "Kroom" twice, base/tiny didn't) — no longer the
+    # default. "tiny" tied "base" on that benchmark and is ~2x faster still;
+    # try it with scripts/voice_mic_latency_test.py if you want lower latency
+    # and your real voice holds up. "base" stays the default as the safer
+    # bet for real-world noise/accent robustness a synthetic benchmark can't
+    # measure. Go back to "small" if you dictate long/complex queries by voice.
+    # Phase 10.X.3: a small synthetic (TTS) comparison also tried the
+    # English-only fine-tunes — "base.en" matched "base"'s latency but got a
+    # casual phrase ("bro open vs code") right where "base" mangled it to
+    # "brow"; "small.en" was 3-5x slower with no extra accuracy on that same
+    # tiny set. NOT changed here — this was 3 synthetic phrases, not real
+    # Hyderabad-accented speech. Try "base.en" yourself once you have real
+    # samples: `python scripts/voice_mic_latency_test.py --save-samples` then
+    # `python scripts/benchmark_stt.py --models base,base.en`.
+    model: base
+    language: en
+    # "cpu" is the default that's actually verified working on this machine —
+    # "cuda"/"auto" need the CUDA Toolkit's cuBLAS/cuDNN installed separately,
+    # not just a GPU being present. Falls back to CPU automatically either way.
+    device: cpu
+    compute_type: int8
+    # Whisper beam width. Benchmarking measured only ~5-10% latency difference
+    # between greedy (1) and the library's default of 5 for short commands on
+    # this CPU (the encoder dominates, not beam search) with no accuracy
+    # difference (PLAN.md Phase 7P) — don't expect this alone to fix latency.
+    beam_size: 1
+    # Phase 10.X.3: faster-whisper's own internal VAD pass before decoding,
+    # on top of the energy-based VAD that already trims the recording below.
+    # Candidate for trimming the trailing-silence hallucinations Whisper can
+    # produce — see scripts/benchmark_stt.py.
+    vad_filter: false
+    # Optional short domain-vocabulary hint (Whisper's initial_prompt).
+    # Blank = none. Only turn on if benchmark_stt.py shows it actually helps.
+    initial_prompt: ""
+    condition_on_previous_text: true
+    # Phase 10.X.5: known FRIDAY entity names biasing faster-whisper's decoder
+    # (via `hotwords`, friday/voice/vocabulary.py) toward hearing them
+    # correctly — a decode-time hint, not a post-hoc text replacement, so it
+    # can never put a word here the user didn't say. Empty list = no hint
+    # (same "blank = off" convention as initial_prompt above).
+    # Defaulted ON: `scripts/benchmark_stt.py --vocabulary default` against
+    # the 12 valid (non-contaminated) real-mic samples in
+    # data/voice_test_samples showed base model avg WER 0.208 -> 0.167 with
+    # every already-correct sample staying correct, fixing the repeatedly-
+    # reported "open VS Code" -> "open me a score" mishearing. Still only 12
+    # samples from one sitting — re-run once a bigger/fresher sample set
+    # exists (see scripts/voice_mic_latency_test.py --fresh) and set this
+    # back to [] if it doesn't hold up.
+    vocabulary:
+      - FRIDAY
+      - VS Code
+      - WhatsApp
+      - Chrome
+      - Notepad
+      - Windows
+      - GitHub
+      - Python
+      - Ollama
+      - ChatGPT
+    # How long a silence has to run after speech before the utterance ends.
+    # Lowered from 1.2s -> 0.8s in Phase 7P to cut perceived latency; still
+    # long enough to survive a normal mid-sentence breath. Raise it back
+    # toward 1.2 if commands are getting cut off mid-sentence for you.
+    silence_timeout_s: 0.8
+    max_recording_s: 15
+    silence_rms_threshold: 0.012
+    # Utterances with less than this much actual speech are discarded as
+    # noise (a cough, a click) instead of being sent to Whisper.
+    min_speech_s: 0.25
+    # Audio kept from just before speech is detected and prepended to the
+    # recording, so a soft-onset word's first phoneme isn't clipped.
+    pre_roll_ms: 300
+    # Phase 10.X.4: use the bundled Silero VAD model (already downloaded for
+    # openWakeWord's own gating) to decide is_speech instead of the raw
+    # silence_rms_threshold compare. A 20-utterance real-mic test showed
+    # 13/20 captures running all the way to max_recording_s because this
+    # room's noise floor sat close enough to silence_rms_threshold that
+    # background noise alone kept resetting the silence timer — see
+    # friday/voice/vad_model.py. Falls back to RMS-threshold detection
+    # automatically if the model can't be loaded.
+    vad_enabled: true
+    # Minimum Silero VAD speech probability (0-1) to START an utterance.
+    # Validated against real recordings: speech scored 0.7-0.99, this room's
+    # background noise never scored above ~0.45.
+    vad_threshold: 0.5
+    # Lower threshold used to keep counting speech once an utterance has
+    # started — a word's probability trace dips mid-word, and a single
+    # shared threshold occasionally drops enough of those dips to undercount
+    # min_speech_s and wrongly reject a short, real command as noise.
+    vad_sustain_threshold: 0.35
+    input_device: null     # null = system default microphone
+  tts:
+    enabled: true
+    engine: sapi            # only adapter implemented so far (pyttsx3/SAPI5)
+    voice_id: ""            # blank = system default SAPI voice; see scripts/list_voices.py
+    rate: null               # null = engine default words-per-minute
+    volume: null             # 0.0-1.0; null = engine default
+  wakeword:
+    # Phase 8: always-listening activation ("FRIDAY, open Chrome" with no
+    # hotkey). See PLAN.md Phase 8A/8O — there is no pretrained "FRIDAY"
+    # wake-word model, so this is a placeholder phrase, not the word
+    # "FRIDAY" itself. Ctrl+Alt+V above always works regardless of this.
+    enabled: true
+    engine: openwakeword    # only adapter implemented so far
+    # One of openWakeWord's pretrained phrases: alexa, hey_jarvis,
+    # hey_mycroft, hey_rhasspy, timer, weather. Downloaded once (~6MB, needs
+    # internet that one time) into models_dir below, then fully offline.
+    model: hey_jarvis
+    # Minimum confidence (0-1) to count as a wake detection. Phase 10.X.2:
+    # raised from openWakeWord's 0.5 baseline to 0.6 — with strict wake-word
+    # gating (follow_up_enabled: false below) a false activation now runs
+    # whatever the mic is picking up as a real command, so this biases
+    # toward fewer false wakes over catching every marginal "hey jarvis".
+    threshold: 0.6
+    models_dir: ""          # blank = data/models/openwakeword
+    # Cooldown + buffer reset after returning to idle, so FRIDAY's own voice
+    # tail or room echo can't immediately re-trigger it.
+    cooldown_s: 1.5
+    # Phase 10.X.7/10.X.8: voice-specific verifier (a small local
+    # scikit-learn model trained on real "Hey Jarvis" recordings, see
+    # scripts/train_wake_verifier.py), layered on top of the pretrained model.
+    # Trained from data/wakeword_samples/20260913_234931_split/train (48 of
+    # the 60 real recordings; the other 12 were held out and never seen
+    # during training — see PLAN.md Phase 10.X.8). Measured on that held-out
+    # set: raises detection from 4/12 (33%, today's pretrained-only config at
+    # this same threshold) to 9/12 (75%) at ZERO observed false positives on
+    # silence/speech/noise, with no measurable added latency. Held-out
+    # recall did NOT reach the 95% target — see PLAN.md Phase 10.X.8 for why
+    # (3 of the 12 held-out clips have near-zero embedding signal from the
+    # pretrained model itself; no verifier can rescue a clip the base model
+    # never meaningfully scored in the first place). Blank = disabled,
+    # pretrained-model-only behavior.
+    verifier_model_path: "data/models/wake_verifier.pkl"
+    verifier_threshold: 0.1
+  # Phase 10.X.2: strict "Hey Jarvis" gating. false (the default) means every
+  # independent command needs its own wake word or Ctrl+Alt+V press — after
+  # FRIDAY finishes speaking, it goes straight back to wake-word standby
+  # instead of opening a no-wake-word listening window. Set true to restore
+  # the old behavior described by follow_up_timeout_s below.
+  follow_up_enabled: false
+  # After FRIDAY finishes speaking, how long the mic stays ready for a
+  # follow-up command with no wake word/hotkey needed (only applies when
+  # follow_up_enabled is true above). Silence for this long returns to idle
+  # quietly.
+  follow_up_timeout_s: 10.0
+  # How long to listen for a spoken answer after FRIDAY asks an L2/L3
+  # confirmation question ("...should I go ahead?").
+  confirm_listen_timeout_s: 12.0
+  # Pause after TTS finishes, before the follow-up window starts listening,
+  # so FRIDAY's own voice tail doesn't trip VAD.
+  post_tts_cooldown_s: 0.4
+  # Phase 10.X.3: short activation chime on "Hey Jarvis" (including
+  # mid-barge-in). Blank path = the bundled friday/assets/audio/wake_chime.wav.
+  wake_sound_enabled: true
+  wake_sound_path: ""
+  wake_sound_warmup_s: 0.85
+
+gui:
+  # Show the main window on launch instead of starting minimized to tray.
+  start_minimized: false
+  always_on_top: false
+  # Poll intervals for the desktop UI's state hub (milliseconds).
+  self_state_poll_ms: 300
+  task_state_poll_ms: 750
+  telemetry_poll_ms: 2000
+  desktop_context_poll_ms: 4000
+  # Desktop-context panel: include OCR text in the periodic observation.
+  # Off by default — OCR is the most expensive part of desktop_observer.observe().
+  desktop_context_include_ocr: false
+  # How long the core widget holds an ERROR look after an isolated failure
+  # before reverting to idle, since nothing else clears SelfStatus.FAILED.
+  error_hold_s: 4.0
+
+logging:
+  level: INFO
+  # Audit log is always written regardless of level.
