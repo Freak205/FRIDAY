@@ -294,6 +294,7 @@ class MainWindow(QMainWindow):
         self._hub.subsystemStatusChanged.connect(self._telemetry.update_subsystems)
         self._hub.telemetryUpdated.connect(self._telemetry.update_telemetry)
         self._hub.taskStateChanged.connect(self._task_panel.update_task_state)
+        self._hub.taskStateChanged.connect(self._command_bar.on_task_state)
         self._hub.orchestratorEvent.connect(self._task_panel.add_ticker_event)
         self._hub.desktopContextUpdated.connect(self._context_panel.update_context)
         self._hub.voiceRawState.connect(self._command_bar.on_voice_raw_state)

@@ -243,6 +243,27 @@ QPushButton#cancelLink:hover {{
     color: {ERROR};
 }}
 
+QPushButton#stopControl {{
+    background-color: transparent;
+    color: {ERROR};
+    border: 1px solid {ERROR};
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: {SIZE_MICRO}pt;
+    font-family: "{FONT_FAMILY_TECHNICAL}";
+    letter-spacing: 1px;
+}}
+
+QPushButton#stopControl:hover {{
+    background-color: {ERROR};
+    color: {WINDOW_BG};
+}}
+
+QPushButton#stopControl:disabled {{
+    color: {TEXT_DIM};
+    border-color: {TEXT_DIM};
+}}
+
 QLineEdit {{
     background-color: {PANEL_BG_RAISED};
     color: {TEXT_PRIMARY};

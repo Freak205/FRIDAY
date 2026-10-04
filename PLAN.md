@@ -17,41 +17,44 @@ confirmation/risk boundaries, remember safely, run unattended within explicit li
 immediately stoppable and auditable. Work proceeds one focused, fully tested milestone at a time. Everything
 after this section is the historical phase log; each phase's own section is the detailed record.
 
-**Current status (2026-10-01).**
+**Current status (2026-10-04).**
 
 | Area | State |
 |---|---|
 | Permission boundary | L0/L1 auto, L2/L3 confirm (`config.py`); per-call risk escalation; one Executor path; audit log; undo journal |
 | Unattended execution | `scheduler`/`trigger` actors capped at `unattended_ceiling` (L1) and never prompt; every goal bounded by `max_steps` 16, `total_timeout_s` 300, `max_replans` 2 |
-| Stopping | tray "Pause all jobs" + Quit; Esc / GUI CANCEL stop a *voice cycle*; a running goal stops only via the daemon's `POST /cancel` (see next milestone) |
+| Stopping | A running goal stops from the GUI STOP button, the global hotkey Ctrl+Alt+X, a typed "stop", or `POST /cancel` - all one path (`Session.stop`, Phase 28): no step starts after it, a coroutine step in flight is interrupted, a worker-thread step (e.g. `shell.run`) finishes first. Esc / GUI CANCEL still only abort a *voice cycle*; tray "Pause all jobs" + Quit |
 | Goal execution | `plan.run` orchestrator: decision layer (19), intent guard (20), coverage/budget (21), post-condition verification (22), evidence-grounded completion (23), answer grounding (24) |
 | Secret handling | tool-data, speech and memory redaction (22, 25); shell blocklist (25) |
 | Computer control | apps/windows, files incl. write/copy/move/delete/mkdir (26), shell, UI Automation incl. right-click/drag/scroll (26) with a wrong-target guard (27), Playwright browser seam (26), clipboard, OCR, system controls, scheduling |
 | Real-machine validation | UI Automation: automated live suite against real windows and real Calculator (27). File mutation: real temp-dir suite (26). Voice/GUI end-to-end: human checklists written, **not yet run by a human** (24-27) |
 
 **Completed major milestones.** Phases 1-23 (log below); 24 answer grounding; 25 safety-net hardening;
-26 computer-control primitives; 27 real-machine UI-automation validation + wrong-target guard.
+26 computer-control primitives; 27 real-machine UI-automation validation + wrong-target guard; 28 user-reachable
+stop for a running goal.
 
 **Remaining capability areas** (direction, not a task list):
-- *Safety & control:* a user-reachable stop for a running goal; later, a hard stop that also refuses new actions.
+- *Safety & control:* stop coverage for what Phase 28 does not reach (standalone routines/scheduled jobs, `shell.run`'s subprocess, a spoken "stop" while a goal runs); authentication of the local daemon API.
 - *Real-world validation:* human passes of the Phase 24-27 checklists; full-planner live runs of file/browser workflows.
 - *Reliable agency:* read-back verification for UI effects where a safe one exists (all `ui.*` are `UNVERIFIABLE` today).
 - *Autonomous recovery:* smarter retry/replan for tool failures, built on the existing bounded replan.
 - *Extensibility:* self-extension, deliberately deferred until sandboxing, approval, testing and registry boundaries exist.
 
-**Current highest-priority milestone: a user-reachable stop for a running goal.** Verified 2026-10-01:
-the only caller of `INTEL.request_cancel()` is the daemon's `POST /cancel`. The GUI CANCEL button
-(`command_bar._on_cancel_clicked`) and Esc (`voice/keys.py`) only abort a voice cycle, and no CLI,
-hotkey or voice command reaches the goal. A goal deleting files or driving the UI for up to 300 s can
-therefore be stopped from inside FRIDAY only by quitting it. The cooperative checkpoints already exist
-(Phase 16); the missing part is the user-facing control.
+**Current highest-priority milestone: not yet chosen** (re-inspect the repo first). Candidates found while
+building Phase 28, none started: (a) make `shell.run` killable (it runs `subprocess.run` in a worker
+thread, so a stop waits up to its 60 s timeout); (b) cover standalone routine/scheduled-job runs
+(`jobs.run_job`), which Phase 28's goal-scoped signal does not reach; (c) hear a spoken "stop" while a
+goal runs (the voice thread is blocked in `Backend.ask` for the whole goal); (d) daemon API
+authentication, which the user has deferred. Also `Backend.ask` times out at 120 s while a goal may
+run 300 s.
 
-**Deferred work.** Self-extension; recursive folder copy/move/delete (26); drag-timing hardening (27:
+**Deferred work.** Self-extension; daemon API authentication; recursive folder copy/move/delete (26); drag-timing hardening (27:
 one unexplained intermittent failure, not reproduced in 56 drags since).
 
 **Known cross-cutting limitations** (per-phase lists are in each section): `ui.*` effects are not read
 back; synthetic input can be disturbed by concurrent physical mouse use; 1-2 digit numbers are never
-grounded (24); the local 3B planner model bounds planning quality; human validation of 24-27 is pending.
+grounded (24); the local 3B planner model bounds planning quality; a stop cannot reverse what already ran or
+interrupt a worker-thread tool (28); human validation of 24-28 is pending.
 
 ---
 
@@ -8374,3 +8377,110 @@ root cause was not established.
 - No human has yet run the MANUAL_VALIDATION.md checklist for this phase.
 
 **Phase 27.0 real-machine UI-automation validation is complete.**
+
+
+---
+
+## Phase 28.0 — User-Reachable Stop for a Running Goal (2026-10-04)
+
+**Problem (verified in the code, not assumed).** A running multi-step goal could be cancelled only through the
+daemon's `POST /cancel`. The GUI CANCEL button and Esc only abort a *voice cycle*. The cooperative flag from
+Phase 16 (`INTEL.cancel_requested`, polled by `Orchestrator.run_goal`) was also incomplete:
+
+1. It was only checked at the top of the loop and after a planner reply - never between "a step was chosen" and
+   "it ran", and never while a step was running.
+2. A stop during a pending L2/L3 confirmation did nothing: the confirmation card stayed up, and a late "yes" would
+   still have executed the action after the user had asked to stop.
+3. A step that failed while a stop was pending was replanned around instead of ending the goal.
+4. The flag was armed even with nothing running, and cleared only when the next goal started.
+5. An interrupted/abandoned step left its audit row open; the "Cancelled." result said nothing about what had run.
+
+**Design: no second mechanism.** The existing signal and its one consumer are kept; every entry point now converges
+on one method and the orchestrator honours the signal at every boundary it can.
+
+- **One signal** (`friday/intelligence/state.py`): `INTEL.request_cancel()` now arms only while a goal is running
+  (returns whether it did), is idempotent and thread-safe (one bool write), and is cleared by `end_goal`. A stop
+  requested while idle can never cancel a later goal.
+- **One entry point** (`Session.stop(source)`, `friday/session.py`): arms the signal first, declines a waiting
+  confirmation through the normal `permission.declined` path, writes an audit row (`friday.stop`, with the source) and
+  a bus event, and returns a truthful, non-overclaiming message ("Stopping. No further steps will start.", or "There's
+  nothing running to stop."). It executes nothing and touches no permission check.
+- **Entry points** - all call it: the GUI **STOP** button (`CommandBar`, visible only while INTEL says a goal is
+  running, shows "STOPPING..." until it ends); the global hotkey **Ctrl+Alt+X** (`permissions.stop_hotkey`,
+  `RegisterHotKey` like the other hotkeys, so it works while another window is in front - exactly when the GUI is
+  out of reach); a typed/spoken **"stop"/"cancel"/"abort"/"emergency stop"** (a short exact list - "stop the music" and
+  "cancel my subscription" still route as commands - and only while a goal runs or a confirmation waits); and the
+  daemon's `POST /cancel`. `Backend.stop` sets the signal on the calling thread before scheduling anything on the
+  loop, so it lands even if the loop is busy.
+- **Orchestrator** (`friday/orchestrator.py`):
+  - `_run_step` is the last gate: no step is *started* once a stop is requested (covers `run_goal` and `run_plan`).
+  - `_run_cancellable` watches a step while it runs. A **coroutine** tool is cancelled (the `CancelledError` reaches the
+    tool) and given 2 s to unwind; a **worker-thread** tool (any plain-function skill, via `asyncio.to_thread`) cannot be
+    interrupted, so it is announced (`orchestrator.cancelling`, `interruptible=False`) and left to finish, still bounded
+    by `step_timeout_s`. The cancel check being absent leaves the old `asyncio.wait_for` path untouched.
+  - After every step, a pending stop ends the goal *before* the step is evaluated or replanned around.
+  - `_cancelled_summary` is the one place a stop becomes a result: how many steps had run and that nothing was undone,
+    which step was interrupted ("can't confirm whether it finished"), which could not be interrupted and ran to
+    completion, and which step was waiting for confirmation and did not run.
+- **Executor** (`friday/permissions.py`): a `CancelledError` closes the audit row as "interrupted before it finished
+  (cancelled)", records the action as `cancelled`, and keeps propagating. Permission, confirmation and the unattended
+  ceiling are unchanged.
+
+**What can and cannot be interrupted (stated, not implied).**
+
+| Situation | Behaviour |
+|---|---|
+| A future planned step / a model reply arriving after the stop | never started / discarded |
+| A step waiting for confirmation | declined (never executed), card dismissed |
+| A coroutine skill running (browser, screen.observe, routine.run, ...) | cancelled at its next `await`; reported as "interrupted - can't confirm whether it finished" |
+| A plain-function skill running in a worker thread (almost all of apps/files/ui/system/shell) | **not interruptible**: it runs to completion (<= `step_timeout_s`; `shell.run` <= 60 s), then the goal stops; the result says so |
+| An external subprocess already launched (e.g. the PowerShell behind `shell.run`) | **not stopped** - nothing in FRIDAY holds a handle to kill it |
+| Anything already done | **not undone** (use `meta.undo` where an inverse exists) |
+
+**Tests and results.**
+
+- `scripts/smoke_stop_control.py` (new, deterministic, 8 scenarios): **80/80** - the signal; no step starts after a
+  stop (loop top, `_run_step` gate, `run_plan`, fail-then-stop not replanned); truthful summaries; async interruption
+  with the audit row; a thread tool left to finish and reported as such; `Session.stop` idle/idempotent/confirmation
+  decline/phrase routing (12 phrases accepted, 11 near-misses refused); end-to-end through the real `plan.run` +
+  Executor + `Session` confirmation (controls: "yes" still runs the L2 step, "no" still declines it, the unattended
+  ceiling still denies; stop at the confirmation means the L2 body never ran, audit `denied`, Goal `CANCELLED`);
+  the daemon `/cancel`; the GUI button/hotkey wiring (offscreen Qt) and `Backend.stop` from a foreign thread.
+  Mutation check: **15/15** deliberately broken variants (gate removed, post-step check removed, interruptibility
+  inverted both ways, task never cancelled, summary dropping "nothing was undone", audit left open, confirmation not
+  declined, idle arming, flag not cleared, prefix-matching stop phrases, typed stop ignored, daemon bypass, STOP never
+  hiding, `run_plan` ignoring it) were all caught.
+- `scripts/smoke_stop_live.py` (new; **automated live, not human validation**): real qwen2.5:3b planning a multi-step
+  read-only goal through the real `plan.run`/Executor/`Session` with every real non-L0 skill hard-denied; a stop on the
+  first started step. 3/3 runs conclusive and passed (no skill started after the stop, goal `cancelled`/not ok, Goal row
+  `CANCELLED`, INTEL clean). In all three the stop landed while the model was planning its next step (the battery read
+  had finished), so this validates "stop during planning", **not** interruption of a running tool - that is covered only
+  by the deterministic suite. Also real-OS: `RegisterHotKey` + `SendInput` of Ctrl+Alt+X armed the signal for a running
+  goal and armed nothing when idle. It wrote 3 cancelled Goal rows to the real FRIDAY database, as earlier live suites do.
+- Regression (all unchanged / green): `regression.py` 94/94 intent matches, 14/14 executions; postconditions 196/196;
+  intent_action_alignment 353/353; tool_data 139/139; confirmation_routing 201/201; long_horizon (incl. its Phase 16
+  cancellation scenario), orchestrator, plan, registry, daemon, intelligence, goal coverage 108, scope expansion 114,
+  semantic repeat 71, open-ended 69, evidence-grounded goals 85; Phase 24 suites (111, 77, 32, 40, 45, 37); Phase 25
+  (14, 13, 38); Phase 26 (38, 10); Phase 27 `smoke_ui_automation` 58/58. `smoke_intent_routing` passed this time
+  (the earlier intermittent exit 139 did not recur; not investigated).
+- **Pre-existing failures, not caused by this phase** (identical on a clean checkout of the previous commit):
+  `smoke_context_budget`, `smoke_browser`, `smoke_project`, and `smoke_apps` (depends on real OS foreground state;
+  its failing lines differ slightly between runs). `smoke_pagination` failed once during this work because I had added
+  an error code to `NOT_EXECUTED_ERRORS`; that was unnecessary and was reverted - it passes.
+
+**Phases 24-27 intact.** None of their code paths were edited; their suites above pass with unchanged counts.
+
+**Known limitations (intentional; see the table above).**
+
+- Worker-thread tools and the subprocesses they launched cannot be interrupted, so a stop can take up to the tool's
+  own timeout (`shell.run` 60 s); the stop button shows "STOPPING..." meanwhile. Making `shell.run` killable is a
+  separate change.
+- The signal is goal-scoped: a standalone `routine.run`/scheduled job (`jobs.run_job`) is not covered unless it is a
+  step of a goal (then it is a coroutine step and is cut at its next `await`).
+- A spoken "stop" cannot be heard while a goal runs: the voice thread is blocked in `Backend.ask` for the whole goal
+  (barge-in only listens during TTS). Use the button, Ctrl+Alt+X, or typed "stop".
+- The Ctrl+Alt+X hotkey is skipped (logged) if another application already owns it; `permissions.stop_hotkey` changes
+  or disables it.
+- The daemon API still has no authentication (deferred by request).
+- The GUI STOP button, the hotkey in the real running GUI, and a stop at a real confirmation card were **not**
+  exercised by a human: see `MANUAL_VALIDATION.md` (Phase 28.0 checklist, all boxes unchecked).

@@ -157,6 +157,10 @@ def run() -> None:
     # wait on `backend.ready`, so this stays fast, matching how
     # `friday/desktop.py` (superseded) always sequenced it.
     HOTKEYS.bind(HOTKEY, window.toggle_visibility)
+    if CFG.permissions.stop_hotkey:
+        # Phase 28.0: emergency stop for a running goal. wait=False: the hotkey thread must
+        # never block on the backend loop.
+        HOTKEYS.bind(CFG.permissions.stop_hotkey, lambda: backend.stop(source="hotkey", wait=False))
     _start_voice(backend, hub)
     HOTKEYS.start()
     HOTKEYS.wait_ready(timeout=2.0)

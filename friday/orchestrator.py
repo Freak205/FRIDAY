@@ -78,6 +78,11 @@ StopReason = Literal[
 # them out via this one set.
 NOT_EXECUTED_ERRORS = frozenset({"repeated_call", "intent_mismatch"})
 
+# Phase 28.0 -- stop requests. How often a step in flight notices a stop request, and how
+# long an interrupted step is given to unwind before it is abandoned and reported as such.
+_CANCEL_POLL_S = 0.2
+_UNWIND_S = 2.0
+
 # Steps that were attempted but whose outcome says nothing about world state
 # (refused/declined/never dispatched), so they can't make an earlier read stale.
 _NO_EFFECT_ERRORS = frozenset({"PermissionError_", "confirmation_declined", "tool_not_allowed"}) | NOT_EXECUTED_ERRORS
@@ -392,6 +397,47 @@ def _summarize(observations: list[Observation], goal: str | None = None) -> str:
     return text[:600] or "Done, no details reported."
 
 
+def _blocking_tool(tool: str) -> bool:
+    """Phase 28.0: can this tool NOT be interrupted once it has started? A registry skill
+    written as a plain function runs in a worker thread (`Skill.__call__`), and Python cannot
+    stop a running thread, nor the subprocess / Win32 call inside it -- cancelling the await
+    would only abandon it while it carries on. A coroutine skill is interrupted at its next
+    await. A tool the registry doesn't know (a test runner) is a plain coroutine."""
+    from friday.registry import REGISTRY
+
+    skill = REGISTRY.get(tool)
+    return skill is not None and not skill.is_async
+
+
+def _cancelled_summary(observations: list[Observation]) -> str:
+    """Phase 28.0: what a stop request actually left behind, in plain words. It says what ran
+    (and that none of it was undone), which step was cut off mid-run, and which step could not
+    be interrupted and so finished anyway -- never "cancelled" alone, and never a claim that
+    stopping reversed anything."""
+    ran = [o for o in observations if o.error not in _NO_EFFECT_ERRORS]
+    held = [o for o in observations if o.error == "confirmation_declined"]
+    cut = [o for o in ran if o.error == "interrupted"]
+    finished = [o for o in ran if o.error != "interrupted"]
+    parts = ["Stopped."]
+    if not ran:
+        parts.append("Nothing had run yet.")
+    if finished:
+        names = ", ".join(dict.fromkeys(o.step.tool for o in finished))[:200]
+        n = len(finished)
+        parts.append(f"{n} step{'s' if n != 1 else ''} had already run ({names}); nothing was undone.")
+    for o in cut:
+        parts.append(f"'{o.step.tool}' was interrupted while running, so I can't confirm whether it finished.")
+    for o in finished:
+        if (o.data or {}).get("finished_after_stop_request"):
+            parts.append(
+                f"'{o.step.tool}' was already running and can't be interrupted, so it ran to completion "
+                f"({'ok' if o.ok else 'it failed'})."
+            )
+    for o in held:
+        parts.append(f"'{o.step.tool}' was waiting for confirmation and did not run.")
+    return " ".join(parts)
+
+
 def _found_so_far(observations: list[Observation]) -> str:
     """A truthful tail for a run that stopped early: what the steps that really
     ran did find (never the synthetic blocked/rejected observations), so a stop
@@ -485,8 +531,11 @@ class Orchestrator:
 
     # -- explicit plan ---------------------------------------------------------
 
-    async def run_plan(self, goal: str, steps: list[PlanStep]) -> OrchestratorResult:
-        """Execute a caller-supplied sequence of steps, stopping at the first failure."""
+    async def run_plan(
+        self, goal: str, steps: list[PlanStep], *, cancel_check: Callable[[], bool] | None = None,
+    ) -> OrchestratorResult:
+        """Execute a caller-supplied sequence of steps, stopping at the first failure (or, when
+        `cancel_check` is given, at a stop request -- Phase 28.0, see `_run_step`)."""
         if len(steps) > self.max_steps:
             return OrchestratorResult(
                 goal, [], False,
@@ -498,8 +547,11 @@ class Orchestrator:
         await BUS.publish("orchestrator.start", goal=goal, steps=len(steps), actor=self.actor)
 
         for step in steps:
-            obs, stop = await self._run_step(step)
-            observations.append(obs)
+            obs, stop = await self._run_step(step, cancel_check=cancel_check)
+            if obs.error != "cancelled_before_start":
+                observations.append(obs)
+            if stop == "cancelled":
+                return await self._cancelled_result(goal, observations, 0)
             if stop is not None:
                 await BUS.publish(
                     "orchestrator.done", goal=goal, ok=False, stopped=stop, actor=self.actor
@@ -670,10 +722,7 @@ class Orchestrator:
         while steps_left > 0:
             steps_left -= 1
             if cancel_check is not None and cancel_check():
-                await BUS.publish("orchestrator.done", goal=goal, ok=False, stopped="cancelled", actor=self.actor)
-                return OrchestratorResult(
-                    goal, observations, False, "Cancelled.", "cancelled", subgoal_idx,
-                )
+                return await self._cancelled_result(goal, observations, subgoal_idx)
 
             evidence_hint = ""
             turn_coverage_hint = ""
@@ -821,10 +870,7 @@ class Orchestrator:
             if outcome.cancelled:
                 # Phase 19.0: a reply that arrives after cancellation is
                 # discarded here, before it can become an executed step.
-                await BUS.publish("orchestrator.done", goal=goal, ok=False, stopped="cancelled", actor=self.actor)
-                return OrchestratorResult(
-                    goal, observations, False, "Cancelled.", "cancelled", subgoal_idx,
-                )
+                return await self._cancelled_result(goal, observations, subgoal_idx)
 
             if outcome.decision is None:
                 # INVALID_DECISION that the bounded repair didn't fix. Nothing
@@ -1056,9 +1102,15 @@ class Orchestrator:
                 subgoal=subgoals[subgoal_idx].description if subgoals else "",
                 expected_outcome=decision.expected_outcome,
             )
-            obs, stop = await self._run_step(step)
-            obs.fingerprint = fingerprint
-            observations.append(obs)
+            obs, stop = await self._run_step(step, cancel_check=cancel_check)
+            if obs.error != "cancelled_before_start":
+                obs.fingerprint = fingerprint
+                observations.append(obs)
+            if stop == "cancelled" or (cancel_check is not None and cancel_check()):
+                # Phase 28.0: a stop request that landed while the step ran (or that cut it
+                # off) ends the goal HERE -- before the step is evaluated, replanned around
+                # or followed by another decision -- whatever the step's own outcome was.
+                return await self._cancelled_result(goal, observations, subgoal_idx)
             step_eval = evaluator.evaluate_step(obs)
             if subgoals and step_eval.verdict == evaluator.Verdict.FAILURE:
                 subgoals[subgoal_idx].recovery_attempts += 1
@@ -1084,6 +1136,18 @@ class Orchestrator:
         return OrchestratorResult(
             goal, observations, False,
             f"Reached the {self.max_steps}-step limit without finishing.", "step_limit", subgoal_idx,
+        )
+
+    async def _cancelled_result(
+        self, goal: str, observations: list[Observation], subgoal_idx: int,
+    ) -> OrchestratorResult:
+        """The one place a stop request becomes a result (Phase 28.0)."""
+        executed = sum(1 for o in observations if o.error not in NOT_EXECUTED_ERRORS)
+        await BUS.publish(
+            "orchestrator.done", goal=goal, ok=False, stopped="cancelled", actor=self.actor, executed=executed,
+        )
+        return OrchestratorResult(
+            goal, observations, False, _cancelled_summary(observations), "cancelled", subgoal_idx,
         )
 
     # -- goal decomposition (Phase 11.2) -----------------------------------------
@@ -1786,7 +1850,58 @@ class Orchestrator:
 
     # -- shared step execution --------------------------------------------------
 
-    async def _run_step(self, step: PlanStep) -> tuple[Observation, StopReason | None]:
+    async def _run_cancellable(
+        self, step: PlanStep, cancel_check: Callable[[], bool],
+    ) -> SkillResult | None:
+        """Run the step like `asyncio.wait_for(runner, step_timeout_s)`, but notice a stop request
+        while it runs (Phase 28.0). Returns the step's result, or None when the step was
+        interrupted. A coroutine tool is cancelled and given `_UNWIND_S` to unwind; a tool that
+        runs in a worker thread cannot be interrupted, so it is announced and left to finish
+        (bounded, as ever, by `step_timeout_s`). The stop request itself never skips the
+        Executor: the step was already past permission/confirmation or is not started at all."""
+        loop = asyncio.get_running_loop()
+        task = asyncio.ensure_future(self.runner(step.tool, step.args, self.actor))
+        deadline = loop.time() + self.step_timeout_s
+        noticed = False
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    task.cancel()
+                    await asyncio.wait({task}, timeout=_UNWIND_S)
+                    raise asyncio.TimeoutError
+                done, _ = await asyncio.wait({task}, timeout=min(_CANCEL_POLL_S, remaining))
+                if done:
+                    result = task.result()
+                    if noticed:
+                        result.data = {**(result.data or {}), "finished_after_stop_request": True}
+                    return result
+                if not noticed and cancel_check():
+                    noticed = True
+                    interruptible = not _blocking_tool(step.tool)
+                    await BUS.publish(
+                        "orchestrator.cancelling", tool=step.tool, interruptible=interruptible, actor=self.actor,
+                    )
+                    if interruptible:
+                        task.cancel()
+                        await asyncio.wait({task}, timeout=_UNWIND_S)
+                        return None
+                    log.info("stop requested during %s: worker-thread tool, waiting for it to finish", step.tool)
+        except asyncio.CancelledError:
+            task.cancel()  # the whole run was cancelled/timed out: never leave the step running behind it
+            raise
+
+    async def _run_step(
+        self, step: PlanStep, cancel_check: Callable[[], bool] | None = None,
+    ) -> tuple[Observation, StopReason | None]:
+        # Phase 28.0: the last gate before execution. Whatever got a step this far (a plan
+        # decision, a slow model reply, a recovery replan), a step is never STARTED once a stop
+        # has been requested -- this is the one place that guarantees it, for run_goal and
+        # run_plan alike. Nothing ran, so the observation is not evidence (NOT_EXECUTED_ERRORS).
+        if cancel_check is not None and cancel_check():
+            obs = Observation(step, False, f"Stopped before running '{step.tool}'.", error="cancelled_before_start")
+            return obs, "cancelled"
+
         if self.tools is not None and step.tool not in self.tools:
             obs = Observation(
                 step, False, f"'{step.tool}' isn't an available tool for this task.",
@@ -1808,9 +1923,19 @@ class Orchestrator:
         await BUS.publish("orchestrator.step", tool=step.tool, args=step.args)
         started = time.perf_counter()
         try:
-            result = await asyncio.wait_for(
-                self.runner(step.tool, step.args, self.actor), timeout=self.step_timeout_s
-            )
+            if cancel_check is None:
+                result = await asyncio.wait_for(
+                    self.runner(step.tool, step.args, self.actor), timeout=self.step_timeout_s
+                )
+            else:
+                result = await self._run_cancellable(step, cancel_check)
+                if result is None:
+                    obs = Observation(
+                        step, False,
+                        f"'{step.tool}' was interrupted by a stop request; I can't confirm whether it finished.",
+                        {"status": "interrupted", "tool": step.tool}, error="interrupted",
+                    )
+                    return obs, "cancelled"
         except asyncio.TimeoutError:
             obs = Observation(step, False, f"'{step.tool}' timed out.", error="timeout")
             return obs, "timeout"

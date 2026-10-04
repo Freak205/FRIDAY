@@ -36,6 +36,10 @@ class PermissionsConfig(BaseModel):
     )
     unattended_ceiling: Tier = "L1"
     overrides: dict[str, Policy] = Field(default_factory=dict)
+    # Phase 28.0: global hotkey that stops the goal FRIDAY is running (works while another
+    # window is in front -- exactly when the GUI's own STOP button is out of reach). Blank
+    # disables it. Registered with RegisterHotKey, like the other hotkeys.
+    stop_hotkey: str = "ctrl+alt+x"
 
 
 class KnowledgeConfig(BaseModel):

@@ -117,6 +117,17 @@ class Backend:
         )
         return future.result(timeout=120)
 
+    def stop(self, *, source: str = "gui", wait: bool = True) -> Any:
+        """Stop the running goal. Safe from ANY thread (Qt, hotkey, voice). The stop signal
+        itself is set right here, on the calling thread, so it lands even if the backend loop
+        is momentarily busy; `Session.stop` then runs on the loop to decline a waiting
+        confirmation and do the bookkeeping. `wait=False` returns at once (the hotkey path)."""
+        from friday.intelligence.state import INTEL
+
+        INTEL.request_cancel()
+        future = asyncio.run_coroutine_threadsafe(SESSION.stop(source=source), self.loop)
+        return future.result(timeout=5) if wait else future
+
     def publish(self, topic: str, **data: Any) -> None:
         """Fire-and-forget a BUS event from a non-asyncio thread."""
         asyncio.run_coroutine_threadsafe(BUS.publish(topic, **data), self.loop)

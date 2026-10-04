@@ -106,6 +106,9 @@ class IntelligenceState:
     # stops cleanly with `stopped="cancelled"` instead of the blunter
     # asyncio-task-cancellation path. Reset whenever a new goal starts so a
     # stale request from a finished goal can never cancel the next one.
+    # Phase 28.0: it is also only ever ARMED while a goal is running and is
+    # cleared when that goal ends (see `request_cancel` / `end_goal`), so the
+    # one stop signal every layer polls can never be left set by accident.
     cancel_requested: bool = False
 
 
@@ -154,16 +157,28 @@ class IntelligenceStateManager:
     def end_goal(self, *, ok: bool, status: str = "") -> None:
         self.state.goal_status = status or ("succeeded" if ok else "failed")
         self.state.execution_status = "idle" if ok else "failed"
+        self.state.cancel_requested = False  # consumed: the goal it targeted is over
         self._touch()
 
     # -- cooperative cancellation (Phase 16.0) -------------------------------
 
-    def request_cancel(self) -> None:
-        """Ask whatever goal is currently running to stop at its next
-        checkpoint. Safe to call with no goal running (a no-op once the next
-        `start_goal` resets it)."""
+    @property
+    def goal_running(self) -> bool:
+        return self.state.goal_status == "running"
+
+    def request_cancel(self) -> bool:
+        """Ask whatever goal is currently running to stop: no further step
+        starts, and an interruptible step in flight is interrupted (see
+        `Orchestrator._run_step`). Returns True when a running goal was
+        signalled, False when there was nothing to stop — in which case
+        NOTHING is armed (Phase 28.0), so a request made while idle can never
+        cancel a later, unrelated goal. Idempotent and thread-safe (one bool
+        write), so a GUI/hotkey thread may call it directly."""
+        if not self.goal_running:
+            return False
         self.state.cancel_requested = True
         self._touch()
+        return True
 
     def is_cancel_requested(self) -> bool:
         return self.state.cancel_requested

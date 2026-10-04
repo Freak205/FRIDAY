@@ -56,6 +56,30 @@ _NO = {"no", "nope", "nah", "cancel", "stop", "don't", "dont", "never mind",
        "nevermind", "abort", "n"}
 
 
+# Phase 28.0: what, said ON ITS OWN, means "stop the goal that is running right now". Deliberately a
+# short exact list, not a pattern: "stop the music" / "cancel my subscription" are ordinary commands
+# and must keep routing as such. It only ever applies while a goal is running or a confirmation is
+# waiting (see `Session._stop_applies`) -- idle, these words route exactly as they always did.
+_STOP_PHRASES = frozenset({
+    "stop", "stop it", "stop that", "stop this", "stop now", "stop everything", "stop all",
+    "stop the task", "stop the goal", "stop the plan", "stop doing that", "stop doing this",
+    "stop what you are doing", "stop what youre doing", "stop whatever you are doing",
+    "cancel", "cancel it", "cancel that", "cancel this", "cancel the task", "cancel the goal",
+    "cancel the plan", "cancel everything", "abort", "abort it", "abort the task", "abort the goal",
+    "halt", "emergency stop",
+})
+_STOP_FILLER = frozenset({"hey", "friday", "please", "now"})
+
+
+def is_stop_phrase(text: str) -> bool:
+    words = re.sub(r"[^a-z ]", "", text.lower().replace("\u2019", "").replace("'", "")).split()
+    while words and words[0] in _STOP_FILLER:
+        words.pop(0)
+    while words and words[-1] in _STOP_FILLER:
+        words.pop()
+    return " ".join(words) in _STOP_PHRASES
+
+
 @dataclass(slots=True)
 class Pending:
     """Whatever FRIDAY is waiting on you for."""
@@ -160,10 +184,75 @@ class Session:
 
     # -- main entry point -----------------------------------------------------
 
+    # -- stop (Phase 28.0) ----------------------------------------------------
+
+    def _stop_applies(self) -> bool:
+        """A bare "stop" means this only while there is something to stop."""
+        try:
+            from friday.intelligence.state import INTEL
+
+            if INTEL.goal_running:
+                return True
+        except Exception:
+            log.exception("stop check failed (non-fatal)")
+        p = self.pending
+        return p is not None and p.kind == "confirm" and p.future is not None and not p.future.done()
+
+    async def stop(self, *, source: str = "user") -> SkillResult:
+        """The one stop entry point -- the GUI button, the global hotkey, the daemon's /cancel and a
+        typed/spoken "stop" all land here (Phase 28.0). It arms the single `INTEL` cancel flag the
+        orchestrator already polls (no second mechanism) and declines a confirmation that is still
+        waiting, so a stopped goal can't be revived by a late "yes". It never executes anything
+        itself and never touches permission checks. Idempotent: a repeat, or a stop with nothing
+        running, is a harmless no-op that says so.
+
+        What it does NOT do: reverse anything already done, or interrupt a step that runs in a
+        worker thread -- the goal's final result reports both, truthfully (see
+        `friday.orchestrator._cancelled_summary`)."""
+        from friday import audit
+        from friday.intelligence.state import INTEL
+
+        running = INTEL.request_cancel()  # first and unconditional: the part that must not fail
+        declined = False
+        pending = self.pending
+        if pending is not None and pending.kind == "confirm" and pending.future is not None and not pending.future.done():
+            pending.future.set_result(False)
+            self.pending = None
+            declined = True
+
+        if running or declined:
+            speech = "Stopping. No further steps will start."
+            if declined:
+                speech += " I declined the confirmation that was waiting."
+        else:
+            speech = "There's nothing running to stop."
+        try:
+            audit_id = audit.record(
+                actor=source, skill="friday.stop", tier="L0",
+                args={"goal_running": running, "declined_confirmation": declined}, decision="auto",
+            )
+            audit.complete(audit_id, ok=True, result=speech)
+        except Exception:
+            log.exception("stop audit failed (non-fatal)")
+        await BUS.publish(
+            "session.stop_requested", source=source, goal_running=running, declined_confirmation=declined,
+        )
+        log.info("stop requested via %s: goal_running=%s declined_confirmation=%s", source, running, declined)
+        return SkillResult(
+            speech=speech, ok=True,
+            data={"stopped": running or declined, "goal_running": running, "declined_confirmation": declined},
+        )
+
     async def handle(self, utterance: str, *, actor: str = "text") -> SkillResult:
         text = (utterance or "").strip()
         if not text:
             return SkillResult(speech="I didn't catch that.", ok=False)
+
+        # Phase 28.0: checked before anything else touches per-turn state (the follow-up slot,
+        # the recorded request), so a stop never clobbers the goal it is stopping.
+        if is_stop_phrase(text) and self._stop_applies():
+            await BUS.publish("session.heard", text=text, actor=actor)
+            return await self.stop(source=actor)
 
         self._turn_id = uuid.uuid4().hex[:12]
         followup, self._followup = self._followup, None

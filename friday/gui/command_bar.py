@@ -91,6 +91,16 @@ class CommandBar(QWidget):
         self._cancel_btn.hide()
         row.addWidget(self._cancel_btn)
 
+        # Phase 28.0: stops the GOAL FRIDAY is running (CANCEL above only aborts a voice
+        # cycle). Shown only while a goal runs (`on_task_state`); the global hotkey
+        # (`permissions.stop_hotkey`) does the same when this window isn't in front.
+        self._stop_btn = QPushButton("STOP")
+        self._stop_btn.setObjectName("stopControl")
+        self._stop_btn.setToolTip("Stop the task FRIDAY is running")
+        self._stop_btn.clicked.connect(self._on_stop_clicked)
+        self._stop_btn.hide()
+        row.addWidget(self._stop_btn)
+
         outer.addLayout(row)
 
     # -- wiring -------------------------------------------------------------------
@@ -138,3 +148,25 @@ class CommandBar(QWidget):
 
     def _on_cancel_clicked(self) -> None:
         voice_keys.request_cancel()
+
+    # -- stopping a running goal (Phase 28.0) ---------------------------------
+
+    def on_task_state(self, snapshot: dict) -> None:
+        """Fed by `GuiStateHub.taskStateChanged` (INTEL's own goal_status -- not a second state)."""
+        running = snapshot.get("goal_status") == "running"
+        if not running:
+            self._stop_btn.setEnabled(True)
+            self._stop_btn.setText("STOP")
+        self._stop_btn.setVisible(running)
+
+    def _on_stop_clicked(self) -> None:
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.setText("STOPPING…")
+
+        def work() -> None:
+            try:
+                self._backend.stop(source="gui")
+            except Exception:
+                pass  # the flag is set before anything that can fail (Backend.stop)
+
+        threading.Thread(target=work, daemon=True, name="gui-stop").start()

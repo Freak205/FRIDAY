@@ -134,17 +134,15 @@ async def invoke(body: Invoke) -> dict[str, Any]:
 
 @app.post("/cancel")
 async def cancel() -> dict[str, Any]:
-    """Ask whatever `plan.run` goal is currently running to stop at its next
-    checkpoint (Phase 16.0). Cooperative, not forced: the running `/say` (or
-    equivalent) request keeps its own task and returns normally, reporting
-    `stopped="cancelled"` with whatever evidence it already gathered — see
-    `friday.orchestrator.Orchestrator.run_goal`'s `cancel_check` parameter.
-    Safe to call with nothing running; it just arms a flag the next
-    `start_goal` clears."""
-    from friday.intelligence.state import INTEL
-
-    INTEL.request_cancel()
-    return {"ok": True, "speech": "Cancellation requested."}
+    """Ask whatever `plan.run` goal is currently running to stop (Phase 16.0;
+    unified with the GUI button / hotkey / typed "stop" in Phase 28.0 — all go
+    through `Session.stop`). No further step starts; a step in flight is
+    interrupted when it can be and otherwise finishes. Cooperative, not forced:
+    the running `/say` (or equivalent) request keeps its own task and returns
+    normally, reporting `stopped="cancelled"` with what it already did. Safe to
+    call with nothing running (nothing is armed) and safe to repeat."""
+    result = await SESSION.stop(source="daemon")
+    return {"ok": True, "speech": result.speech, "data": result.data}
 
 
 @app.post("/teach")

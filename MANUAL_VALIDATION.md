@@ -3268,3 +3268,73 @@ Worst first:
    way. This is an over-strict guard; note the app and the control's name.
 
 There is no kill switch for this guard, because it only ever refuses to send input it can't aim safely.
+
+
+---
+
+# FRIDAY — Phase 28.0 manual validation checklist
+
+Not yet run by a human. The automated suites (`smoke_stop_control.py`, `smoke_stop_live.py`) do not replace
+this: they never drove the real GUI window, a real confirmation card, or a long-running tool.
+
+Use read-only requests unless a test says otherwise. Start the GUI (`START.bat`).
+
+## Test 1 — STOP button during a multi-step goal
+
+1. Type: "Check my battery, then the volume, then which window is active, then list my Downloads folder, then
+   tell me today's date."
+2. While it is working, look next to the command box and click **STOP**.
+
+- [ ] A red STOP button appears only while the goal is running, and is gone when FRIDAY is idle
+- [ ] After the click it reads "STOPPING..." and cannot be clicked twice
+- [ ] The reply starts with "Stopped." and says how many steps had already run and that nothing was undone
+- [ ] No further step ran afterwards (`python run.py audit` shows nothing newer than the stop)
+
+## Test 2 — the global hotkey with another window in front
+
+1. Start the same request, then immediately click into another application so the FRIDAY window is covered.
+2. Press **Ctrl+Alt+X**.
+
+- [ ] The goal stops (bring FRIDAY forward: the reply starts with "Stopped.")
+- [ ] The keypress did nothing in the application that was in front
+- [ ] Pressing Ctrl+Alt+X with nothing running does nothing visible
+
+## Test 3 — stop while a confirmation is showing
+
+1. Ask for something that needs confirmation and is harmless, e.g. "create a folder called stoptest in
+   Documents" (confirm card appears).
+2. While the card is showing, press Ctrl+Alt+X (or type "stop").
+
+- [ ] The confirmation card closes
+- [ ] The folder was **not** created
+- [ ] The reply says the step was waiting for confirmation and did not run
+
+## Test 4 — typed "stop"
+
+1. Start a multi-step request, then type `stop` in the command box and press Enter.
+
+- [ ] The goal stops as in Test 1
+- [ ] Typing `stop` when nothing is running behaves exactly as before this phase (no new message, no error)
+
+## Test 5 — a tool that cannot be interrupted is reported honestly
+
+1. Ask: "Run `ping -n 20 127.0.0.1` in PowerShell" and approve the confirmation.
+2. Press STOP while it is running.
+
+- [ ] STOP shows "STOPPING..." and the goal ends only after the command finishes (up to 60 s)
+- [ ] The reply says the command could not be interrupted and ran to completion - it does **not** claim it was stopped
+
+## Test 6 — normal goals are unaffected
+
+1. Run a normal multi-step read-only request to completion without touching STOP.
+
+- [ ] It completes with its normal answer; STOP disappears afterwards
+
+## If something goes wrong
+
+1. **A step started after you asked to stop**, or a confirmed action ran after a stop. Note what ran and the time
+   (`python run.py audit`).
+2. **FRIDAY says it stopped something it did not** (e.g. the Test 5 command kept running with no mention).
+3. **STOP is missing during a goal, or stuck after it ended.**
+4. **The hotkey does nothing**: check the FRIDAY log (friday.log) for "could not register" (another app owns Ctrl+Alt+X) and
+   change `permissions.stop_hotkey` in `config.yaml`.

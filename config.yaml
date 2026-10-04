@@ -29,6 +29,9 @@ permissions:
   unattended_ceiling: L1
   # Tools listed here override their tier's default policy.
   overrides: {}
+  # Global emergency-stop hotkey: stops the goal FRIDAY is running (no further step
+  # starts; an interruptible step in flight is interrupted). Blank disables it.
+  stop_hotkey: "ctrl+alt+x"
 
 knowledge:
   # Cosine similarity a document chunk needs to count as relevant.

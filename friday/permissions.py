@@ -13,6 +13,7 @@ Tiers
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import time
 from collections.abc import Awaitable, Callable
@@ -209,6 +210,16 @@ class Executor:
         actor_token = _CURRENT_ACTOR.set(actor)
         try:
             result = await skill(**args)
+        except asyncio.CancelledError:
+            # Phase 28.0: the step was interrupted by a stop request (or the run's own timeout).
+            # Close the audit row honestly -- started, not known to have finished -- instead of
+            # leaving it open-ended, and let the cancellation keep propagating.
+            elapsed = int((time.perf_counter() - started) * 1000)
+            audit.complete(
+                audit_id, ok=False, error="interrupted before it finished (cancelled)", duration_ms=elapsed,
+            )
+            _record_action(skill.name, args, actor=actor, status="cancelled")
+            raise
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             audit.complete(audit_id, ok=False, error=str(exc), duration_ms=elapsed)
