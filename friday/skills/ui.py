@@ -14,6 +14,7 @@ Order of preference for controlling an app, most to least reliable:
 
 from __future__ import annotations
 
+import time
 from typing import Annotated, Any
 
 from friday.log import get
@@ -31,6 +32,11 @@ _INTERESTING = {
 }
 
 _MAX_NODES = 400  # hard cap: some apps have enormous trees
+
+_AIM_TRIES = 3  # a restore animation or a passing tooltip can briefly hide a control
+_AIM_WAIT_S = 0.15
+_MAX_HIT_DEPTH = 64
+_GA_ROOT = 2
 
 
 def _auto():
@@ -66,10 +72,16 @@ def _walk(control: Any, depth: int, max_depth: int, out: list[dict]) -> None:
                         (rect.left + rect.right) // 2,
                         (rect.top + rect.bottom) // 2,
                     ],
+                    "_control": child,
                 })
             _walk(child, depth + 1, max_depth, out)
         except Exception:
             continue
+
+
+def _public(nodes: list[dict]) -> list[dict]:
+    """Nodes without their live control handles, safe to return as tool data."""
+    return [{k: v for k, v in n.items() if not k.startswith("_")} for n in nodes]
 
 
 def _target_window(app: str):
@@ -116,6 +128,96 @@ def _find_control(window: Any, label: str, kind: str = ""):
     return (best if best_score >= 65 else None), nodes
 
 
+# Synthetic input lands on whatever is on screen at a point, not on the control we
+# matched by name — so it is only sent after re-checking what is actually there.
+
+
+def _bring_forward(window: Any) -> None:
+    """Raise `window` so synthetic input can reach it; a failure is left to the hit-test."""
+    try:
+        import win32gui
+
+        from friday.skills.apps import _focus_hwnd
+
+        hwnd = window.NativeWindowHandle
+        if hwnd and win32gui.GetForegroundWindow() != hwnd:
+            _focus_hwnd(hwnd)
+    except Exception:
+        log.debug("could not bring the window forward", exc_info=True)
+
+
+def _root_window_at(x: int, y: int) -> int:
+    import win32gui
+
+    hit = win32gui.WindowFromPoint((x, y))
+    return win32gui.GetAncestor(hit, _GA_ROOT) if hit else 0
+
+
+def _foreground_root() -> int:
+    import win32gui
+
+    fg = win32gui.GetForegroundWindow()
+    return win32gui.GetAncestor(fg, _GA_ROOT) if fg else 0
+
+
+def _visible_center(element: Any) -> tuple[int, int] | None:
+    try:
+        r = element.BoundingRectangle
+    except Exception:
+        return None
+    if r.right - r.left <= 0 or r.bottom - r.top <= 0:
+        return None
+    return (r.left + r.right) // 2, (r.top + r.bottom) // 2
+
+
+def _hit_reaches(auto: Any, point: tuple[int, int], element: Any) -> bool:
+    """Whether the element actually under `point` is `element` or one of its descendants."""
+    try:
+        hit = auto.ControlFromPoint(*point)
+        for _ in range(_MAX_HIT_DEPTH):
+            if hit is None:
+                return False
+            if auto.ControlsAreSame(hit, element):
+                return True
+            hit = hit.GetParentControl()
+    except Exception:
+        log.debug("hit-test failed", exc_info=True)
+    return False
+
+
+def _aim(auto: Any, node: dict) -> tuple[int, int] | str:
+    """Where synthetic input reaches `node`'s own control, or why no point safely does."""
+    element = node.get("_control")
+    reason = f"'{node['name']}' isn't visible on screen"
+    for attempt in range(_AIM_TRIES):
+        if attempt:
+            time.sleep(_AIM_WAIT_S)
+        point = _visible_center(element) if element is not None else None
+        if point is None:
+            reason = f"'{node['name']}' isn't visible on screen"
+        elif _hit_reaches(auto, point, element):
+            return point
+        else:
+            reason = f"'{node['name']}' is covered by another window"
+    return reason
+
+
+def _aim_window(window: Any) -> tuple[int, int] | str:
+    """The window's center, provided the window itself is what's on screen there."""
+    reason = "that window isn't visible on screen"
+    for attempt in range(_AIM_TRIES):
+        if attempt:
+            time.sleep(_AIM_WAIT_S)
+        point = _visible_center(window)
+        if point is None:
+            reason = "that window isn't visible on screen"
+        elif _root_window_at(*point) == window.NativeWindowHandle:
+            return point
+        else:
+            reason = "that window is covered by another window"
+    return reason
+
+
 # --------------------------------------------------------------------------
 
 
@@ -158,7 +260,7 @@ def inspect(
 
     return SkillResult(
         speech=" ".join(parts),
-        data={"window": window.Name, "controls": nodes},
+        data={"window": window.Name, "controls": _public(nodes)},
     )
 
 
@@ -192,23 +294,25 @@ def click(
             speech=f"I can't find '{label}'. I can see: {available}.", ok=False
         )
 
-    # Prefer the accessibility Invoke pattern; fall back to a real click.
-    auto = _auto()
+    data = {"clicked": node["name"], "type": node["type"]}
+    # The control's own Invoke pattern acts on that exact element, whatever covers it.
     try:
-        control = auto.ControlFromPoint(*node["center"])
-        if control and hasattr(control, "GetInvokePattern"):
-            control.GetInvokePattern().Invoke()
-        else:
-            raise AttributeError("no invoke pattern")
+        pattern = node["_control"].GetInvokePattern()
+        if pattern is not None and pattern.Invoke():
+            return SkillResult(speech=f"Clicked {node['name']}.", data=data)
     except Exception:
-        from friday import winput
+        log.debug("no usable invoke pattern on %r", node["name"], exc_info=True)
 
-        winput.click(*node["center"])
+    _bring_forward(window)
+    point = _aim(_auto(), node)
+    if isinstance(point, str):
+        return SkillResult(speech=f"I didn't click anything: {point}.", ok=False,
+                           data={"control": node["name"], "refused": point})
 
-    return SkillResult(
-        speech=f"Clicked {node['name']}.",
-        data={"clicked": node["name"], "type": node["type"]},
-    )
+    from friday import winput
+
+    winput.click(*point)
+    return SkillResult(speech=f"Clicked {node['name']}.", data=data)
 
 
 @skill(
@@ -241,18 +345,162 @@ def fill(
             ok=False,
         )
 
-    auto = _auto()
+    data = {"field": node["name"]}
+    try:
+        pattern = node["_control"].GetValuePattern()
+        if pattern is not None and pattern.SetValue(text):
+            return SkillResult(speech=f"Filled {node['name']}.", data=data)
+    except Exception:
+        log.debug("no usable value pattern on %r", node["name"], exc_info=True)
+
+    _bring_forward(window)
+    point = _aim(_auto(), node)
+    if isinstance(point, str):
+        return SkillResult(speech=f"I didn't type anything: {point}.", ok=False, data={**data, "refused": point})
+
     from friday import winput
 
-    try:
-        control = auto.ControlFromPoint(*node["center"])
-        control.GetValuePattern().SetValue(text)
-    except Exception:
-        winput.click(*node["center"])
-        winput.press("ctrl+a")
-        winput.type_text(text)
+    winput.click(*point)
+    time.sleep(0.05)
+    # Keystrokes go to whichever window has focus, not to a point.
+    if _foreground_root() != window.NativeWindowHandle:
+        reason = f"'{node['name']}' didn't get keyboard focus"
+        return SkillResult(speech=f"I didn't type anything: {reason}.", ok=False, data={**data, "refused": reason})
+    winput.press("ctrl+a")
+    winput.type_text(text)
+    return SkillResult(speech=f"Filled {node['name']}.", data=data)
 
-    return SkillResult(speech=f"Filled {node['name']}.", data={"field": node["name"]})
+
+@skill(
+    name="ui.right_click",
+    tier="L1",
+    action=CLICK_RULE,
+    description="Right-click a control by its visible name, opening its context menu",
+    examples=[
+        "right click save",
+        "right click on the file",
+        "open the context menu for this item",
+        "right click the desktop",
+        "show the right click menu for this icon",
+    ],
+)
+def right_click(
+    label: Annotated[str, "visible text of the control to right-click"],
+    app: Annotated[str, "window to act in, blank for the active one"] = "",
+    kind: Annotated[str, "optional control type filter, e.g. 'button'"] = "",
+) -> SkillResult:
+    window = _target_window(app)
+    if window is None:
+        return SkillResult(speech=f"I can't find a window for {app}.", ok=False)
+
+    node, nodes = _find_control(window, label, kind)
+    if node is None:
+        available = ", ".join(n["name"] for n in nodes[:6]) or "nothing readable"
+        return SkillResult(
+            speech=f"I can't find '{label}'. I can see: {available}.", ok=False
+        )
+
+    _bring_forward(window)
+    point = _aim(_auto(), node)
+    if isinstance(point, str):
+        return SkillResult(speech=f"I didn't right-click anything: {point}.", ok=False,
+                           data={"control": node["name"], "refused": point})
+
+    from friday import winput
+
+    winput.click(*point, button="right")
+
+    return SkillResult(
+        speech=f"Right-clicked {node['name']}.",
+        data={"clicked": node["name"], "type": node["type"]},
+    )
+
+
+@skill(
+    name="ui.drag",
+    tier="L1",
+    action="modify",
+    description="Drag one control onto another (e.g. drag a file onto a folder, reorder a list item)",
+    examples=[
+        "drag this file into that folder",
+        "drag the first item below the second",
+        "drag and drop this onto that",
+        "move this item to the top by dragging it",
+    ],
+    dry_run=lambda source, target, app="": f"Drag '{source}' onto '{target}'",
+)
+def drag(
+    source: Annotated[str, "visible text of the control to drag"],
+    target: Annotated[str, "visible text of the control to drop it onto"],
+    app: Annotated[str, "window to act in, blank for the active one"] = "",
+) -> SkillResult:
+    window = _target_window(app)
+    if window is None:
+        return SkillResult(speech=f"I can't find a window for {app}.", ok=False)
+
+    src_node, nodes = _find_control(window, source)
+    dst_node, _ = _find_control(window, target)
+    if src_node is None or dst_node is None:
+        missing = source if src_node is None else target
+        available = ", ".join(n["name"] for n in nodes[:6]) or "nothing readable"
+        return SkillResult(
+            speech=f"I can't find '{missing}'. I can see: {available}.", ok=False
+        )
+
+    _bring_forward(window)
+    auto = _auto()
+    src = _aim(auto, src_node)
+    dst = _aim(auto, dst_node) if not isinstance(src, str) else src
+    if isinstance(src, str) or isinstance(dst, str):
+        reason = src if isinstance(src, str) else dst
+        return SkillResult(speech=f"I didn't drag anything: {reason}.", ok=False,
+                           data={"source": src_node["name"], "target": dst_node["name"], "refused": reason})
+
+    from friday import winput
+
+    winput.drag(*src, *dst)
+
+    return SkillResult(
+        speech=f"Dragged {src_node['name']} onto {dst_node['name']}.",
+        data={"source": src_node["name"], "target": dst_node["name"]},
+    )
+
+
+@skill(
+    name="ui.scroll",
+    tier="L1",
+    action="modify",
+    description="Scroll a window up or down",
+    examples=[
+        "scroll down",
+        "scroll up a bit",
+        "scroll down this page",
+        "scroll to the bottom",
+        "scroll up in this window",
+    ],
+)
+def scroll(
+    direction: Annotated[str, "'up' or 'down'"] = "down",
+    amount: Annotated[int, "how many notches to scroll"] = 3,
+    app: Annotated[str, "window to act in, blank for the active one"] = "",
+) -> SkillResult:
+    window = _target_window(app)
+    if window is None:
+        return SkillResult(speech=f"I can't find a window for {app}.", ok=False)
+
+    _bring_forward(window)
+    point = _aim_window(window)
+    if isinstance(point, str):
+        return SkillResult(speech=f"I didn't scroll: {point}.", ok=False,
+                           data={"direction": direction, "refused": point})
+
+    from friday import winput
+
+    winput.move_mouse(*point)
+    sign = -1 if direction.strip().lower().startswith("down") else 1
+    winput.scroll(sign * abs(int(amount)))
+
+    return SkillResult(speech=f"Scrolled {direction}.", data={"direction": direction, "amount": amount})
 
 
 @skill(

@@ -1,12 +1,21 @@
-"""File skills: search and read.
+"""File skills: search, read, and (Phase 26) mutate.
 
 P0 walks your user folders directly. P1 swaps the backend for the Everything SDK,
 which makes full-disk search instant; the skill signatures stay the same.
+
+The mutation skills below (`write`, `copy`, `move`, `delete`, `mkdir`) reuse the
+same Executor/tier/confirmation/audit/undo architecture as every other skill —
+see friday.permissions and friday.undo — rather than a filesystem-specific
+mechanism. They deliberately stay out of `shell.run`'s reach: routing a file
+write through an arbitrary shell command would bypass the per-call risk
+classifiers below (e.g. "overwriting an existing file" escalating to a
+confirm), collapsing a specific, previewable operation into an opaque one.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Annotated
 
@@ -164,3 +173,196 @@ def reveal(
     else:
         subprocess.Popen(["explorer", str(p)])
     return SkillResult(speech=f"Opening {p.name} in Explorer.")
+
+
+def _overwrites(path: str, content: str = "") -> bool:
+    """Risk classifier for `write`: escalates only when it would destroy
+    existing content, matching browser.click's is_consequential pattern —
+    the tier stays L1 (reversible) for the common create-a-new-file case."""
+    return Path(path).expanduser().exists()
+
+
+def _dst_exists(src: str, dst: str) -> bool:
+    return Path(dst).expanduser().exists()
+
+
+@skill(
+    name="files.write",
+    tier="L1",
+    action="modify",
+    description="Create a new text file, or overwrite an existing one, with the given content",
+    examples=[
+        "create a text file called notes.txt",
+        "write this to a new file",
+        "save this text as a file on my desktop",
+        "make a file with this content",
+        "create a new file named todo.md with this",
+    ],
+    dry_run=lambda path, content="": (
+        f"{'Overwrite' if Path(path).expanduser().exists() else 'Create'} "
+        f"{path} with {len(content)} characters"
+    ),
+    risk=_overwrites,
+    undo=lambda path, content="": {"skill": "files.delete", "args": {"path": path}},
+)
+def write(
+    path: Annotated[str, "full path of the file to write"],
+    content: Annotated[str, "text content to write"] = "",
+) -> SkillResult:
+    p = Path(path).expanduser()
+    if not p.parent.exists():
+        return SkillResult(speech=f"There's no folder at {p.parent}.", ok=False)
+    if p.exists() and p.is_dir():
+        return SkillResult(speech=f"{p.name} is already a folder, not a file.", ok=False)
+
+    existed = p.exists()
+    try:
+        p.write_text(content, encoding="utf-8")
+    except Exception as exc:
+        return SkillResult(speech=f"I couldn't write that file: {exc}", ok=False)
+
+    verb = "Overwrote" if existed else "Created"
+    return SkillResult(speech=f"{verb} {p.name}.", data={"path": str(p), "overwritten": existed})
+
+
+@skill(
+    name="files.copy",
+    tier="L1",
+    action="modify",
+    description="Copy a file to a new location",
+    examples=[
+        "copy this file to my documents",
+        "make a copy of this file",
+        "duplicate this file to the desktop",
+        "copy report.docx into the backups folder",
+    ],
+    dry_run=lambda src, dst: f"Copy {src} to {dst}",
+    risk=_dst_exists,
+    undo=lambda src, dst: {"skill": "files.delete", "args": {"path": dst}},
+)
+def copy(
+    src: Annotated[str, "full path of the file to copy"],
+    dst: Annotated[str, "full path (or destination folder) to copy it to"],
+) -> SkillResult:
+    source = Path(src).expanduser()
+    if not source.exists():
+        return SkillResult(speech=f"There's no file at {src}.", ok=False)
+    if not source.is_file():
+        return SkillResult(speech=f"{source.name} is a folder — copy each file, or use a script for whole folders.", ok=False)
+
+    dest = Path(dst).expanduser()
+    if dest.is_dir():
+        dest = dest / source.name
+    if not dest.parent.exists():
+        return SkillResult(speech=f"There's no folder at {dest.parent}.", ok=False)
+
+    try:
+        shutil.copy2(source, dest)
+    except Exception as exc:
+        return SkillResult(speech=f"I couldn't copy that file: {exc}", ok=False)
+
+    return SkillResult(speech=f"Copied {source.name} to {dest}.", data={"src": str(source), "dst": str(dest)})
+
+
+@skill(
+    name="files.move",
+    tier="L1",
+    action="modify",
+    description="Move or rename a file",
+    examples=[
+        "move this file to my downloads",
+        "rename this file to final_report.docx",
+        "move invoice.pdf into the tax folder",
+        "rename notes.txt to meeting_notes.txt",
+    ],
+    dry_run=lambda src, dst: f"Move {src} to {dst}",
+    risk=_dst_exists,
+    undo=lambda src, dst: {"skill": "files.move", "args": {"src": dst, "dst": src}},
+)
+def move(
+    src: Annotated[str, "full path of the file to move"],
+    dst: Annotated[str, "full destination path (or folder) to move it to"],
+) -> SkillResult:
+    source = Path(src).expanduser()
+    if not source.exists():
+        return SkillResult(speech=f"There's no file at {src}.", ok=False)
+    if not source.is_file():
+        return SkillResult(speech=f"{source.name} is a folder — I can only move individual files.", ok=False)
+
+    dest = Path(dst).expanduser()
+    if dest.is_dir():
+        dest = dest / source.name
+    if not dest.parent.exists():
+        return SkillResult(speech=f"There's no folder at {dest.parent}.", ok=False)
+
+    try:
+        shutil.move(str(source), str(dest))
+    except Exception as exc:
+        return SkillResult(speech=f"I couldn't move that file: {exc}", ok=False)
+
+    return SkillResult(speech=f"Moved {source.name} to {dest}.", data={"src": str(source), "dst": str(dest)})
+
+
+@skill(
+    name="files.delete",
+    tier="L2",
+    action="delete",
+    description="Delete a file, or an empty folder",
+    examples=[
+        "delete this file",
+        "remove that pdf from my downloads",
+        "get rid of this file",
+        "delete the empty folder called old_drafts",
+        "erase draft.docx",
+    ],
+    dry_run=lambda path: f"Permanently delete {path}",
+)
+def delete(
+    path: Annotated[str, "full path of the file or empty folder to delete"],
+) -> SkillResult:
+    p = Path(path).expanduser()
+    if not p.exists():
+        return SkillResult(speech=f"There's nothing at {path}.", ok=False)
+
+    try:
+        if p.is_dir():
+            p.rmdir()  # refuses non-empty directories (OSError) — no recursive delete here
+        else:
+            p.unlink()
+    except OSError as exc:
+        if p.is_dir():
+            return SkillResult(speech=f"{p.name} isn't empty — I won't delete a folder full of files.", ok=False)
+        return SkillResult(speech=f"I couldn't delete that: {exc}", ok=False)
+
+    return SkillResult(speech=f"Deleted {p.name}.", data={"path": str(p)})
+
+
+@skill(
+    name="files.mkdir",
+    tier="L1",
+    action="modify",
+    description="Create a new folder",
+    examples=[
+        "create a folder called projects",
+        "make a new directory named archive",
+        "create a folder on my desktop called photos",
+        "make a subfolder called drafts",
+    ],
+    dry_run=lambda path: f"Create folder {path}",
+    undo=lambda path: {"skill": "files.delete", "args": {"path": path}},
+)
+def mkdir(
+    path: Annotated[str, "full path of the folder to create"],
+) -> SkillResult:
+    p = Path(path).expanduser()
+    if p.exists():
+        return SkillResult(speech=f"{p.name} already exists.", ok=False)
+    if not p.parent.exists():
+        return SkillResult(speech=f"There's no folder at {p.parent}.", ok=False)
+
+    try:
+        p.mkdir()
+    except Exception as exc:
+        return SkillResult(speech=f"I couldn't create that folder: {exc}", ok=False)
+
+    return SkillResult(speech=f"Created folder {p.name}.", data={"path": str(p)})

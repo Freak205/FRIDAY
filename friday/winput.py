@@ -161,5 +161,35 @@ def scroll(amount: int) -> None:
     ))
 
 
+def drag(x1: int, y1: int, x2: int, y2: int, *, steps: int = 12, delay: float = 0.015) -> None:
+    """Press at (x1, y1), move to (x2, y2) in small steps, then release.
+
+    The intermediate moves matter: some drop targets (sortable lists,
+    drag-to-reorder UI) only react to a real sequence of move events between
+    down and up, not a same-frame teleport.
+    """
+    move_mouse(x1, y1)
+    time.sleep(0.03)
+    _send(INPUT(
+        type=INPUT_MOUSE,
+        mi=MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=MOUSEEVENTF_LEFTDOWN,
+                      time=0, dwExtraInfo=None),
+    ))
+    time.sleep(delay)
+
+    steps = max(1, steps)
+    for i in range(1, steps + 1):
+        nx = x1 + (x2 - x1) * i // steps
+        ny = y1 + (y2 - y1) * i // steps
+        move_mouse(nx, ny)
+        time.sleep(delay)
+
+    _send(INPUT(
+        type=INPUT_MOUSE,
+        mi=MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=MOUSEEVENTF_LEFTUP,
+                      time=0, dwExtraInfo=None),
+    ))
+
+
 def screen_size() -> tuple[int, int]:
     return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)

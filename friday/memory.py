@@ -48,8 +48,17 @@ def remember(
     key: str | None = None,
     source: str = "user",
 ) -> int:
-    """Store a memory. Replaces an existing one with the same key."""
-    value = value.strip()
+    """Store a memory. Replaces an existing one with the same key.
+
+    Phase 25.0: run through the same redaction `friday.toolview` already applies to tool
+    output (`sanitize(..., prose=True)` — memories are free sentences, not `key=value`
+    tool data, so the prose-aware pass is needed) before it is embedded and stored, so
+    "remember my wifi password is upstairs123" is never kept as plaintext. Every other
+    subsystem that can see model/tool text already redacts it this way; memory was the one
+    place that didn't, despite its own canonical example being exactly this phrase."""
+    from friday import toolview
+
+    value = toolview.sanitize(value.strip(), prose=True)
     if not value:
         raise ValueError("empty memory")
     if kind not in KINDS:

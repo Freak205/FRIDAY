@@ -8,6 +8,53 @@ controls the entire machine, and runs tasks on schedules and triggers.
 
 ---
 
+## 0. Master roadmap (living; updated only when the project's actual state changes)
+
+**Master goal.** A reliable, safe, genuinely usable autonomous personal computer agent: understand a
+natural-language goal, plan and execute multi-step work across the computer, detect and recover from
+failure, verify the intended outcome actually happened, answer only from evidence, respect
+confirmation/risk boundaries, remember safely, run unattended within explicit limits, and stay
+immediately stoppable and auditable. Work proceeds one focused, fully tested milestone at a time. Everything
+after this section is the historical phase log; each phase's own section is the detailed record.
+
+**Current status (2026-10-01).**
+
+| Area | State |
+|---|---|
+| Permission boundary | L0/L1 auto, L2/L3 confirm (`config.py`); per-call risk escalation; one Executor path; audit log; undo journal |
+| Unattended execution | `scheduler`/`trigger` actors capped at `unattended_ceiling` (L1) and never prompt; every goal bounded by `max_steps` 16, `total_timeout_s` 300, `max_replans` 2 |
+| Stopping | tray "Pause all jobs" + Quit; Esc / GUI CANCEL stop a *voice cycle*; a running goal stops only via the daemon's `POST /cancel` (see next milestone) |
+| Goal execution | `plan.run` orchestrator: decision layer (19), intent guard (20), coverage/budget (21), post-condition verification (22), evidence-grounded completion (23), answer grounding (24) |
+| Secret handling | tool-data, speech and memory redaction (22, 25); shell blocklist (25) |
+| Computer control | apps/windows, files incl. write/copy/move/delete/mkdir (26), shell, UI Automation incl. right-click/drag/scroll (26) with a wrong-target guard (27), Playwright browser seam (26), clipboard, OCR, system controls, scheduling |
+| Real-machine validation | UI Automation: automated live suite against real windows and real Calculator (27). File mutation: real temp-dir suite (26). Voice/GUI end-to-end: human checklists written, **not yet run by a human** (24-27) |
+
+**Completed major milestones.** Phases 1-23 (log below); 24 answer grounding; 25 safety-net hardening;
+26 computer-control primitives; 27 real-machine UI-automation validation + wrong-target guard.
+
+**Remaining capability areas** (direction, not a task list):
+- *Safety & control:* a user-reachable stop for a running goal; later, a hard stop that also refuses new actions.
+- *Real-world validation:* human passes of the Phase 24-27 checklists; full-planner live runs of file/browser workflows.
+- *Reliable agency:* read-back verification for UI effects where a safe one exists (all `ui.*` are `UNVERIFIABLE` today).
+- *Autonomous recovery:* smarter retry/replan for tool failures, built on the existing bounded replan.
+- *Extensibility:* self-extension, deliberately deferred until sandboxing, approval, testing and registry boundaries exist.
+
+**Current highest-priority milestone: a user-reachable stop for a running goal.** Verified 2026-10-01:
+the only caller of `INTEL.request_cancel()` is the daemon's `POST /cancel`. The GUI CANCEL button
+(`command_bar._on_cancel_clicked`) and Esc (`voice/keys.py`) only abort a voice cycle, and no CLI,
+hotkey or voice command reaches the goal. A goal deleting files or driving the UI for up to 300 s can
+therefore be stopped from inside FRIDAY only by quitting it. The cooperative checkpoints already exist
+(Phase 16); the missing part is the user-facing control.
+
+**Deferred work.** Self-extension; recursive folder copy/move/delete (26); drag-timing hardening (27:
+one unexplained intermittent failure, not reproduced in 56 drags since).
+
+**Known cross-cutting limitations** (per-phase lists are in each section): `ui.*` effects are not read
+back; synthetic input can be disturbed by concurrent physical mouse use; 1-2 digit numbers are never
+grounded (24); the local 3B planner model bounds planning quality; human validation of 24-27 is pending.
+
+---
+
 ## 1. What FRIDAY is
 
 | Property | Meaning |
@@ -8051,3 +8098,279 @@ the two named-but-unfixed adversarial-review findings in §11 reported honestly 
 5. Re-run `smoke_phase23_live.py` after any prompt, schema or model change, same as Phase 20-22's standing
    rule — and if this repository ever gains git history, prefer a real `--root <tree copy>` comparison
    over the same-tree switch toggle used here.
+
+
+## Phase 24.0 — Answer-Reliability Hardening (Answer Grounding) (documented 2026-09-28)
+
+This section is written retroactively: the Phase 25.0 safety-net-hardening audit found the implementation
+below (ten sub-phases, seven dedicated smoke suites, all shipped and passing) had never gotten a narrative
+entry here — the code itself points to "project memory (friday-phase24-answer-grounding)" as the record
+instead, and `friday/intelligence/discovery.py`'s own "Phase 24 reliability contract" block (§719-769) was
+already the authoritative in-code summary this section restates. Scope guard, same
+posture as Phase 22/23: no GUI/voice/wake-word change, no new goal/memory/evaluator system, the request
+pipeline order is unchanged. Everything below is gated by `CFG.planner.answer_grounding_guard` (the kill
+switch) and lives in `friday.intelligence.discovery` (`ground_answer`, `normalize_answer`,
+`finalize_answer`) plus the two call sites that use it (`Orchestrator._answer_from_evidence`, the Phase 23
+composer, and `Orchestrator._ground_done_summary`, the planner's own `done` summary).
+
+**The problem.** Phase 23 taught the orchestrator to answer straight from gathered evidence instead of
+always re-planning — but a plain-text model completion (`_answer_from_evidence`) has no structural
+guarantee it only states what the evidence actually showed. A composed answer could name a number, a
+filename or a completed action the evidence never produced, and nothing before Phase 24 checked it.
+
+**24.1-24.2 — deterministic grounding guard.** `ground_answer(goal, answer, observations)` is a second,
+independent, non-model check run after composition: every concrete number (3+ digits; thousands separators
+and glued units like "500GB" normalized) and filename in the answer must be stated by real evidence (`ok`,
+non-`uncertain`) or by the goal itself; broadened in 24.2 to completed-action claims ("deleted", "sent",
+"created", ...) via a verb-to-stem map, skipping negated ("never deleted") and filler uses. One unsupported
+claim fails the whole answer closed to a fixed "insufficient evidence" statement — never a partial edit,
+never a fabricated replacement fact.
+
+**24.3 — completeness.** A grounded-but-incomplete answer (goal-relevant evidence the answer silently
+dropped) gets that evidence appended ("Also: ..."), restated verbatim from the tool's own words, re-checked
+until nothing new is missing (bounded, so this is idempotent).
+
+**24.4 — which observations may speak.** An attempt/progress line ("Attempting to delete x.") does not
+ground a completed-action claim; a later same-operation result overrides an earlier one; a cross-tool
+success-vs-failure conflict about the same file is preserved (both sides stated), never silently resolved
+to the optimistic side.
+
+**24.5 — both final-answer routes guarded.** The planner's own `done` summary is a final answer too
+(`Orchestrator._ground_done_summary`) and gets the same guard, with `retrieval_claims=False` so
+"found/retrieved/..." wording (true of the planner's own read-verb vocabulary) doesn't need its own
+grounding the way a stronger claim does.
+
+**24.6 — progress never completes a goal.** Progress/attempt/uncertain evidence never satisfies a stop
+rule (`_is_conclusive`, shared by the sufficiency and completion checks) — a run cannot end "done" on
+"Searching for..." alone.
+
+**24.7 — normalization, removal-only.** `finalize_answer` = `ground_answer` then `normalize_answer` in that
+fixed order (nothing runs after normalization). Normalization only ever REMOVES text (a duplicate
+statement, a superseded progress line) — verified at run time as a character subsequence of its input, so
+it structurally cannot add a new claim grounding didn't already pass.
+
+**24.8 — adversarial hardening.** A dedicated pass exercising 2-4 of the above behaviours at once
+(`scripts/smoke_answer_reliability_adversarial.py`) found and fixed 12 real defects: plain-substring number/
+filename matching ("999" matched inside "1999", "report.csv" inside "myreport.csv"), an unchecked
+unit-glued number ("500GB"), the `done` route's read-verb exemption letting an unsupported "Found X." through
+on progress/failure alone, "still exists" being invisible to conflict detection, "no errors"/"nothing went
+wrong" misread as a stated failure, the sufficiency gate accepting a tool-flagged-uncertain result, the
+summary reading out internal `ALREADY_TRIED`/`intent_mismatch` planner notes, and several normalizer
+over-merges (a stranded list marker, sentences differing only by a pronoun or a symbol, a dropped
+in-progress state, a dropped failure the goal's own "why" needed).
+
+**24.9 — per-object grounding.** A claim naming several files ("both a.txt and b.txt were sent") now needs
+a real outcome for EACH one explicitly extractable from the claim (`_claimed_objects`/`_grounds_object`);
+where object boundaries are genuinely ambiguous the claim is allowed rather than guessed at — covers
+filenames only, not contacts/app names/job names.
+
+**24.10 — boundary validation.** A cross-cutting suite (`scripts/smoke_phase24_boundary.py`) that adds no
+new heuristic, only checks the layers behave as ONE contract: the kill-switch matrix, idempotence
+(`ground(ground(x)) == ground(x)`, etc.), the fixed compose -> overclaim-guard -> ground -> normalize order,
+cross-route equivalence, and a seeded-corpus "no new claims" property. Found and fixed one real idempotence
+bug in the process. The "Phase 24 reliability contract" comment this section is based on
+(`friday/intelligence/discovery.py:719-769`) was written as part of this sub-phase and is the precise,
+line-by-line GUARANTEED / NOT GUARANTEED boundary — read it directly for anything this summary compresses.
+
+**Known limitations (deliberately not widened — see the NOT GUARANTEED list in the contract block for the
+full, current set):** 1-2 digit numbers are never checked; the filename extension vocabulary is closed;
+per-object grounding covers filenames only; verb/stem matching is prefix/substring-based and can over- or
+under-match outside its known vocabulary; semantic correctness (a poor but honest summary) is not judged;
+a tool falsely reporting success for something that didn't happen is believed here (that is
+`friday/verify.py`'s job, not this one's); an honest answer that only a FAILED observation supports fails
+closed rather than being allowed through.
+
+Regression: `smoke_answer_grounding_guard.py`, `smoke_answer_grounding_e2e.py`,
+`smoke_answer_normalization.py`, `smoke_answer_object_grounding.py`,
+`smoke_answer_reliability_adversarial.py`, `smoke_phase24_boundary.py`, `smoke_progress_completion.py` — all
+deterministic and offline. Live validation (`scripts/smoke_phase24_live.py`, real Ollama) was the one piece
+missing at the time this section was written; added the same sitting, Phase 25.0 Workstream 1 (see below).
+
+
+## Phase 25.0 — Safety-Net Hardening & Phase 24 Closure (2026-09-28)
+
+A completion audit of the whole codebase (post-24.10) found five concrete, narrow gaps and closed them —
+not a new feature area, not a reopening of Phase 24's heuristics. Scope guard: no GUI/voice/permission-
+architecture change, no filesystem-mutation skills (Phase 26), no kill switch (Phase 27), no self-extension.
+
+1. **Phase 24 live validation** — `scripts/smoke_phase24_live.py`, real Ollama (qwen2.5:3b). Two shapes: the
+   real production seam (`Orchestrator._answer_from_evidence`, real model composes, the real Phase 24 gate
+   runs on it — used where the model's good-faith answer is expected to already pass) and a blunt,
+   uncoached prompt fed straight to `discovery.finalize_answer` (used to reliably elicit the model's raw
+   tendency to guess, so the gate has something real to catch). 8 cases (supported fact, unsupported
+   number/filename/completed-action, multi-object grounding, conflicting evidence, progress-not-completion,
+   normalization-adds-nothing) x 3 reps = 24/24 passed against the real model.
+2. **This documentation.** The Phase 24.0 section above.
+3. **Speech-field redaction** (the gap Phase 23 §11 and Phase 24's own contract both named and left open).
+   `clipboard.read`/`screen.find_text`/`screen.click_text` put raw screen/clipboard content straight into
+   `SkillResult.speech`; `friday.toolview` sanitized `.data` (Phase 22.0) but never `.speech`, so that text
+   reached the planner's own prompt (`_history_line`), the LLM composer/grounding-guard input and the
+   deterministic goal summary unredacted. Fixed at the one place every `Observation` is built
+   (`Orchestrator._run_step`): `result.speech` is passed through `toolview.sanitize` before becoming
+   evidence, so every downstream consumer inherits it. A single-step direct call (no orchestrator involved)
+   is untouched by design — "what's in my clipboard" still reads back the real answer.
+   `scripts/smoke_speech_redaction.py`, 13/13.
+4. **Memory secret redaction.** `friday.memory.remember()` had no redaction at all, unlike every other
+   subsystem that can see model/tool text — despite its own canonical example being "remember my wifi
+   password". `friday/toolview.py` gained an opt-in `sanitize(text, prose=True)` pass (a credential named in
+   a plain sentence, "my wifi password is X", not just `key=value` shape — kept opt-in so ordinary sentences
+   using a keyword non-secretly, "the session is active", are never touched by the default path every other
+   caller uses). `memory.remember()` now runs every value through it before embedding/storing; the
+   `memory.remember`/`memory.recall` skills (`friday/skills/memory.py`) also sanitize before building their
+   own spoken confirmation — found live during testing: the confirmation used to echo the raw pre-storage
+   value, leaking the secret back to the user in speech even though it was never actually persisted.
+   `scripts/smoke_memory_redaction.py`, 14/14; `scripts/smoke_memory.py` updated (its wifi-password case
+   asserted the old plaintext-storage behavior, which is precisely what this fixes).
+5. **`shell.run` blocklist tests.** Previously untested. Writing the tests found a real defect (not
+   hypothetical — the brief's own bar for touching the blocklist): the whole-drive `del` pattern matched
+   exactly one flag before the drive letter, so the most common real invocation of the exact command it
+   claims to block — `del /s /q c:\`, `del /f /s /q c:\`, flags trailing the path — passed straight through.
+   Fixed in `friday/skills/shell.py` (`_FORBIDDEN`) to accept one-or-more flags, either side of the drive
+   path; every previously-blocked pattern and every representative allowed command still behaves
+   identically. `scripts/smoke_shell_blocklist.py`, 38/38, including a fail-closed check that a blocked
+   command never reaches `subprocess.run`.
+
+**Phase 25.0 safety-net hardening is complete.**
+
+## Phase 26.0 — Computer-Control Primitive Completion (2026-09-28)
+
+Closed the four concrete gaps the completion audit found in FRIDAY's low-level computer-control
+surface. Phase 24's reliability/grounding architecture was not touched.
+
+1. **Filesystem mutation skills.** `friday/skills/files.py` gained `files.write` (create/overwrite,
+   L1, risk-escalates to a confirm when the target already exists — the same per-call risk-classifier
+   pattern `browser.click` uses for consequential UI text), `files.copy` (L1, escalates on an existing
+   destination), `files.move` (L1, escalates on an existing destination, undo moves it back), `files.delete`
+   (L2, file or empty folder only — no recursive delete), and `files.mkdir` (L1, undo deletes the empty
+   folder). All route through the existing Executor/tier/confirmation/audit/undo architecture, not
+   `shell.run` (which would bypass the risk classifiers). `friday/verify.py` gained real postcondition
+   verifiers for all five (`path_exists`/`path_absent`/`path_moved`/`file_contains` — primitives that
+   were already sitting in verify.py, anticipated but never wired up, per its own module comment).
+   `scripts/smoke_files_mutation.py`, 38/38.
+2. **Mouse/UI primitives.** `friday/winput.py` gained `drag()` (press, stepped move, release — some
+   drop targets need real intermediate move events, not a same-frame teleport). `friday/skills/ui.py`
+   gained `ui.right_click` (reuses `CLICK_RULE`, the same per-call risk classifier `ui.click` uses — a
+   context menu can expose "Delete"), `ui.drag`, and `ui.scroll`. All three are in `verify.UNVERIFIABLE`
+   (a click/drag/scroll's effect has no generic, safe read-back — the same honest answer `ui.click`
+   already gives). `scripts/smoke_ui_automation.py`, 29/29 — also the first real coverage of the
+   pre-existing `ui.click`/`ui.fill`, which had none.
+3. **`web.open` / `browser.open` seam.** The two tools silently disagreed about what "the browser" was:
+   `web.open` always launched the OS default browser (untracked, unreadable), while `browser.*` acts on
+   a separate, FRIDAY-controlled Playwright session. If a controlled session was already open and a
+   phrasing routed to `web.open`, it opened a second, unrelated window while the controlled session
+   `browser.read`/`browser.click` still act on stayed on its old page. Fixed: `web.open` now checks
+   `browser.is_open()` first and navigates the controlled session when one exists; with no session open,
+   behavior is unchanged (OS default browser). `scripts/smoke_web_browser_seam.py`, 10/10.
+4. **UI Automation click/fill test coverage.** `ui.click`/`ui.fill` had zero tests despite being FRIDAY's
+   universal fallback for controlling any app. `scripts/smoke_ui_automation.py` fakes `uiautomation` and
+   `friday.winput` to exercise, headlessly and deterministically, the real accessibility-pattern path,
+   the real synthetic-input fallback path, and clean failure reporting for a missing window/control —
+   for `ui.click`, `ui.fill`, and the three new primitives above.
+
+Full relevant regression run: `scripts/regression.py` (94/94 intent matches + 14/14 live executions),
+`smoke_postconditions.py` (196/196, coverage test now includes all 5 new filesystem skills),
+`smoke_intent_action_alignment.py` (353/353, every new skill declares an explicit action class),
+`smoke_registry.py`, `smoke_tool_data.py`, `smoke_orchestrator.py`, `smoke_intent_routing.py` — all
+green. Phase 24/25 suites re-run unchanged and green (`smoke_phase24_boundary.py` 37/37,
+`smoke_memory_redaction.py` 14/14, `smoke_shell_blocklist.py` 38/38, `smoke_speech_redaction.py`
+13/13): Phase 24 was not reopened.
+
+**Known limitations carried forward, unchanged by this phase:** `files.copy`/`files.move` operate on
+single files only (no recursive folder copy/move — out of scope, keeps this phase focused);
+`files.delete` refuses non-empty folders outright rather than offering a recursive option (Phase 26's
+brief explicitly deferred broader filesystem mutation skills beyond this set to a later phase); `ui.drag`
+depends on the same accessibility-tree name matching `ui.click`/`ui.fill` already rely on, so it inherits
+their existing fuzzy-match limitations against apps with a sparse/unlabeled UI tree.
+
+**Phase 26.0 computer-control primitive completion is complete.**
+
+## Phase 27.0 — Real-Machine UI-Automation Validation & Wrong-Target Guard (2026-10-01)
+
+(Phase 25's scope note pencilled "Phase 27" for a kill switch. That work is still open and is the
+roadmap's current highest-priority milestone; see §0.)
+
+**Why this milestone.** Phase 26 shipped `ui.right_click`/`ui.drag`/`ui.scroll` and the first coverage
+of `ui.click`/`ui.fill`, but `smoke_ui_automation.py` fakes both `uiautomation` and `friday.winput`. None
+of the real accessibility calls or real `SendInput` sequences behind FRIDAY's universal app-control
+fallback had ever executed: implemented, never validated.
+
+**Harness.** `scripts/smoke_ui_live.py` drives the real skills against real windows and asserts on what
+each window *received*, not on what the skill reported. It uses a disposable WinForms window
+(`scripts/live_ui_harness.ps1`: real Win32 controls, real UIA proxy, real OLE drag-drop, every event
+logged, self-closing) plus real Windows Calculator (WinUI, a different UIA provider). Before every call a
+guard checks that the skill's own window resolution lands on a test-owned window and that every point
+it could actuate is covered by one. A defect can therefore only misfire onto the test's windows, never
+the user's. Scenario K parks a shield window over screen (0,0) for the same reason.
+
+**Baseline on the pre-fix code** (first real execution of these paths). Working for real: coordinate
+space (after `uiautomation` loads the process is per-monitor DPI-aware, 1536x864 -> 1920x1080, matching
+UIA), `inspect`, `click`, `fill` (replaces rather than appends), `right_click` (never invokes), `drag`,
+`scroll`, and Calculator `7 + 3 =` read back as "Display is 10". **Defect, all five primitives:** with
+the target window covered, every action landed on the covering window and still reported success.
+With the cover always-on-top the result was the same. Calculator exposes a named `System` item whose
+rect is `(0,0,0,0)` (UIA does not even flag it offscreen). `ui.click("System", app="Calculator")`
+reported "Clicked System." and actually invoked the *Increment Counter button in another process's
+window* parked at (0,0); on a normal desktop that is whatever the user has there. 27 failing checks.
+
+**Root cause.** `click`/`fill` matched the control by name in the named window's tree, then acted through
+`auto.ControlFromPoint(center)` (the topmost element at that *screen point*, in any app) or synthetic
+input at that point. This contradicted §9's own "accessibility tree first, pixels last".
+
+**Fix (`friday/skills/ui.py` only).**
+- Pattern paths act on the matched element itself. `_walk` keeps the live control handle, which
+  `_public` strips before any node leaves the module. `click` uses its Invoke pattern and `fill` its
+  SetValue, so no screen point is involved and a covered or minimized target is still reached correctly.
+- Synthetic paths (the click/fill fallback, `right_click`, `drag`, `scroll`) first raise the window,
+  reusing `apps._focus_hwnd`. They then re-read the control's rect: a zero-area control means "isn't
+  visible on screen". A fresh hit-test follows: the element actually under the point must be the
+  control or its descendant (`ControlsAreSame` up the parent chain); for `scroll`, the root window at
+  the center must be the target.
+- `fill`'s fallback sends Ctrl+A and typing only if the target window really took focus, because
+  keystrokes go to focus, not to a point. Otherwise it refuses: `ok=False`, "I didn't click anything:
+  'X' is covered by another window."
+
+**Results.** Live suite 66/66 on the fixed code, in 11 scenarios, on three consecutive full runs. The
+covered-by-normal-window case now reaches the target for all five primitives. Under an always-on-top
+cover, click/fill still reach the target through their own patterns, while right_click/drag/scroll fail
+closed with nothing actuated anywhere. The zero-area control is refused with nothing at (0,0) touched.
+The deterministic suite was rebuilt: its fakes now follow the real contract (pattern getters return
+None, Invoke/SetValue return bool, ControlFromPoint returns whatever is topmost), giving 58/58 in 16
+scenarios. A mutation check re-introduced each defect (hit-test disabled, visibility check disabled,
+scroll unguarded, the old coordinate-based click) and the suite caught all four. With the visibility
+check disabled, the independent hit-test still refused the (0,0) click, so two layers hold.
+
+**Drag intermittency, not fixed speculatively.** In the very first live run one unobstructed
+`ui.drag` reported success while the harness never saw a drag start. It has not recurred in 56
+unobstructed drags since: a 5-drag diagnostic, a 25-drag stress run interleaved with fill/click, and
+six later full-suite runs (1 drag in the first, 5 in each of the rest). The cause is undetermined; candidates are first-run PowerShell handler latency in
+the harness, or physical mouse input during the drag. Scenario F now repeats the drag five times so
+intermittency surfaces.
+
+**Regression.** Everything below is green:
+- `regression.py`: 94/94 intent matches and 14/14 real L0 executions, including `ui.inspect` through the
+  Executor and audit path.
+- `smoke_postconditions` 196/196, `smoke_intent_action_alignment` 353/353, `smoke_tool_data` 139/139,
+  plus `smoke_registry` and `smoke_orchestrator`.
+- Phase 24: `smoke_phase24_boundary` 37/37, `smoke_answer_grounding_guard` 111/111,
+  `smoke_answer_grounding_e2e` 77/77, `smoke_answer_normalization` 32/32,
+  `smoke_answer_object_grounding` 40/40, `smoke_answer_reliability_adversarial` 45/45,
+  `smoke_progress_completion` 31/31.
+- Phase 25: `smoke_memory_redaction` 14/14, `smoke_shell_blocklist` 38/38, `smoke_speech_redaction` 13/13.
+- Phase 26: `smoke_files_mutation` 38/38, `smoke_web_browser_seam` 10/10.
+
+One incident: in the batch run `smoke_intent_routing` died with a native crash (exit 139, no
+traceback, output lost). Two isolated re-runs were 54/54. That suite never executes the changed
+`ui.*` paths, and the crash matches the codebase's known intermittent native-crash class, but its
+root cause was not established.
+
+**Known limitations.**
+- A window of milliseconds remains between the hit-test and `SendInput`.
+- Concurrent physical mouse use can still disturb a synthetic action; there is no post-action check.
+- A control that the app doesn't hit-test to itself is refused for synthetic input (fails closed).
+- Synthetic actions change the foreground window as a side effect, as a real click would.
+- `scroll`'s window check was exercised live only on a Win32 window (not UWP or a browser).
+- `ui.*` effects remain `verify.UNVERIFIABLE`.
+- The live suite needs an unlocked desktop and moves the mouse for about 45 s.
+- No human has yet run the MANUAL_VALIDATION.md checklist for this phase.
+
+**Phase 27.0 real-machine UI-automation validation is complete.**

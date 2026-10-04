@@ -373,13 +373,16 @@ UNVERIFIABLE: dict[str, str] = {
     "dev.git": "arbitrary git subcommand; no single state to read back",
     "ui.click": "a click has no generic read-back; the UI change it caused is unknown",
     "ui.fill": "field contents are not readable through a generic, safe API",
+    "ui.right_click": "a right-click opens a context menu with no generic read-back",
+    "ui.drag": "a drag's effect (reorder, drop) has no generic, safe read-back",
+    "ui.scroll": "scroll position is not exposed through a generic, safe API",
     "screen.click_text": "a click has no generic read-back",
     "browser.click": "a click has no generic read-back",
     "browser.type": "page field contents are not readable back reliably",
     "browser.press": "a key press has no generic read-back",
     "browser.open": "the page load is not confirmed by the call; navigation state is asynchronous",
     "browser.close": "browser session state is not exposed for read-back",
-    "web.open": "opens the default browser; nothing FRIDAY can read back",
+    "web.open": "opens the default browser (or navigates the controlled session, if one is open); navigation state is asynchronous either way",
     "input.type": "typed text lands in whatever window has focus; not readable back",
     "input.hotkey": "a key combination has no generic read-back",
     "project.open": "launches an editor; no reliable window signature for a project",
@@ -714,6 +717,49 @@ def _downloaded(args, data, before):
     return [path_exists(str(path), kind="file", min_bytes=1, name="downloaded file")]
 
 
+# filesystem mutation (Phase 26) ----------------------------------------------------------------
+
+
+def _fs_write(args, data, before):
+    path = data.get("path") or args.get("path")
+    if not path:
+        return [Check("file written", None, detail="the written path was not reported")]
+    checks = [path_exists(str(path), kind="file", name="file exists")]
+    content = args.get("content")
+    if content:
+        checks.append(file_contains(str(path), str(content), name="content matches"))
+    return checks
+
+
+def _fs_copy(args, data, before):
+    dst = data.get("dst") or args.get("dst")
+    if not dst:
+        return [Check("file copied", None, detail="the destination path was not reported")]
+    return [path_exists(str(dst), kind="file", min_bytes=1, name="copy exists")]
+
+
+def _fs_move(args, data, before):
+    src = data.get("src") or args.get("src")
+    dst = data.get("dst") or args.get("dst")
+    if not src or not dst:
+        return [Check("file moved", None, detail="the source/destination path was not reported")]
+    return path_moved(str(src), str(dst))
+
+
+def _fs_delete(args, data, before):
+    path = args.get("path")
+    if not path:
+        return [Check("file deleted", None, detail="no path was given")]
+    return [path_absent(str(path), name="path is gone")]
+
+
+def _fs_mkdir(args, data, before):
+    path = data.get("path") or args.get("path")
+    if not path:
+        return [Check("folder created", None, detail="the created path was not reported")]
+    return [path_exists(str(path), kind="dir", name="folder exists")]
+
+
 def _register_real() -> None:
     register("system.volume.set", Verifier(_volume_set, settle_s=0.6))
     register("system.volume.up", Verifier(_volume_delta(+1), _volume_before, settle_s=0.6))
@@ -740,6 +786,11 @@ def _register_real() -> None:
     register("notes.add", Verifier(_note_added, _notes_before))
     register("clipboard.write", Verifier(_clipboard_written))
     register("web.download", Verifier(_downloaded))
+    register("files.write", Verifier(_fs_write, settle_s=0.3))
+    register("files.copy", Verifier(_fs_copy, settle_s=0.3))
+    register("files.move", Verifier(_fs_move, settle_s=0.3))
+    register("files.delete", Verifier(_fs_delete, settle_s=0.3))
+    register("files.mkdir", Verifier(_fs_mkdir, settle_s=0.3))
 
 
 _register_real()

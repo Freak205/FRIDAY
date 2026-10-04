@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Annotated
 
-from friday import memory
+from friday import memory, toolview
 from friday.registry import SkillResult, skill
 
 # "remember that X" / "note that X" / "don't forget X"
@@ -75,6 +75,12 @@ def remember(
 
     kind = "preference" if _PREFERENCE.search(value) else "fact"
     memory.remember(value, kind=kind)
+    # Phase 25.0: `memory.remember` redacts secret-like values before storing (a wifi
+    # password is never kept in plaintext) — but this spoken confirmation used to build
+    # its own text straight from the raw, unredacted `value`, so the secret would still be
+    # read back to the user immediately even though it was never actually persisted.
+    # Sanitizing here too (idempotent, so a non-secret `value` is unaffected) closes that.
+    value = toolview.sanitize(value, prose=True)
 
     return SkillResult(
         speech=f"Noted — {value}.",
@@ -126,6 +132,7 @@ def recall(
         if value:
             kind = "preference" if _PREFERENCE.search(value) else "fact"
             memory.remember(value, kind=kind)
+            value = toolview.sanitize(value, prose=True)  # Phase 25.0 — see remember() above
             return SkillResult(
                 speech=f"Noted — {value}.",
                 data={"remembered": value, "kind": kind, "rerouted": True},

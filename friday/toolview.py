@@ -81,6 +81,18 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
 _CARD = re.compile(r"\b(?:\d[ -]?){13,19}\b")
 _OPAQUE = re.compile(r"\b(?=[A-Za-z0-9_-]{40,}\b)(?=[A-Za-z_-]*\d)(?=[0-9_-]*[A-Za-z])[A-Za-z0-9_-]{40,}\b")
 
+# Phase 25.0: the `_REDACTIONS` above only catch a credential in `key=value`/`key: value`
+# shape — real tool output (config dumps, headers, env vars) is almost always shaped like
+# that. Free-form PROSE ("my wifi password is upstairs123") has no separator at all, which
+# `friday.memory.remember` stores verbatim today. Kept as a separate, OPT-IN pass
+# (`sanitize(..., prose=True)`) rather than folded into `_REDACTIONS`: "___ is/was ___" is
+# common enough in ordinary speech (session status, expiry notices) that running it over
+# every tool's speech/data by default would over-redact things that were never secrets.
+_PROSE_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\b((?:my |our |the |his |her |their )?" + _KEYWORD + r")\s+(?:is|are|was|were)\s*:?\s+"
+                r"(?:\"[^\"\n]*\"|'[^'\n]*'|[^.,;!?\n]+)"), r"\1 is [redacted]"),
+)
+
 _INJECTION: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?im)^\s*(?:system|assistant|user|human|developer|tool)\s*:"), "(role label removed):"),
     (re.compile(r"<\|[^|>\n]{1,40}\|>"), "(chat token removed)"),
@@ -115,13 +127,22 @@ def _redact_cards(text: str) -> str:
     return _CARD.sub(repl, text)
 
 
-def sanitize(text: str) -> str:
+def sanitize(text: str, *, prose: bool = False) -> str:
     """Make a piece of tool output safe to show the planner: strip control/bidi characters,
     redact credential-shaped text, neutralise text that imitates our own protocol or tries
-    to give the model instructions. Idempotent."""
+    to give the model instructions. Idempotent.
+
+    `prose=True` (Phase 25.0, used by `friday.memory.remember`) additionally redacts a
+    credential NAMED IN PLAIN SENTENCES ("my wifi password is upstairs123"), not just
+    `key=value` shape. Opt-in: every other caller (tool data/speech shown to the planner)
+    keeps the narrower default so ordinary sentences using a keyword non-secretly
+    ("the session is active") are never touched."""
     text = _CTRL.sub("", text)
     for pattern, repl in _REDACTIONS:
         text = pattern.sub(repl, text)
+    if prose:
+        for pattern, repl in _PROSE_REDACTIONS:
+            text = pattern.sub(repl, text)
     text = _redact_cards(text)
     text = _OPAQUE.sub("[redacted opaque string]", text)
     for pattern, repl in _INJECTION:

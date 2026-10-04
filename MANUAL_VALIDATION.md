@@ -3091,3 +3091,180 @@ Worst first:
 Kill switches (pre-Phase-23 behaviour, for comparison), in `config.yaml`,
 then restart: `planner.subgoal_evidence_advance: false`,
 `planner.answer_from_evidence: false`.
+
+
+# FRIDAY — Phase 24.0 manual validation checklist
+
+Real-machine checks for PLAN.md's Phase 24.0 section (answer-reliability hardening / answer
+grounding — the guard that stops a composed answer from stating a number, filename or
+completed action the evidence never actually showed). The deterministic scorecards are
+`scripts/smoke_answer_grounding_guard.py`, `smoke_answer_grounding_e2e.py`,
+`smoke_answer_normalization.py`, `smoke_answer_object_grounding.py`,
+`smoke_answer_reliability_adversarial.py` and `smoke_phase24_boundary.py`; the real-model
+validation is `scripts/smoke_phase24_live.py` (real `qwen2.5:3b`; unlike Phase 20-23's live
+suites this one calls no skill and needs no lockdown — every case builds its own evidence by
+hand, so nothing it does can touch your machine regardless of what the model says).
+
+**No boxes below are checked. This phase has not yet been run on real hardware against real
+speech/GUI input** — only the deterministic suites and `smoke_phase24_live.py` have actually
+executed (both green; see PLAN.md Phase 24.0 / Phase 25.0). Check a box only after you
+personally watched it happen.
+
+What is being tested: **when FRIDAY answers a goal from evidence it already gathered, the
+answer should never claim more than the evidence actually showed — no invented number, no
+invented filename, no "done" on a failed or half-finished action — and should say so plainly
+when it can't back up part of what it's about to say, rather than guessing.**
+
+**No message sends. No purchases. No deletion, no system changes** beyond what each test's
+own setup step performs on purpose (e.g. Test 3's deliberately-failing delete).
+
+Keep `data/logs/friday.log` open and use `python run.py audit` for what actually ran.
+
+## Test 1 — an honest answer states only what a real result showed
+
+1. Put a fact in a real text file (e.g. "Version 4.2.1" in a `version.txt`). Say/type "Hey
+   Jarvis, read `<path>` and tell me the version."
+
+- [ ] The answer states the real version from the file
+- [ ] Nothing in the answer looks invented (no extra number/filename not in the file)
+
+## Test 2 — asking for something the evidence doesn't contain
+
+1. Ask for a specific fact the file does NOT state: "Hey Jarvis, read `<path>` and tell me
+   its exact byte size" (for a file whose size was never reported by any tool call).
+
+- [ ] FRIDAY does not state a specific, made-up byte count
+- [ ] The answer says plainly that it doesn't have that / can't confirm it, rather than
+      guessing a number
+
+## Test 3 — a failed action is never reported as done
+
+1. Try an action that will fail (a locked/read-only file, a nonexistent target), e.g. "Hey
+   Jarvis, delete `C:\Windows\explorer.exe`" and decline/let it fail, or point at a
+   read-only file.
+
+- [ ] The final answer does NOT say the file was deleted/removed
+- [ ] The failure is reported honestly (what actually happened)
+
+## Test 4 — a multi-part claim needs evidence for every part
+
+1. Ask about two things where only one has a real result, e.g. "Hey Jarvis, check the battery
+   and the wifi password, then tell me both."  (adjust to two real, distinct sub-asks on your
+   machine)
+
+- [ ] The answer does not claim a definite value for the part that has no real evidence
+      behind it
+- [ ] The part that DOES have real evidence is still answered normally
+
+## Test 5 — conflicting results are not silently resolved
+
+1. Contrive a case with two contradictory real results about the same thing if you can (e.g.
+   an action reports success, then a follow-up check shows it didn't actually take effect —
+   Phase 22's postcondition verification is a natural source of this).
+
+- [ ] The final answer does not confidently claim only the optimistic side
+- [ ] Both sides are visible, or the answer says the outcome isn't fully confirmed
+
+## Test 6 — progress talk never reads as "done"
+
+1. Interrupt a longer-running goal partway (or pick one where an early step only reports
+   "searching"/"attempting") and ask what happened.
+
+- [ ] A run that only produced progress/attempt evidence is never summarized as complete
+- [ ] The answer reflects that it's still in progress / unresolved, not finished
+
+## Test 7 — plain single-clause requests are unaffected
+
+1. Ask a simple, already-answerable question with no compound "and tell me" phrasing.
+
+- [ ] Answered exactly as before Phase 24 — this phase only ever REMOVES/replaces an
+      unsupported claim, never changes a well-supported answer's wording
+
+## If something goes wrong
+
+Worst first:
+
+1. **FRIDAY confidently states a number, filename or "done" that turns out to be wrong /
+   invented** — this is the exact failure Phase 24 exists to prevent; report the exact
+   wording and the audit trail (what evidence actually existed at that point).
+2. **A genuinely correct, well-supported answer gets replaced with "insufficient evidence"**
+   — an over-eager false positive; report the exact wording, the goal, and the real evidence
+   that should have grounded it.
+3. **The answer reads noticeably worse/more defensive than before** even though nothing was
+   actually unsupported — report the exact before/after wording.
+
+Kill switch (pre-Phase-24 behaviour, for comparison), in `config.yaml`, then restart:
+`planner.answer_grounding_guard: false`.
+
+
+# FRIDAY — Phase 27.0 manual validation checklist
+
+Real-machine checks for PLAN.md's Phase 27.0 section (the UI-automation wrong-target guard). The
+automated real-machine suite is `scripts/smoke_ui_live.py`. It drives the real `ui.*` skills against
+a disposable test window and real Calculator, and asserts on what each window actually received:
+66/66, see PLAN.md. The deterministic suite is `scripts/smoke_ui_automation.py`. Neither goes
+through speech, the brain or the planner, so this checklist covers what only a person at the keyboard
+can confirm: the same guard, reached through FRIDAY's normal request path, against ordinary apps.
+
+**No boxes below are checked. This phase has not been run by a human.** Check a box only after you
+personally watched it happen.
+
+What is being tested: **when FRIDAY clicks, types, right-clicks, drags or scrolls in a named app, the
+action lands in that app and never in whatever window happens to be on top of it. When FRIDAY can't
+reach the control safely, it says so instead of claiming it did it.**
+
+**Use throwaway content only.** Windows 11 Notepad reopens previous tabs. Before Tests 2-3, open a
+*new* tab (Ctrl+N) and make sure that empty tab is the active one, because a fill replaces the active
+tab's whole text. Use `ui.inspect` ("what can I click here") first if FRIDAY doesn't recognise a
+control's name.
+
+## Test 1 — clicking into an app that's behind another window
+
+1. Open Calculator, then put another window (e.g. File Explorer) over it so its keypad is hidden.
+2. "Hey Jarvis, click seven in Calculator."
+
+- [ ] Calculator shows 7
+- [ ] Nothing happened in the window that was on top
+
+## Test 2 — typing into a covered app
+
+1. Notepad with a new, empty, active tab; cover it with another window.
+2. "Type hello in the text editor in Notepad" (the field is usually named "Text editor").
+
+- [ ] "hello" appears in the new Notepad tab, and in no other tab
+- [ ] Nothing was typed into the covering window
+
+## Test 3 — an always-on-top window in the way
+
+1. Turn on Calculator's "Keep on top" and move it over the middle of Notepad's text area.
+2. "Right click the text editor in Notepad."
+
+- [ ] FRIDAY says it didn't right-click because the control is covered
+- [ ] No context menu opened in Calculator, Notepad or anywhere else
+
+## Test 4 — scrolling the right window
+
+1. Open something long in one app (a web page, a long document) and put a second scrollable window
+   partly over its middle.
+2. "Scroll down in <the first app>."
+
+- [ ] The named app scrolls (it may come to the front first; that's expected)
+- [ ] The other window did not scroll
+
+## Test 5 — nothing changed when the app is already in front
+
+1. Calculator in front and uncovered: "click seven", "click plus", "click three", "click equals".
+
+- [ ] Calculator shows 10, the same as before this phase
+
+## If something goes wrong
+
+Worst first:
+
+1. **An action lands in a different app than the one named.** This is the exact failure this phase
+   exists to prevent. Note both window titles and what `python run.py audit` shows ran.
+2. **FRIDAY says it did something that didn't happen** (e.g. "Clicked X." but nothing changed).
+3. **A reachable control is refused** ("covered" / "isn't visible on screen") when nothing was in the
+   way. This is an over-strict guard; note the app and the control's name.
+
+There is no kill switch for this guard, because it only ever refuses to send input it can't aim safely.

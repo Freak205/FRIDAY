@@ -23,9 +23,17 @@ _TIMEOUT = 60
 
 # Patterns refused outright, regardless of confirmation. These are the commands
 # with no plausible benign use from a voice assistant.
+_DEL_FLAG = r"/[sqfy]"
 _FORBIDDEN = [
     (re.compile(r"\bformat\s+[a-z]:", re.I), "disk formatting"),
-    (re.compile(r"\bdel\s+/[sqf]\s+[a-z]:\\?\s*$", re.I), "wiping a whole drive"),
+    # Phase 25.0 fix: the original pattern only matched EXACTLY one flag before the drive
+    # letter, so the most common real invocation of this exact command
+    # (`del /s /q c:\`, `del /f /s /q c:\`, or the flags trailing the path) passed
+    # straight through despite matching this rule's own stated intent. A live regression
+    # test (scripts/smoke_shell_blocklist.py, case B2) exposed it. Now matches one or more
+    # flags in any order, before and/or after the bare drive path.
+    (re.compile(rf"\bdel\s+(?:{_DEL_FLAG}\s+)+[a-z]:\\?\s*(?:{_DEL_FLAG}\s*)*$", re.I), "wiping a whole drive"),
+    (re.compile(rf"\bdel\s+[a-z]:\\?\s+(?:{_DEL_FLAG}\s*)+$", re.I), "wiping a whole drive"),
     (re.compile(r"Remove-Item.*-Recurse.*[a-z]:\\?\s*$", re.I), "wiping a whole drive"),
     (re.compile(r"\bvssadmin\s+delete\s+shadows", re.I), "deleting shadow copies"),
     (re.compile(r"\bbcdedit\b", re.I), "editing the boot configuration"),

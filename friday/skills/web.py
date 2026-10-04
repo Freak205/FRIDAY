@@ -158,11 +158,9 @@ def fetch(
         "browse to wikipedia",
     ],
 )
-def open_url(
+async def open_url(
     url: Annotated[str, "URL or site name to open"],
 ) -> SkillResult:
-    import webbrowser
-
     target = url.strip()
     # "open youtube" -> a bare word, not a URL.
     if not target.startswith(("http://", "https://")):
@@ -170,6 +168,27 @@ def open_url(
             target = f"https://{target.replace(' ', '')}.com"
         else:
             target = "https://" + target
+
+    # Phase 26.0: if a controlled browser session (friday.browser, driven by
+    # browser.open/read/click/...) is already running, navigate THAT session
+    # rather than launching a second, untracked window in the OS default
+    # browser. Without this, "open youtube" said after a browser.open session
+    # is already active opens an unreadable second window while browser.read/
+    # browser.click keep acting on the stale page the controlled session was
+    # already on — the two tools silently disagreed about what "the browser"
+    # meant. When no controlled session exists yet, this is a no-op check and
+    # behavior is unchanged: the default browser opens, exactly as before.
+    from friday import browser
+
+    if browser.is_open():
+        try:
+            info = await browser.goto(target)
+        except browser.BrowserError as exc:
+            return SkillResult(speech=f"I couldn't get there: {exc}", ok=False)
+        speech = f"{info.title or info.url} is already open." if info.already_loaded else f"Opened {info.title or info.url}."
+        return SkillResult(speech=speech, data={"url": info.url, "title": info.title})
+
+    import webbrowser
 
     webbrowser.open(target)
     return SkillResult(speech=f"Opening {urlparse(target).netloc}.", data={"url": target})

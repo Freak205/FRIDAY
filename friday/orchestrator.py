@@ -1824,7 +1824,21 @@ class Orchestrator:
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             await BUS.publish("orchestrator.observation", tool=step.tool, ms=elapsed_ms)
 
-        obs = Observation(step, result.ok, result.speech, result.data)
+        # Phase 25.0: `result.speech` is sanitized the same way `result.data` already is
+        # (friday.toolview.sanitize — the one existing redaction mechanism, reused rather
+        # than duplicated) before it becomes evidence. `.data` was covered by
+        # `toolview.excerpt` since Phase 22.0, but `.speech` was not: a tool like
+        # `clipboard.read`/`screen.find_text`/`screen.click_text` puts raw screen/clipboard
+        # content straight into `speech`, which then flows unredacted into the planner's own
+        # prompt (`_history_line`), the evidence history the LLM composer/grounding guard
+        # sees, and the deterministic goal summary — all real "planner context" / "model
+        # prompt" consumers, not just the final spoken reply. Applied once here, at the one
+        # place every Observation is created, so every downstream consumer inherits it.
+        # Single-step calls (Session._act/_run) never build an Observation and are
+        # untouched, so "what's in my clipboard" still gets its raw answer read back.
+        from friday import toolview
+
+        obs = Observation(step, result.ok, toolview.sanitize(result.speech) if result.speech else result.speech, result.data)
         if not result.ok and result.data and result.data.get("confirmation_declined"):
             # Tagged by friday.permissions.Executor.run so this never reads as
             # an ordinary retryable failure — see

@@ -21,9 +21,13 @@ TEACH = [
 ]
 
 # Recall phrased so the answer shares almost no words with the stored fact.
+# Phase 25.0: the wifi password is a secret-like value (friday.memory.remember now runs
+# storage through toolview.sanitize(prose=True)), so recall must find the memory but the
+# password itself is never in the answer — see scripts/smoke_memory_redaction.py for the
+# focused redaction suite this pairs with.
 ASK = [
     ("what is my sibling called",            "priya"),
-    ("how do i get on the network at home",  "bluehouse42"),
+    ("how do i get on the network at home",  "[redacted]"),
     ("when is the project due",              "friday"),
     ("what theme do i like",                 "dark mode"),
     ("where did i leave the vehicle",        "level 3"),
