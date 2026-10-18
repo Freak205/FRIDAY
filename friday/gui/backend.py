@@ -17,13 +17,14 @@ from __future__ import annotations
 import asyncio
 import threading
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any
 
 from friday import store
 from friday.brain import BRAIN
 from friday.bus import BUS
 from friday.log import get, setup
-from friday.registry import REGISTRY
+from friday.registry import REGISTRY, SkillResult
 from friday.session import SESSION
 
 log = get(__name__)
@@ -107,15 +108,38 @@ class Backend:
 
     # -- bridges used by the GUI thread ----------------------------------------
 
+    # Phase 39: how much longer than a goal's own time bound the caller keeps waiting for it.
+    ASK_MARGIN_S = 30.0
+
+    def ask_timeout_s(self) -> float:
+        """How long `ask` waits: a goal is bounded by `planner.total_timeout_s` (300 s) and ends itself, so waiting only
+        120 s reported "Something went wrong" for a goal that was still running and went on to finish."""
+        from friday.config import CFG
+
+        return max(120.0, float(CFG.planner.total_timeout_s) + self.ASK_MARGIN_S)
+
     def ask(self, text: str, *, actor: str = "text") -> Any:
         """Run an utterance on the backend loop and wait for the result.
         Must only be called from a worker thread, never the Qt thread —
-        this blocks the calling thread up to 120s.
+        this blocks the calling thread up to `ask_timeout_s()`.
+
+        Running out of patience is not a failure of the request: the coroutine keeps running on the backend loop
+        (cancelling it would cut a step in half), so the caller is told exactly that -- not "failed", not "done" --
+        and that STOP ends it.
         """
         future = asyncio.run_coroutine_threadsafe(
             SESSION.handle(text, actor=actor), self.loop
         )
-        return future.result(timeout=120)
+        try:
+            return future.result(timeout=self.ask_timeout_s())
+        except FutureTimeout:
+            log.warning("ask(%r) still running after %.0fs; not cancelled", text[:60], self.ask_timeout_s())
+            return SkillResult(
+                speech="That is still running; I haven't heard back from it yet, and I haven't stopped it. "
+                       "I can't tell you yet whether it worked. Say stop to end it, or ask me again in a moment.",
+                ok=False,
+                data={"still_running": True},
+            )
 
     def stop(self, *, source: str = "gui", wait: bool = True) -> Any:
         """Stop the running goal. Safe from ANY thread (Qt, hotkey, voice). The stop signal

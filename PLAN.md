@@ -55,8 +55,14 @@ never cleaned unless the user asks (and pending undo entries never expire by def
 Older candidates, none started: (a) make `shell.run` killable (it runs `subprocess.run` in a worker thread, so a stop
 waits up to its 60 s timeout); (b) cover standalone routine/scheduled-job runs (`jobs.run_job`), which Phase 28's
 goal-scoped signal does not reach; (c) hear a spoken "stop" while a goal runs (the voice thread is blocked in
-`Backend.ask` for the whole goal); (d) daemon API authentication, which the user has deferred. Also `Backend.ask`
-times out at 120 s while a goal may run 300 s.
+`Backend.ask` for the whole goal); (d) daemon API authentication, which the user has deferred.
+**Phase 39 (done):** `Backend.ask` used to give up after a fixed 120 s while a goal may run 300 s
+(`planner.total_timeout_s`), so a slow goal showed "Something went wrong: " (an empty `TimeoutError`) and then finished in the
+background - a false failure claim. It now waits `max(120, total_timeout_s + 30)` s and, if that still runs out, returns an
+honest "still running, not stopped, I can't tell you whether it worked; say stop" result (`data.still_running`) without
+cancelling the request (`scripts/smoke_backend_ask.py`, 11 checks). Limitation: the late real answer of such a request is not
+shown afterwards. Still open: the `ConfirmPanel` / voice paths show nothing special for `still_running`; the known
+"how do I get on the network at home" recall case (matcher: `network.status` 0.79 > `memory.recall` 0.69, identical at Phase 37).
 
 **Deferred work.** Self-extension; daemon API authentication; recursive folder copy/move/delete (26); drag-timing hardening (27:
 one unexplained intermittent failure, not reproduced in 56 drags since).
