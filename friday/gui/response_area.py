@@ -58,6 +58,18 @@ class ResponseArea(QWidget):
         self._response.setFixedWidth(520)
         outer.addWidget(self._response, alignment=Qt.AlignmentFlag.AlignHCenter)
 
+        # Phase 41: a request that finished AFTER Backend.ask stopped waiting for it. Shown on its own line when the strip has
+        # moved on to another exchange, so it is never displayed as the result of whatever happens to be on screen.
+        self._late = QLabel("")
+        self._late.setObjectName("lateResult")
+        self._late.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._late.setWordWrap(True)
+        self._late.setFixedWidth(520)
+        self._late.hide()
+        outer.addWidget(self._late, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self._pending_id = ""  # the request whose "still running" text is on screen now
+        self._late_seen: list[str] = []  # request ids already displayed: a completion is shown once
+
         self._has_content = False
 
     # -- typed-command path (CommandBar.exchangeReady) ---------------------------
@@ -68,15 +80,38 @@ class ResponseArea(QWidget):
         self._show_response(friday_text or "…", ok=ok)
         self._has_content = True
 
-    def set_pending(self, user_text: str, friday_text: str) -> None:
+    def set_pending(self, user_text: str, friday_text: str, request_id: str = "") -> None:
         """Phase 40: the request is still running (`Backend.ask` stopped waiting, it did not finish). Shown under its own
         header and in the accent colour -- not the warning colour of a failure -- so it is not mistaken for one."""
         self._user_echo.setText(f"“{user_text}”")
         self._user_echo.show()
         self._show_response(friday_text or "Still running.", pending=True)
+        self._pending_id = request_id
         self._has_content = True
 
+    def set_late(self, info: dict) -> None:
+        """Phase 41: the ORIGINAL request ended (`Backend` read its own finished future; nothing was run again). If its
+        "still running" text is still the one on screen it is replaced by the real outcome; otherwise the strip belongs to a
+        newer exchange and is left alone -- the outcome gets its own line, labelled with the request it belongs to. Each
+        request id is shown once. The outcome is shown as reported: a failure or an error stays a failure, never a success."""
+        rid = str(info.get("request_id") or "")
+        if rid and rid in self._late_seen:
+            return
+        if rid:
+            self._late_seen = (self._late_seen + [rid])[-50:]
+        text = str(info.get("utterance") or "")
+        speech = str(info.get("speech") or "") or "The earlier request ended."
+        ok = bool(info.get("ok"))
+        if rid and rid == self._pending_id:
+            self.set_exchange(text, speech, ok)
+            return
+        self._late.setText(f"Earlier request “{text}”: {speech}")
+        self._late.setStyleSheet("" if ok else f"color: {theme.WARNING};")
+        self._late.show()
+
     def _show_response(self, text: str, *, ok: bool = True, pending: bool = False) -> None:
+        self._pending_id = ""
+        self._late.hide()
         self._header.setText(_PENDING_HEADER if pending else _HEADER)
         self._response.setText(text)
         if pending:
@@ -101,6 +136,8 @@ class ResponseArea(QWidget):
             ok = bool(data.get("ok", True))
             if text:
                 self._show_response(text, ok=ok, pending=bool(data.get("pending")))
+                if data.get("pending"):
+                    self._pending_id = str(data.get("request_id") or "")
                 self._has_content = True
         elif state in ("conversation.wake_detected", "listening"):
             if not self._has_content:

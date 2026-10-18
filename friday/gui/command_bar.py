@@ -45,7 +45,7 @@ _MIC_LABELS = {
 class CommandBar(QWidget):
     exchangeReady = Signal(str, str, bool)  # (utterance, speech, ok) — typed path only
     # Phase 40: the request is still running (Backend.ask's `still_running`): neither an answer nor a failure.
-    exchangePending = Signal(str, str)  # (utterance, speech)
+    exchangePending = Signal(str, str, str)  # (utterance, speech, request_id)
 
     def __init__(self, backend: Backend, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -137,7 +137,7 @@ class CommandBar(QWidget):
             try:
                 result = self._backend.ask(text, actor=actor)
                 if (getattr(result, "data", None) or {}).get("still_running"):
-                    self.exchangePending.emit(text, result.speech)
+                    self.exchangePending.emit(text, result.speech, str(result.data.get("request_id") or ""))
                 else:
                     self.exchangeReady.emit(text, result.speech, result.ok)
             except Exception as exc:

@@ -304,6 +304,7 @@ class MainWindow(QMainWindow):
         self._hub.backendReady.connect(self._on_backend_ready)
         self._command_bar.exchangeReady.connect(self._response_area.set_exchange)
         self._command_bar.exchangePending.connect(self._response_area.set_pending)
+        self._hub.lateResult.connect(self._response_area.set_late)
 
     def apply_boot_stages(self, stages: list[str]) -> None:
         self._startup_overlay.update_stages(stages)

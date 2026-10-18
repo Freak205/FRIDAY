@@ -72,9 +72,20 @@ applies to a goal or a pending confirmation). `CommandBar.exchangePending` -> `R
 `ResponseArea` honours it. No new status system: STOP button / task panel remain INTEL-driven. Tests: `scripts/smoke_backend_ask.py`
 (20), `scripts/smoke_ui_pending.py` (15, offscreen Qt); `smoke_gui.py` and `smoke_voice_pipeline.py` (isolated) still pass.
 Limitations: the voice thread is still blocked in `ask` for the whole wait (a spoken "stop" is only heard after it returns);
-the late real answer is still not shown; `ConfirmPanel` needs nothing (a "yes" returns at once, the original request carries
-the wait). Still open: the known "how do I get on the network at home" recall case (matcher: `network.status` 0.79 >
-`memory.recall` 0.69, identical at Phase 37).
+`ConfirmPanel` needs nothing (a "yes" returns at once, the original request carries the wait).
+**Phase 41 (done):** the late real outcome is now shown, without running anything again. A timed-out request gets an id
+(`data.request_id`; a repeat of it carries the same id) and `Backend.ask` attaches ONE done-callback to the original, still-running
+future; when it ends, `Backend._deliver_late` reads that future (its own result with its own `ok`, its own exception, or its own
+cancellation - each reported as exactly that; an exception also says part of it may have run, with the text redacted via
+`toolview.sanitize`) and publishes `backend.late_result` on the existing BUS -> `GuiStateHub.lateResult` ->
+`ResponseArea.set_late`. If that request's "still running" text is still on screen it is replaced by the outcome; if the strip has
+moved on to another exchange, that exchange is left alone and the outcome gets its own labelled line (`Earlier request "<words>": ...`);
+each request id is displayed once. No polling, no second task system, no second `Backend.ask`. Tests: `scripts/smoke_backend_ask.py`
+(29), `scripts/smoke_ui_pending.py` (28, incl. the real BUS -> hub -> MainWindow wiring); `smoke_gui.py` and `smoke_voice_pipeline.py`
+(isolated) still pass. Limitations: a late result is displayed, not spoken (the voice path does not speak it); the side line holds one
+outcome (a second late result replaces the first, and the next exchange clears it); the id/outcome map is in memory only (lost on
+restart); the voice thread is still blocked in `ask` for the whole wait. Still open: the known "how do I get on the network at home"
+recall case (matcher: `network.status` 0.79 > `memory.recall` 0.69, identical at Phase 37).
 
 **Deferred work.** Self-extension; daemon API authentication; recursive folder copy/move/delete (26); drag-timing hardening (27:
 one unexplained intermittent failure, not reproduced in 56 drags since).

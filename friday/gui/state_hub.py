@@ -78,6 +78,7 @@ class GuiStateHub(QObject):
     orchestratorEvent = Signal(str, dict)   # (topic, event.data) — ticker feed
     confirmRequested = Signal(dict)         # {skill, tier, preview, speech, actor}
     confirmResolved = Signal(str, str)      # (skill, outcome) outcome: approved|declined
+    lateResult = Signal(dict)               # Backend's backend.late_result: {request_id, utterance, speech, ok, error, cancelled}
     telemetryUpdated = Signal(dict)         # {cpu_pct, ram_pct, ram_used_mb, ram_total_mb}
     desktopContextUpdated = Signal(dict)    # DesktopObservation.to_dict()
     voiceRawState = Signal(str, dict)       # passthrough of on_state(state, **data)
@@ -108,6 +109,7 @@ class GuiStateHub(QObject):
 
     def start(self) -> None:
         BUS.subscribe("session.awaiting_confirm", self._on_awaiting_confirm)
+        BUS.subscribe("backend.late_result", self._on_late_result)
         BUS.subscribe("skill.start", self._on_skill_start)
         BUS.subscribe("skill.done", self._on_skill_done)
         BUS.subscribe("skill.error", self._on_skill_error)
@@ -127,6 +129,7 @@ class GuiStateHub(QObject):
 
     def stop(self) -> None:
         BUS.unsubscribe("session.awaiting_confirm", self._on_awaiting_confirm)
+        BUS.unsubscribe("backend.late_result", self._on_late_result)
         BUS.unsubscribe("skill.start", self._on_skill_start)
         BUS.unsubscribe("skill.done", self._on_skill_done)
         BUS.unsubscribe("skill.error", self._on_skill_error)
@@ -213,6 +216,9 @@ class GuiStateHub(QObject):
         self._confirm_pending_skill = str(event.data.get("skill") or "")
         self.confirmRequested.emit(dict(event.data))
         self._recompute_core_state()
+
+    async def _on_late_result(self, event: Event) -> None:
+        self.lateResult.emit(dict(event.data))
 
     async def _on_skill_start(self, event: Event) -> None:
         skill = str(event.data.get("skill") or "")

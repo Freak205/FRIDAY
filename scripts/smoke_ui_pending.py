@@ -26,13 +26,36 @@ from friday.gui.response_area import ResponseArea  # noqa: E402
 from friday.registry import SkillResult  # noqa: E402
 
 PENDING = SkillResult(speech="That is still running, and I haven't heard back from it yet. please don't repeat it.", ok=False,
-                      data={"still_running": True, "repeat": False, "stoppable": False})
+                      data={"still_running": True, "repeat": False, "stoppable": False, "request_id": "req-A"})
 
 
 class FakeBackend:
     def __init__(self) -> None:
+        import threading
+
         self.asked: list[tuple[str, str]] = []
         self.reply = SkillResult(speech="all good", ok=True)
+        self.error = False
+        self.ready = threading.Event()
+        self.ready.set()
+        self.stages = ["memory", "registry:0", "brain"]
+
+    def observe(self, **kwargs):
+        from concurrent.futures import Future
+
+        future: Future = Future()
+        future.set_exception(RuntimeError("no desktop_observer in smoke test"))
+        return future
+
+    def ping_llm(self):
+        from concurrent.futures import Future
+
+        future: Future = Future()
+        future.set_result(False)
+        return future
+
+    def shutdown(self) -> None:
+        pass
 
     def ask(self, text: str, *, actor: str = "text"):
         self.asked.append((text, actor))
@@ -97,7 +120,7 @@ def main() -> int:
     bar._run_ask("organise my downloads", actor="text")
     pump(app, lambda: bool(ready or pending))
     check("C2 a still-running reply goes to exchangePending, not exchangeReady (so it is not shown as a failure)",
-          pending == [("organise my downloads", PENDING.speech)] and not ready, f"{ready} {pending}")
+          pending == [("organise my downloads", PENDING.speech, "req-A")] and not ready, f"{ready} {pending}")
     check("C3 one submission made exactly one Backend.ask call (nothing resubmits it)", backend.asked == [("hello", "text"), ("organise my downloads", "text")], str(backend.asked))
 
     backend.reply = SkillResult(speech="no", ok=False)
@@ -115,7 +138,82 @@ def main() -> int:
     pump(app, lambda: bool(ready or pending))
     check("C5 a result without .data is handled as a normal reply", ready == [("bare", "ok", True)], f"{ready} {pending}")
 
-    return finish("Phase 40 -- UI shows a still-running request", time.perf_counter() - t0, min_assertions=15, min_scenarios=3)
+    scenario("D: Phase 41 -- a late result replaces ITS OWN pending text, once, and never another request's")
+    ra = ResponseArea()
+    late_a = {"request_id": "req-A", "utterance": "organise my downloads", "speech": "Moved 12 files.", "ok": True, "error": False, "cancelled": False}
+    ra.set_pending("organise my downloads", PENDING.speech, "req-A")
+    ra.set_late(late_a)
+    check("D1 the pending text for request A is replaced by A's real outcome, as a normal exchange",
+          ra._response.text() == "Moved 12 files." and ra._header.text() == "FRIDAY" and "organise my downloads" in ra._user_echo.text() and ra._response.styleSheet() == "",
+          f"{ra._header.text()!r} {ra._response.text()!r}")
+    ra.set_exchange("what time is it", "It is 3 pm.", True)
+    ra.set_late(late_a)
+    check("D2 the same completion is never shown twice (a repeat does not touch the screen)", ra._response.text() == "It is 3 pm." and not ra._late.isVisibleTo(ra) and ra._late.text() == "", f"{ra._response.text()!r} {ra._late.text()!r}")
+
+    ra = ResponseArea()
+    ra.set_pending("organise my downloads", PENDING.speech, "req-A")
+    ra.set_exchange("what time is it", "It is 3 pm.", True)
+    ra.set_late(late_a)
+    check("D3 A's result arrives while the screen shows request B: B's exchange is untouched",
+          ra._response.text() == "It is 3 pm." and "what time is it" in ra._user_echo.text() and ra._header.text() == "FRIDAY", f"{ra._response.text()!r} {ra._user_echo.text()!r}")
+    check("D4 ...and A's outcome appears on its own line, labelled with A's words",
+          ra._late.isVisibleTo(ra) and "organise my downloads" in ra._late.text() and "Moved 12 files." in ra._late.text(), ra._late.text())
+    ra.set_exchange("next thing", "ok", True)
+    check("D5 the next exchange clears the late line", not ra._late.isVisibleTo(ra))
+
+    ra = ResponseArea()
+    ra.set_pending("do A", PENDING.speech, "req-A")
+    ra.set_pending("do B", "B is still running too", "req-B")
+    ra.set_late({"request_id": "req-A", "utterance": "do A", "speech": "A done.", "ok": True})
+    check("D6 A finishes while B is the one on screen as pending: B's pending text and header are kept",
+          "STILL RUNNING" in ra._header.text() and ra._response.text() == "B is still running too" and "do B" in ra._user_echo.text() and "A done." in ra._late.text(),
+          f"{ra._header.text()!r} {ra._response.text()!r}")
+    ra.set_late({"request_id": "req-B", "utterance": "do B", "speech": "B done.", "ok": True})
+    check("D7 then B finishes: it replaces its own pending text", ra._response.text() == "B done." and ra._header.text() == "FRIDAY" and "do B" in ra._user_echo.text(), f"{ra._response.text()!r}")
+
+    ra = ResponseArea()
+    ra.set_pending("risky", PENDING.speech, "req-E")
+    ra.set_late({"request_id": "req-E", "utterance": "risky", "ok": False, "error": True,
+                 "speech": "The earlier request ended with an error (RuntimeError). Part of it may already have run, so check before repeating it."})
+    check("D8 a late error is shown as a failure (warning colour) and the words say part of it may have run",
+          theme.WARNING in ra._response.styleSheet() and "may already have run" in ra._response.text() and "STILL RUNNING" not in ra._header.text(), ra._response.styleSheet())
+    ra.set_pending("risky two", PENDING.speech, "req-F")
+    ra.set_exchange("something else", "fine", True)
+    ra.set_late({"request_id": "req-F", "utterance": "risky two", "ok": False, "speech": "I could not do it."})
+    check("D9 a late failure on the side line is also a failure colour, never a success presentation", theme.WARNING in ra._late.styleSheet() and ra._response.text() == "fine", ra._late.styleSheet())
+
+    ra = ResponseArea()
+    ra.on_voice_raw_state("executing", {"text": "tidy up"})
+    ra.on_voice_raw_state("speaking", {"text": PENDING.speech, "ok": False, "pending": True, "request_id": "req-V"})
+    ra.set_late({"request_id": "req-V", "utterance": "tidy up", "speech": "Tidied.", "ok": True})
+    check("D10 a voice request's late result replaces its own pending text too", ra._response.text() == "Tidied." and ra._header.text() == "FRIDAY", ra._response.text())
+
+    scenario("E: BUS -> GuiStateHub.lateResult -> MainWindow's ResponseArea (the real wiring)")
+    import asyncio
+
+    from friday.bus import BUS
+    from friday.gui.main_window import MainWindow
+    from friday.gui.state_hub import GuiStateHub
+
+    backend = FakeBackend()
+    hub = GuiStateHub(backend)  # type: ignore[arg-type]
+    hub.start()
+    got: list[dict] = []
+    hub.lateResult.connect(got.append)
+    window = MainWindow(backend, hub)  # type: ignore[arg-type]
+    window._response_area.set_pending("wired request", PENDING.speech, "req-W")
+    payload = dict(request_id="req-W", utterance="wired request", speech="Wired result.", ok=True, error=False, cancelled=False)
+    asyncio.run(BUS.publish("backend.late_result", **payload))
+    app.processEvents()
+    check("E1 a backend.late_result event on the BUS reaches the hub as lateResult, unchanged", got == [payload], str(got))
+    check("E2 and MainWindow shows it in the response area", window._response_area._response.text() == "Wired result." and "wired request" in window._response_area._user_echo.text(), window._response_area._response.text())
+    asyncio.run(BUS.publish("backend.late_result", **payload))
+    app.processEvents()
+    check("E3 the same event delivered again is not shown again", window._response_area._response.text() == "Wired result." and not window._response_area._late.isVisibleTo(window._response_area), window._response_area._late.text())
+    window.close()
+    hub.stop()
+
+    return finish("Phase 40/41 -- UI shows a still-running request and its late result", time.perf_counter() - t0, min_assertions=28, min_scenarios=5)
 
 
 if __name__ == "__main__":
