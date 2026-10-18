@@ -231,6 +231,20 @@ class ConversationLoop:
         log.info("HOTKEY RECEIVED (%s)", CFG.voice.activation_hotkey)
         threading.Thread(target=self._hotkey_cycle, daemon=True, name="voice-hotkey").start()
 
+    def announce_late(self, info: dict) -> bool:
+        """Phase 42: speak a late result (see `VoiceSession.announce`) -- only while the conversation is idle, and with the
+        wake scanner held off for the whole of it (`_tick` stands down while the session is busy) so FRIDAY's own voice
+        cannot wake it. Afterwards the detector and the audio queued meanwhile are dropped, as after any interaction."""
+        return self._session.announce(
+            info, may_start=lambda: self.fsm.state is State.IDLE, after=self._after_announcement,
+        )
+
+    def _after_announcement(self) -> None:
+        with self._wake_lock:
+            self._wake.reset()
+        self._score_window.reset()
+        self._drain_wake_queue()
+
     def _hotkey_cycle(self) -> None:
         log.info("COMMAND LISTENING STARTED (hotkey activation, manual override)")
         self._run_cycle_with_bargein()
@@ -281,9 +295,9 @@ class ConversationLoop:
             last_state = self.fsm.state
             self._emit_fsm()
 
-        if self.fsm.state is not State.IDLE:
-            # A cycle (wake- or hotkey-triggered) or a follow-up window is in
-            # progress — don't score audio, just drain this queue so it
+        if self.fsm.state is not State.IDLE or getattr(self._session, "busy", False):
+            # A cycle (wake- or hotkey-triggered), a follow-up window, or (Phase 42) a spoken late
+            # result is in progress — don't score audio, just drain this queue so it
             # doesn't fill (Phase 8D: suppress wake detection while
             # executing/speaking).
             self._drain_quietly(q)

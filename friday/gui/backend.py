@@ -159,12 +159,12 @@ class Backend:
             with self._late_lock:
                 self._late[key] = (future, request_id)
             # registered once, here; if the future has already ended this runs at once, still exactly one delivery
-            future.add_done_callback(lambda f, rid=request_id, said=text: self._deliver_late(f, rid, said))
+            future.add_done_callback(lambda f, rid=request_id, said=text, who=actor: self._deliver_late(f, rid, said, who))
             return self._still_running_result(repeat=False, request_id=request_id)
 
     LATE_TOPIC = "backend.late_result"
 
-    def _deliver_late(self, future: Future, request_id: str, utterance: str) -> None:
+    def _deliver_late(self, future: Future, request_id: str, utterance: str, actor: str = "") -> None:
         """Publish how the original request really ended. Nothing is re-run and `ask` is not called: this only reads the
         finished future. A result is reported with its own `ok` (never promoted to success); an exception or a
         cancellation is reported as exactly that, and an exception also says part of the request may have run."""
@@ -191,7 +191,7 @@ class Backend:
         log.info("late result for %s: ok=%s error=%s cancelled=%s", request_id, ok, error, cancelled)
         try:
             self.publish(self.LATE_TOPIC, request_id=request_id, utterance=utterance, speech=speech, ok=ok,
-                         error=error, cancelled=cancelled)
+                         error=error, cancelled=cancelled, actor=actor)
         except Exception:
             log.exception("could not publish the late result for %s", request_id)
 

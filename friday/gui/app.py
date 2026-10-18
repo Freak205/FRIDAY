@@ -36,6 +36,16 @@ HOTKEY = "ctrl+alt+space"
 _conversation_loop: Any = None
 
 
+def _speak_late_results(announce: Any) -> None:
+    """Phase 42: voice requests that finish after `Backend.ask` stopped waiting are announced once (best-effort)."""
+    try:
+        from friday.voice.late import subscribe_late_announcements
+
+        subscribe_late_announcements(announce)
+    except Exception:
+        log.exception("late-result announcements unavailable; results are still shown on screen")
+
+
 def _start_voice(backend: Backend, hub: GuiStateHub) -> None:
     """Best-effort at every layer, ported from `friday/desktop.py`'s
     `_start_voice`: a failure anywhere here must never stop the rest of the
@@ -58,6 +68,7 @@ def _start_voice(backend: Backend, hub: GuiStateHub) -> None:
 
         loop = build_conversation_loop(handle_text=handle_text, on_state=hub.on_voice_state)
         HOTKEYS.bind(CFG.voice.activation_hotkey, loop.activate_from_hotkey)
+        _speak_late_results(loop.announce_late)
     except Exception:
         log.exception(
             "conversation/wake-word subsystem failed to initialize; "
@@ -69,6 +80,7 @@ def _start_voice(backend: Backend, hub: GuiStateHub) -> None:
 
             session = build_voice_session(handle_text=handle_text, on_state=hub.on_voice_state)
             HOTKEYS.bind(CFG.voice.activation_hotkey, session.activate)
+            _speak_late_results(session.announce)
             _conversation_loop = None
         except Exception:
             log.exception("voice subsystem failed to initialize entirely; continuing without it")

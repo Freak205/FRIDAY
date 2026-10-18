@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
+from typing import Any
 
 from friday.log import get
 from friday.registry import SkillResult
@@ -79,6 +81,9 @@ class VoiceSession:
         self._capture_tuning = capture_tuning
         self._guard = threading.Lock()
         self._busy = False
+        # Phase 42: late-result announcements are spoken one at a time, each request id at most once.
+        self._announce_lock = threading.Lock()
+        self._announced: OrderedDict[str, None] = OrderedDict()
 
     @property
     def busy(self) -> bool:
@@ -297,6 +302,61 @@ class VoiceSession:
         self._emit("done", ok=result.ok)
         self._log_timings(timings)
         return result
+
+    def announce(
+        self,
+        info: dict[str, Any],
+        *,
+        may_start: Callable[[], bool] | None = None,
+        after: Callable[[], None] | None = None,
+    ) -> bool:
+        """Phase 42: speak the real outcome of a voice request that ended AFTER `Backend.ask` stopped waiting (`info` is
+        the `backend.late_result` payload). Returns True only if it was spoken.
+
+        Safe by construction, never clever: it holds the SAME busy guard a cycle holds, so it can never talk over a running
+        cycle, a confirmation, or another announcement's speech (a second late result waits its turn, in arrival order),
+        and a wake word / hotkey press during it is dropped exactly as during any cycle. It interrupts nothing: when the
+        session is busy, TTS is off, `may_start()` says the conversation is not idle, or there is nothing truthful to say,
+        it does NOT speak (the on-screen result is the record) -- a late result is never queued to be read out of context
+        later. The request id is consumed first, so the same result can never be spoken twice, whether the event is
+        delivered twice or the GUI and voice paths race. It runs no skill and calls no `Backend.ask`."""
+        from friday.voice.late import spoken_text
+
+        request_id = str(info.get("request_id") or "")
+        if not request_id:
+            return False
+        with self._announce_lock:
+            if request_id in self._announced:
+                log.info("late result %s: already announced once; not repeated", request_id)
+                return False
+            self._announced[request_id] = None
+            while len(self._announced) > 100:
+                self._announced.popitem(last=False)
+            text = spoken_text(info, max_chars=self._max_speech_chars)
+            if not text or self._speak is None or not self._tts_enabled():
+                return False
+            if not self._try_acquire():
+                log.info("late result %s: voice is busy; shown on screen only, not spoken over it", request_id)
+                return False
+            spoke = False
+            try:
+                if may_start is not None and not may_start():
+                    log.info("late result %s: a conversation is in progress; shown on screen only", request_id)
+                    return False
+                log.info("late result %s: announcing", request_id)
+                try:
+                    self._speak(text, cancel_check=esc_pressed)
+                    spoke = True
+                except TtsBackendError:
+                    log.exception("tts failed while announcing a late result")
+                return spoke
+            finally:
+                self._release()
+                if spoke and after is not None:
+                    try:
+                        after()
+                    except Exception:
+                        log.exception("post-announcement hook failed")
 
     def _log_timings(self, timings: dict[str, float]) -> None:
         """Logs one line: per-stage deltas since the previous named stage,

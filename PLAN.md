@@ -82,9 +82,26 @@ cancellation - each reported as exactly that; an exception also says part of it 
 moved on to another exchange, that exchange is left alone and the outcome gets its own labelled line (`Earlier request "<words>": ...`);
 each request id is displayed once. No polling, no second task system, no second `Backend.ask`. Tests: `scripts/smoke_backend_ask.py`
 (29), `scripts/smoke_ui_pending.py` (28, incl. the real BUS -> hub -> MainWindow wiring); `smoke_gui.py` and `smoke_voice_pipeline.py`
-(isolated) still pass. Limitations: a late result is displayed, not spoken (the voice path does not speak it); the side line holds one
+(isolated) still pass. Limitations: the side line holds one
 outcome (a second late result replaces the first, and the next exchange clears it); the id/outcome map is in memory only (lost on
-restart); the voice thread is still blocked in `ask` for the whole wait. Still open: the known "how do I get on the network at home"
+restart); the voice thread is still blocked in `ask` for the whole wait.
+**Phase 42 (done):** a VOICE request's late outcome is also spoken, once. `Backend` now puts the originating `actor` on
+`backend.late_result`; `friday/voice/late.py` subscribes (BUS handler -> its own daemon thread, so the backend loop never blocks on
+TTS) and `VoiceSession.announce` speaks it: only `actor == "voice"` (typed stays on screen); the words are the outcome's own
+(`ok=False`/error/cancelled are spoken as exactly that - "didn't succeed", "ended with an error ... may already have run" - never as
+success), run through `toolview.sanitize` and the usual `for_speech` shortening; the request's own words are not read back. Delivery
+rules: the request id is consumed first (at most once, even for a duplicate event or a GUI/voice race); it takes the SAME busy guard a
+voice cycle holds, so it never talks over a running cycle or confirmation and never interrupts anything; a second late result waits
+for the first to finish speaking (spoken in arrival order, never overlapping); if the session is busy, TTS is off, or the
+conversation is not idle (`ConversationLoop.announce_late` -> `fsm.state is IDLE`) it is NOT spoken and NOT queued (the on-screen
+result stays the record - queuing risks reading a stale result into an unrelated conversation). `ConversationLoop._tick` now also
+stands down while the session is busy, so FRIDAY's own announcement cannot wake it; afterwards the wake detector/queue are reset as
+after any interaction. Tests: `scripts/smoke_voice_late.py` (27, fake TTS + wake detector, real Backend/BUS/VoiceSession/
+ConversationLoop); `smoke_voice_conversation.py` (102), `smoke_voice_pipeline.py` (76, isolated) and `smoke_backend_ask.py` (29) still
+pass. Limitations: no barge-in ("Hey Friday") during an announcement (Esc still cancels speech); a late result that arrives while
+voice is busy / mid-conversation is on screen only; the hotkey-only fallback path (no `ConversationLoop`) has no idle-FSM check but
+keeps the busy guard; the check-then-speak window against a simultaneous wake word is not atomic (the busy guard makes the loser
+skip, so at worst that one wake is dropped); not exercised against a real speaker. Still open: the known "how do I get on the network at home"
 recall case (matcher: `network.status` 0.79 > `memory.recall` 0.69, identical at Phase 37).
 
 **Deferred work.** Self-extension; daemon API authentication; recursive folder copy/move/delete (26); drag-timing hardening (27:
