@@ -287,7 +287,9 @@ class VoiceSession:
         log.info("SESSION RESULT: ok=%s", result.ok)
 
         speech = for_speech(result.speech or "Done.", max_chars=self._max_speech_chars)
-        self._emit("speaking", text=speech, ok=result.ok)
+        # Phase 40: a request Backend.ask stopped waiting for is "pending", not a failure (the GUI shows it differently)
+        pending = bool((getattr(result, "data", None) or {}).get("still_running"))
+        self._emit("speaking", text=speech, ok=result.ok, pending=pending)
         timings["tts_start"] = time.perf_counter()
         self._speak_safe(speech)
         timings["tts_end"] = time.perf_counter()

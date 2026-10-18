@@ -41,6 +41,9 @@ class Backend:
         # actually completes each step, for the startup screen's checklist.
         # Never used to synthesize a minimum wait; only to report the truth.
         self.stages: list[str] = []
+        # Phase 40: requests `ask` stopped waiting for but that are still running, by normalised text.
+        self._late: dict[str, Future] = {}
+        self._late_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True, name="friday-core")
 
     # -- lifecycle -------------------------------------------------------------
@@ -124,9 +127,22 @@ class Backend:
         this blocks the calling thread up to `ask_timeout_s()`.
 
         Running out of patience is not a failure of the request: the coroutine keeps running on the backend loop
-        (cancelling it would cut a step in half), so the caller is told exactly that -- not "failed", not "done" --
-        and that STOP ends it.
+        (cancelling it would cut a step in half), so the caller is told exactly that -- not "failed", not "done".
+
+        Phase 40: that request is remembered, and the SAME words asked again while it is still running are not
+        submitted a second time (a retry of a slow state-changing request would run it twice); the caller gets the
+        same "still running" answer, marked `repeat`. A request that has finished, or different words, run as usual.
         """
+        key = " ".join(text.lower().split())
+        with self._late_lock:
+            earlier = self._late.get(key)
+            if earlier is not None and earlier.done():
+                del self._late[key]
+                earlier = None
+        if earlier is not None:
+            log.warning("ask(%r) not resubmitted: the same request is still running", text[:60])
+            return self._still_running_result(repeat=True)
+
         future = asyncio.run_coroutine_threadsafe(
             SESSION.handle(text, actor=actor), self.loop
         )
@@ -134,12 +150,31 @@ class Backend:
             return future.result(timeout=self.ask_timeout_s())
         except FutureTimeout:
             log.warning("ask(%r) still running after %.0fs; not cancelled", text[:60], self.ask_timeout_s())
-            return SkillResult(
-                speech="That is still running; I haven't heard back from it yet, and I haven't stopped it. "
-                       "I can't tell you yet whether it worked. Say stop to end it, or ask me again in a moment.",
-                ok=False,
-                data={"still_running": True},
-            )
+            with self._late_lock:
+                self._late[key] = future
+            return self._still_running_result(repeat=False)
+
+    def _still_running_result(self, *, repeat: bool) -> SkillResult:
+        """The one wording of "this has not finished, and I do not know how it will turn out". It never says it worked or
+        failed, tells the user not to repeat it, and describes STOP as the existing STOP really behaves: it ends a
+        running GOAL (no new step starts; a step already underway may finish; nothing already carried out is reversed), so
+        for a request that is not a goal it says STOP cannot end it rather than promising that it can."""
+        try:
+            from friday.intelligence.state import INTEL
+
+            stoppable = bool(INTEL.goal_running)
+        except Exception:
+            stoppable = False
+        lead = ("That request is still running; I have not started it again." if repeat
+                else "That is still running, and I haven't heard back from it yet.")
+        stop = ("To end it, press STOP or say stop: no new step will start, though a step already underway may finish "
+                "and nothing already carried out is reversed." if stoppable
+                else "STOP cannot end this one; it will finish or time out by itself.")
+        return SkillResult(
+            speech=f"{lead} I can't tell you yet how it turned out, so please don't repeat it. {stop}",
+            ok=False,
+            data={"still_running": True, "repeat": repeat, "stoppable": stoppable},
+        )
 
     def stop(self, *, source: str = "gui", wait: bool = True) -> Any:
         """Stop the running goal. Safe from ANY thread (Qt, hotkey, voice). The stop signal

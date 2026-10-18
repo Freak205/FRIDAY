@@ -60,9 +60,21 @@ goal-scoped signal does not reach; (c) hear a spoken "stop" while a goal runs (t
 (`planner.total_timeout_s`), so a slow goal showed "Something went wrong: " (an empty `TimeoutError`) and then finished in the
 background - a false failure claim. It now waits `max(120, total_timeout_s + 30)` s and, if that still runs out, returns an
 honest "still running, not stopped, I can't tell you whether it worked; say stop" result (`data.still_running`) without
-cancelling the request (`scripts/smoke_backend_ask.py`, 11 checks). Limitation: the late real answer of such a request is not
-shown afterwards. Still open: the `ConfirmPanel` / voice paths show nothing special for `still_running`; the known
-"how do I get on the network at home" recall case (matcher: `network.status` 0.79 > `memory.recall` 0.69, identical at Phase 37).
+cancelling the request (`scripts/smoke_backend_ask.py`). Limitation: the late real answer of such a request is not
+shown afterwards.
+**Phase 40 (done):** the UI now treats `still_running` as its own state. `Backend.ask` remembers a request it stopped waiting for
+and does NOT submit the same words (case/spacing aside) a second time while it is still running - the caller gets the same
+answer marked `repeat` (so a retry cannot run a state-changing request twice); the wording says it is unfinished, that nothing
+is known about the outcome, not to repeat it, and describes STOP truthfully: for a running *goal* (`INTEL.goal_running`) it
+ends it (no new step; one underway may finish; nothing reversed), otherwise "STOP cannot end this one" (the existing STOP only
+applies to a goal or a pending confirmation). `CommandBar.exchangePending` -> `ResponseArea.set_pending` show it under a
+"STILL RUNNING" header in the accent colour (not the failure colour); the voice `speaking` event carries `pending` and
+`ResponseArea` honours it. No new status system: STOP button / task panel remain INTEL-driven. Tests: `scripts/smoke_backend_ask.py`
+(20), `scripts/smoke_ui_pending.py` (15, offscreen Qt); `smoke_gui.py` and `smoke_voice_pipeline.py` (isolated) still pass.
+Limitations: the voice thread is still blocked in `ask` for the whole wait (a spoken "stop" is only heard after it returns);
+the late real answer is still not shown; `ConfirmPanel` needs nothing (a "yes" returns at once, the original request carries
+the wait). Still open: the known "how do I get on the network at home" recall case (matcher: `network.status` 0.79 >
+`memory.recall` 0.69, identical at Phase 37).
 
 **Deferred work.** Self-extension; daemon API authentication; recursive folder copy/move/delete (26); drag-timing hardening (27:
 one unexplained intermittent failure, not reproduced in 56 drags since).

@@ -20,6 +20,8 @@ from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 from . import theme
 
 _IDLE_PLACEHOLDER = "Ask a question, type a command, or say the wake word."
+_HEADER = "FRIDAY"
+_PENDING_HEADER = "FRIDAY · STILL RUNNING"
 
 
 class ResponseArea(QWidget):
@@ -39,7 +41,7 @@ class ResponseArea(QWidget):
         self._user_echo.hide()
         outer.addWidget(self._user_echo, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        header_row = QLabel("FRIDAY")
+        header_row = QLabel(_HEADER)
         header_row.setObjectName("responseHeader")
         header_row.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         outer.addWidget(header_row)
@@ -63,27 +65,42 @@ class ResponseArea(QWidget):
     def set_exchange(self, user_text: str, friday_text: str, ok: bool) -> None:
         self._user_echo.setText(f"“{user_text}”")
         self._user_echo.show()
-        self._response.setText(friday_text or "…")
-        self._response.setStyleSheet("" if ok else f"color: {theme.WARNING};")
+        self._show_response(friday_text or "…", ok=ok)
         self._has_content = True
+
+    def set_pending(self, user_text: str, friday_text: str) -> None:
+        """Phase 40: the request is still running (`Backend.ask` stopped waiting, it did not finish). Shown under its own
+        header and in the accent colour -- not the warning colour of a failure -- so it is not mistaken for one."""
+        self._user_echo.setText(f"“{user_text}”")
+        self._user_echo.show()
+        self._show_response(friday_text or "Still running.", pending=True)
+        self._has_content = True
+
+    def _show_response(self, text: str, *, ok: bool = True, pending: bool = False) -> None:
+        self._header.setText(_PENDING_HEADER if pending else _HEADER)
+        self._response.setText(text)
+        if pending:
+            self._response.setStyleSheet(f"color: {theme.ACCENT};")
+        else:
+            self._response.setStyleSheet("" if ok else f"color: {theme.WARNING};")
 
     # -- voice path (GuiStateHub.voiceRawState) ----------------------------------
 
     def on_voice_raw_state(self, state: str, data: dict) -> None:
+        if state in ("cancelled", "empty", "error"):
+            self._header.setText(_HEADER)  # these replace the text below; a previous "still running" header must not stay
         if state == "executing":
             text = str(data.get("text") or "")
             if text:
                 self._user_echo.setText(f"“{text}”")
                 self._user_echo.show()
-                self._response.setText("…")
-                self._response.setStyleSheet("")
+                self._show_response("…")
                 self._has_content = True
         elif state == "speaking":
             text = str(data.get("text") or "")
             ok = bool(data.get("ok", True))
             if text:
-                self._response.setText(text)
-                self._response.setStyleSheet("" if ok else f"color: {theme.WARNING};")
+                self._show_response(text, ok=ok, pending=bool(data.get("pending")))
                 self._has_content = True
         elif state in ("conversation.wake_detected", "listening"):
             if not self._has_content:
