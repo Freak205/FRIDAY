@@ -41,6 +41,13 @@ _FILLER = frozenset(
 )
 
 
+# A query that talks ABOUT forgetting ("i forgot ...", "don't forget ...") without an imperative forget/delete lead.
+_NOT_A_FORGET = re.compile(r"\b(?:forgot(?:ten)?|(?:don'?t|do not|never|not)\s+forget)\b", re.IGNORECASE)
+_FORGET_COMMAND = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:forget|delete|erase|remove|clear|wipe)\b", re.IGNORECASE
+)
+
+
 def _content_words(text: str) -> set[str]:
     words = re.findall(r"[a-z0-9]+", text.lower().replace("'s", ""))
     return {w[:-1] if len(w) > 3 and w.endswith("s") else w for w in words if w not in _FILLER}
@@ -227,6 +234,14 @@ def list_memories(
 def forget(
     query: Annotated[str, "what to forget"],
 ) -> SkillResult:
+    # Phase 38: "I forgot my umbrella" / "don't forget my umbrella" are not instructions to delete a stored memory,
+    # however close an embedding finds them to one. Nothing is looked up, let alone removed.
+    if _NOT_A_FORGET.search(query) and not _FORGET_COMMAND.match(query):
+        return SkillResult(
+            speech="I only forget things when you tell me to, like \"forget my old address\". Nothing was deleted.",
+            ok=False,
+            data={"deleted": False},
+        )
     cleaned = re.sub(
         r"^\s*(please\s+)?(forget|delete|erase|remove)\s+"
         r"(what (i|you) (said|know|told me) about\s+|that\s+|my\s+)?",

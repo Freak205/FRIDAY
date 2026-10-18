@@ -551,6 +551,135 @@ def suite_store_and_questions() -> None:
     check("synthetic: a planner hand-off for a personal-memory question becomes recall (the planner would invent an answer)",
           directroute.refine(planner.utterance, planner).skill == "memory.recall")
 
+    say("\n--- 8d. Phase 38: 'my <thing>'s name' and 'I forgot my X, what was it?' are recalls; system asks and writes are not ---\n")
+    for text in ("What is my laptop's name?", "what's my laptop's name", "what is my laptop name", "what is my computer's name",
+                 "do you remember my laptop's name", "what did I say my laptop's name was",
+                 "I forgot my blood type, what was it?", "I forgot my locker number, what was it?",
+                 "i can't remember my passport number, can you tell me", "I forgot my blood type, do you remember it?",
+                 "I forgot my laptop's name, what was it?"):
+        u, a = _decide(text)
+        check(f"phase 38 recall: {text!r} -> memory.recall, direct and safe", u.skill == "memory.recall" and a.safe and u.action is Action.ACT, f"{u.skill} {a.reason}")
+        check(f"personal_memory_question({text!r}) is True", directroute.personal_memory_question(text))
+    for text in ("What is my laptop's battery level?", "what is my screen resolution", "what is my cpu usage", "what is the size of my downloads folder",
+                 "what is my wifi name", "what's my wifi's name", "what is my network name", "what is my username", "what is my hostname",
+                 "what is my gpu's name", "what is my project's name", "what is my workspace's name", "what is my desktop's name",
+                 "what is my laptop's ram usage", "what is my git status", "what time is it", "what's the weather",
+                 "I forgot my umbrella", "I forgot my passport at home", "i forgot my password, reset it",
+                 "I forgot my blood type, what was it? and delete the downloads folder",
+                 "what is my laptop's name and shut it down", "remember my laptop's name is Orion", "remember that my blood type is O+",
+                 "my laptop's name is Orion", "i forgot my blood type, remember it is O+"):
+        check(f"personal_memory_question({text!r}) is False", not directroute.personal_memory_question(text))
+    for text, want in [("What is my laptop's battery level?", "system.battery"), ("what is my cpu usage", "system.info"),
+                       ("what is my wifi name", "network.status"), ("what is my git status", "dev.git"), ("what time is it", "system.time"),
+                       ("what is my screen resolution", "screen.observe"), ("remember my blood type is O+", "memory.remember")]:
+        u, a = _decide(text)
+        check(f"phase 38: {text!r} is left on {want}", u.skill == want, f"{u.skill}")
+    for text in ("remember my laptop's name is Orion", "remember that my blood type is O+", "i forgot my blood type, remember it is O+"):
+        u, a = _decide(text)
+        check(f"phase 38: the write {text!r} is never redirected to a safe recall", not (u.skill == "memory.recall" and a.safe), f"{u.skill} {a.reason}")
+    tie = U("system.battery", {}, "what is my laptop's name", score=0.74, candidates=[Match("system.battery", 0.74, ""), Match("process.top", 0.735, "")])
+    r = directroute.refine(tie.utterance, tie)
+    check("synthetic: a battery / process.top coin-flip on 'my laptop's name' becomes a safe recall", r.skill == "memory.recall" and directroute.assess(tie.utterance, r).safe, f"{r.skill}")
+    sysq = U("system.battery", {}, "what is my laptop's battery level", score=0.85, candidates=[Match("system.battery", 0.85, "")])
+    check("synthetic: 'my laptop's battery level' is left alone", directroute.refine(sysq.utterance, sysq) is sysq)
+
+    say("\n--- 8e. Phase 38 hardening: compound requests, 'I forgot ...', deterministic personal writes, statements ---\n")
+    COMPOUND = ("What is my laptop's name and shut it down", "what is my blood type and shut it down", "what is my laptop's name, then lock the screen",
+                "tell me my blood type and restart the computer", "shut down and tell me my blood type",
+                "remember my laptop's name is Orion and shut it down", "remember my blood type is O positive and shut it down",
+                "what is my blood type and what is my laptop's name", "what time is it and what's the weather",
+                "what is my blood type and delete the downloads folder")
+    for text in COMPOUND:
+        u, a = _decide(text)
+        check(f"compound: {text!r} is never a safe single direct route", not a.safe or u.action not in (Action.ACT, Action.ASK_SLOT), f"{u.skill} {a.reason}")
+        check(f"compound: {text!r} has two request clauses", len(directroute.request_clauses(text)) >= 2, f"{directroute.request_clauses(text)}")
+        check(f"compound: personal_memory_question({text!r}) is False", not directroute.personal_memory_question(text))
+        check(f"compound: explicit_store({text!r}) stores nothing", directroute.explicit_store(text) is None)
+    for text in ("What is my laptop's name?", "I forgot my blood type, what was it?", "remind me what my locker number is", "what did I say my laptop's name was",
+                 "Remember my laptop's name is Orion.", "what time is it", "what is the weather in paris"):
+        check(f"single request: {text!r} is not a compound", len(directroute.request_clauses(text)) <= 1, f"{directroute.request_clauses(text)}")
+    u, a = _decide("What is my laptop's name and shut it down")
+    check("the raw system.shutdown pick for the compound is refused with compound_request", u.skill == "system.shutdown" and has(a, "compound_request"), f"{u.skill} {a.reason}")
+    u, a = _decide("shut down the computer")
+    check("a plain 'shut down the computer' is still its own direct route", u.skill == "system.shutdown" and a.safe, f"{u.skill} {a.reason}")
+
+    for text in ("I forgot my umbrella", "i forgot my keys at home", "I forgot to lock the door", "I forgot my laptop's name", "we've forgotten the wifi name"):
+        u, a = _decide(text)
+        check(f"statement: {text!r} is never forget / lock / any executable direct route",
+              not (u.action in (Action.ACT, Action.ASK_SLOT) and a.safe) and u.skill not in ("memory.forget", "knowledge.forget"), f"{u.skill} {u.action} {a.reason}")
+    for text, skill in (("I forgot my umbrella", "memory.forget"), ("don't forget my umbrella", "memory.forget"), ("i forgot my keys", "knowledge.forget")):
+        forced = U(skill, {"query": text}, text, score=0.99)
+        check(f"a {skill} decision for {text!r} is refused whatever its score", has(verdict(forced), "not_a_forget_instruction"), verdict(forced).reason)
+    for text in ("forget my old address", "forget the fact I told you about my old address", "please forget my wifi password", "can you forget what I said about the deadline",
+                 "delete that memory", "erase what you know about my car"):
+        forced = U("memory.forget", {"query": text}, text, score=0.95)
+        check(f"an explicit forget {text!r} is not refused as a non-instruction", not has(verdict(forced), "not_a_forget_instruction"), verdict(forced).reason)
+    forgot_q = U("memory.recall", {"query": "i forgot my blood type what was it"}, "I forgot my blood type, what was it?", score=0.65)
+    check("'I forgot my blood type, what was it?' as a recall is not refused as a past-tense statement", not has(verdict(forgot_q), "not_a_request"), verdict(forgot_q).reason)
+
+    for text in ("Remember my laptop's name is Orion.", "Remember my blood type is O positive.", "remember that my laptop's name is Orion",
+                 "please remember my blood type is O positive", "Remember my blood type is O+."):
+        u, a = _decide(text)
+        check(f"write: {text!r} -> memory.remember, direct and safe", u.skill == "memory.remember" and a.safe and u.action is Action.ACT, f"{u.skill} {a.reason}")
+        check(f"write: {text!r} keeps the value exactly as said", text.rstrip(".").split(" ", 1)[-1].lower().split()[-1] in str(u.args.get("text", "")).lower(), f"{u.args}")
+    u, a = _decide("Remember my blood type is O+.")
+    check("write: the '+' in 'O+' is not dropped", "O+" in str(u.args.get("text", "")), f"{u.args}")
+    u, a = _decide("remember to call mom")
+    check("'remember to call mom' is a reminder, not a stored fact", u.skill != "memory.remember", f"{u.skill}")
+    for text in ("do you remember my blood type", "can you remember my laptop's name", "what did I tell you about my laptop's name"):
+        u, a = _decide(text)
+        check(f"{text!r} stays a recall, never a write", u.skill == "memory.recall" and a.safe, f"{u.skill} {a.reason}")
+    for text in ("do you remember my blood type", "can you remember my laptop's name", "what did I tell you about my laptop's name"):
+        check(f"explicit_store({text!r}) is None (a question is never a write)", directroute.explicit_store(text) is None)
+
+    for text in ("My cat's name is Tom", "my cat's name is Tom.", "my blood type is O positive", "my laptop's name is Orion", "my birthday is march 3rd"):
+        check(f"personal_statement({text!r}) is True", directroute.personal_statement(text))
+        u, a = _decide(text)
+        check(f"statement: {text!r} is not executed (no recall, no clock, no battery) and says what it would take",
+              u.action is Action.UNKNOWN and u.skill is None and "remember" in u.speech.lower(), f"{u.skill} {u.action} {u.speech!r}")
+    for text in ("what is my cat's name", "is my cat's name Tom?", "my screen is flickering", "my laptop's battery is low", "my wifi name is slow", "remember my cat's name is Tom",
+                 "my cat's name is Tom and delete the downloads folder", "my git status is clean"):
+        check(f"personal_statement({text!r}) is False", not directroute.personal_statement(text))
+    u, a = _decide("my sister's name is Priya")
+    check("the existing taught convention 'my sister's name is priya' still stores", u.skill == "memory.remember" and a.safe, f"{u.skill} {a.reason}")
+
+    say("\n--- 8e2. Phase 38: two requested facts never get one answer; explicit memory forgets are deterministic ---\n")
+    for text in ("what's my battery level and cpu usage", "what is my battery level and CPU usage?", "battery level and cpu usage", "tell me the battery and the cpu usage",
+                 "what time is it and the weather", "check the weather and the time", "show cpu and gpu usage", "what is my volume and brightness",
+                 "set the volume to 30 and the brightness to 50"):
+        u, a = _decide(text)
+        check(f"two facts: {text!r} is never a safe single direct skill call", not (a.safe and u.action in (Action.ACT, Action.ASK_SLOT)), f"{u.skill} {a.reason}")
+        check(f"two facts: {text!r} is named as more than one kind of fact", len(directroute.facts_named(text)) >= 2, f"{directroute.facts_named(text)}")
+    for text, want in (("what's the battery level", "system.battery"), ("what is my cpu usage", "system.info"), ("cpu and ram usage", "system.info"),
+                       ("disk space and ram usage", "system.info"), ("what is the date and time", "system.time"), ("how much disk space is left", "system.info"),
+                       ("what's the volume", "system.volume.get"), ("what is my laptop's battery level", "system.battery")):
+        u, a = _decide(text)
+        check(f"one kind of fact: {text!r} is still its own direct route ({want})", u.skill == want and a.safe, f"{u.skill} {a.reason}")
+    for skill, text in (("system.info", "cpu usage and battery level"), ("system.battery", "battery level and cpu usage"), ("system.time", "the time and the weather")):
+        check(f"synthetic: {skill} for {text!r} is refused whatever its score", has(verdict(U(skill, {}, text, score=0.99)), "multiple_facts"), verdict(U(skill, {}, text, score=0.99)).reason)
+    check("synthetic: a skill that answers every named kind is not refused", verdict(U("system.info", {}, "cpu and ram usage", score=0.7)).safe)
+    check("synthetic: a skill outside the fact table is not judged by it", not has(verdict(U("memory.recall", {"query": "my battery and cpu"}, "what is my battery and cpu", score=0.95)), "multiple_facts"))
+
+    for text in ("forget the fact I told you about my old address", "forget that my cat is named Tom", "forget my cat's name", "forget my old address",
+                 "forget that I told you my blood type", "please forget my wifi password", "can you forget what I said about the deadline", "delete my old address"):
+        u, a = _decide(text)
+        check(f"forget: {text!r} -> memory.forget, direct and safe", u.skill == "memory.forget" and a.safe and u.action is Action.ACT, f"{u.skill} {u.action} {a.reason}")
+    for text, want in (("forget the document about taxes", "knowledge.forget"), ("forget the document I added", "knowledge.forget"), ("stop remembering that pdf", "knowledge.forget"),
+                       ("forget my reminders", "schedule.delete")):
+        u, a = _decide(text)
+        check(f"forget: {text!r} is NOT turned into a memory forget (stays {want})", u.skill == want, f"{u.skill} {a.reason}")
+    for text in ("forget the knowledge about onboarding", "forget my old address and shut it down", "forget it", "forget everything"):
+        u, a = _decide(text)
+        check(f"forget: {text!r} is not a safe direct memory.forget", not (u.skill == "memory.forget" and a.safe), f"{u.skill} {a.reason}")
+    for text in ("forget the onboarding document", "forget the knowledge about onboarding"):
+        check(f"synthetic: memory.forget for the document phrase {text!r} is refused whatever its score",
+              has(verdict(U("memory.forget", {"query": text}, text, score=0.95)), "forget_target_is_not_a_memory"), verdict(U("memory.forget", {"query": text}, text, score=0.95)).reason)
+    for text in ("I forgot my umbrella", "don't forget my umbrella"):
+        u, a = _decide(text)
+        check(f"{text!r}: no skill at all (not forget, not remember)", u.skill is None and u.action is Action.UNKNOWN and bool(u.speech), f"{u.skill} {u.action}")
+    u, a = _decide("don't forget my car is parked on level 3")
+    check("'don't forget my car is parked on level 3' (a stated fact) keeps storing", u.skill == "memory.remember" and a.safe, f"{u.skill} {a.reason}")
+
     say("\n--- 8b. a clear knowledge question stays on knowledge.ask ---\n")
     ask_cases = ["how much is the marketing budget", "when does the office lease need renewing", "who is sending over the signed contract"]
     with _mock.patch.object(directroute, "_kb_has_documents", lambda: True):
@@ -584,6 +713,83 @@ def suite_store_and_questions() -> None:
         check("an EMPTY knowledge base: a read-vs-read tie is NOT waved through", u.skill != "knowledge.ask" or not a.safe, f"{u.skill} {a.reason}")
         u, a = _decide("how much is the marketing budget")
         check("... but a question that only ties with a mutating rival is still waved through (it can only be answered, never stored)", a.safe, f"{u.skill} {a.reason}")
+
+
+async def suite_phase38_session() -> None:
+    """Phase 38 end to end (real BRAIN + Session, executor recorded so nothing real runs): a rejected request executes
+    NOTHING -- no half of a compound, no forget, no recall-as-answer -- and the deterministic write is exactly one
+    memory.remember call through the executor."""
+    from friday.session import SESSION
+
+    say("\n--- 8f. Phase 38 end to end: a rejected request runs no part of itself ---\n")
+    compound = ("What is my laptop's name and shut it down", "what is my blood type and shut it down",
+                "remember my laptop's name is Orion and shut it down", "what is my laptop's name, then lock the screen")
+    with cfg("planner", postcondition_verify=False):
+        for prompt in compound:
+            reset_session()
+            with recorded_executor() as rec:
+                await SESSION.handle(prompt, actor="test")
+            check(f"planner on: {prompt!r} goes to the planner whole; no system action or recall ran on its own",
+                  rec.tools == ["plan.run"] and rec.calls[0][1].get("goal") == prompt, f"tools={rec.tools}")
+    with cfg("planner", enabled=False):
+        for prompt in compound:
+            reset_session()
+            with recorded_executor() as rec:
+                r = await SESSION.handle(prompt, actor="test")
+            check(f"planner off: {prompt!r} runs no half of itself (only the planner hand-off, which declines when off)",
+                  set(rec.tools) <= {"plan.run"}, f"tools={rec.tools} ok={r.ok} {r.speech!r}")
+    facts = ("what's my battery level and cpu usage", "what is my battery level and CPU usage?", "what time is it and the weather", "set the volume to 30 and the brightness to 50")
+    partial = {"system.info", "system.battery", "system.time", "weather.now", "process.top", "system.volume.set", "system.brightness.set", "system.brightness.get", "system.volume.get"}
+    with cfg("planner", postcondition_verify=False):
+        for prompt in facts:
+            reset_session()
+            with recorded_executor() as rec:
+                await SESSION.handle(prompt, actor="test")
+            check(f"planner on: {prompt!r} goes to the planner whole; no single skill answered half of it",
+                  rec.tools == ["plan.run"] and rec.calls[0][1].get("goal") == prompt, f"tools={rec.tools}")
+    with cfg("planner", enabled=False):
+        for prompt in facts:
+            reset_session()
+            with recorded_executor() as rec:
+                r = await SESSION.handle(prompt, actor="test")
+            check(f"planner off: {prompt!r} answers neither fact on its own and does not claim success",
+                  not (set(rec.tools) & partial) and not (r.ok and bool(rec.tools) and rec.tools != ["plan.run"]), f"tools={rec.tools} ok={r.ok} {r.speech!r}")
+        for prompt, want in (("what's the battery level", ["system.battery"]), ("what is my cpu usage", ["system.info"])):
+            reset_session()
+            with recorded_executor() as rec:
+                await SESSION.handle(prompt, actor="test")
+            check(f"one fact: {prompt!r} still runs exactly {want}", rec.tools == want, f"tools={rec.tools}")
+    with cfg("planner", postcondition_verify=False):
+        for prompt in ("forget that my cat is named Tom", "forget the fact I told you about my old address", "forget my old address"):
+            reset_session()
+            with recorded_executor() as rec:
+                await SESSION.handle(prompt, actor="test")
+            check(f"{prompt!r}: exactly one memory.forget through the executor (so confirmation + audit apply), no planner",
+                  rec.tools == ["memory.forget"], f"tools={rec.tools}")
+        for prompt in ("I forgot my umbrella", "don't forget my umbrella"):
+            reset_session()
+            with recorded_executor() as rec:
+                r = await SESSION.handle(prompt, actor="test")
+            check(f"{prompt!r}: neither forgets nor stores (nothing executes)", rec.tools == [] and not r.ok and bool(r.speech), f"tools={rec.tools} {r.speech!r}")
+    with cfg("planner", postcondition_verify=False):
+        for prompt in ("I forgot my umbrella", "i forgot my keys at home", "My cat's name is Tom", "my blood type is O positive", "my birthday is march 3rd"):
+            reset_session()
+            with recorded_executor() as rec:
+                r = await SESSION.handle(prompt, actor="test")
+            check(f"{prompt!r}: nothing executes (no forget, recall, clock or planner) and the user is told what would work",
+                  rec.tools == [] and not r.ok and bool(r.speech), f"tools={rec.tools} {r.speech!r}")
+        for prompt, want in (("Remember my laptop's name is Orion.", "Orion"), ("Remember my blood type is O positive.", "O positive"), ("Remember my blood type is O+.", "O+")):
+            reset_session()
+            with recorded_executor() as rec:
+                await SESSION.handle(prompt, actor="test")
+            check(f"{prompt!r}: exactly one memory.remember through the executor, value intact",
+                  rec.tools == ["memory.remember"] and want in rec.calls[0][1].get("text", ""), f"{rec.calls}")
+        for prompt in ("What is my laptop's name?", "I forgot my blood type, what was it?"):
+            reset_session()
+            with recorded_executor() as rec:
+                await SESSION.handle(prompt, actor="test")
+            check(f"{prompt!r}: still exactly one memory.recall", rec.tools == ["memory.recall"], f"{rec.tools}")
+        reset_session()
 
 
 async def suite_store_end_to_end() -> None:
@@ -900,7 +1106,7 @@ def main() -> int:
         failed = 0
         for suite in (
             suite_gate, suite_session, suite_benchmark_prompts, suite_legitimate,
-            suite_store_and_questions, suite_store_end_to_end, suite_verification, suite_truthful, suite_switches,
+            suite_store_and_questions, suite_phase38_session, suite_store_end_to_end, suite_verification, suite_truthful, suite_switches,
         ):
             failed += run_suite(suite)
         failed += mutation_testing()

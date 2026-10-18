@@ -263,11 +263,114 @@ def _check_second_instruction(u: Understanding) -> str | None:
     return None
 
 
+# Phase 38: a request is more than one when two of its clauses are each a request. The verb table alone misses the
+# read half ("what is my laptop's name" has no action verb) and phrasal system verbs ("shut it down"), so
+# "what is my laptop's name and shut it down" used to look like ONE request and ran as a bare system.shutdown.
+_CLAUSE_JOIN = re.compile(r"\s*(?:[,;]|\band\s+then\b|\band\s+also\b|\bthen\b|\balso\b|\bafter\s+that\b|\bplus\b|\band\b)\s*", re.IGNORECASE)
+_READ_LEAD = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?(?:(?:what|when|where|who|whom|whose|which|how)\b"
+    r"|(?:tell|show|remind)\s+me\b|do\s+i\s+have\b|do\s+you\s+(?:know|remember)\b|is\s+my\b|are\s+my\b)",
+    re.IGNORECASE,
+)
+_SYSTEM_IMPERATIVE = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?(?:shut\s*(?:\w+\s+)?down|shutdown|power\s+(?:off|down)|turn\s+(?:it\s+)?off"
+    r"|restart|reboot|log\s*(?:off|out)|sign\s*out|hibernate|lock\b|sleep\b)",
+    re.IGNORECASE,
+)
+
+
+def request_clauses(text: str) -> list[str]:
+    """The clauses of `text` that are each a request in their own right: a question (interrogative lead), a spoken
+    system command ("shut it down"), or anything the verb table recognises as an action."""
+    masked = mask_operands(text)
+    out: list[str] = []
+    for clause in _CLAUSE_JOIN.split(masked):
+        if clause.strip() and (
+            _READ_LEAD.match(clause) or _SYSTEM_IMPERATIVE.match(clause)
+            or any(intent.clause_verbs(clause))
+        ):
+            out.append(clause.strip())
+    return out
+
+
 def _check_compound_request(text: str, u: Understanding) -> str | None:
+    if u.skill and u.skill.startswith("memory.") and len(request_clauses(text)) >= 2:
+        # the memory skills parse their own input (exempt below), but one of them silently answering half of a
+        # two-part request -- or storing it -- is exactly the dropped intent this check exists for
+        return "compound_request:memory"
+    if sum(1 for c in _CLAUSE_JOIN.split(mask_operands(text)) if _READ_LEAD.match(c)) >= 2:
+        return "compound_request:questions"  # two questions, one skill call: "what time is it and what's the weather"
     if parses_own_input(u.skill or "") or u.score >= CONFIDENT_SCORE:
         return None
     acting = [c for c in intent.clause_verbs(mask_operands(text)) if c]
-    return "compound_request" if len(acting) >= 2 else None
+    return "compound_request" if max(len(acting), len(request_clauses(text))) >= 2 else None
+
+
+# Phase 38: one read-only skill answers ONE kind of fact. "what's my battery level and cpu usage" matches system.info
+# (cpu / memory / disk) at 0.86 and would answer the cpu half only, in a reply that sounds complete. When the sentence
+# names facts from two different kinds, the chosen skill has to cover every one of them, else the request is not direct.
+# Deliberately small: a handful of kinds of machine fact, and only skills that answer exactly one kind are listed (a skill
+# not listed here is never judged by this check).
+_FACTS = {
+    "battery": r"batter(?:y|ies)|charging|plugged\s+in",
+    "resources": r"cpu|processor|ram|memory|disk|storage",
+    "gpu": r"gpu|graphics\s+card",
+    "time": r"time|date|clock",
+    "weather": r"weather|forecast|rain|raining",
+    "volume": r"volume",
+    "brightness": r"brightness",
+    "network": r"wi-?fi|network|internet|ip\s+address",
+}
+_FACTS_ANSWERED = (
+    ("system.battery", {"battery"}), ("system.info", {"resources"}), ("process.top", {"resources"}),
+    ("system.time", {"time"}), ("weather.", {"weather"}), ("system.volume.", {"volume"}),
+    ("system.brightness.", {"brightness"}), ("network.", {"network"}),
+)
+
+
+def facts_named(text: str) -> set[str]:
+    t = (text or "").lower()
+    return {kind for kind, words in _FACTS.items() if re.search(rf"\b(?:{words})\b", t)}
+
+
+def _check_multiple_facts(text: str, u: Understanding) -> str | None:
+    answered = next((kinds for prefix, kinds in _FACTS_ANSWERED if (u.skill or "").startswith(prefix)), None)
+    if answered is None:
+        return None
+    named = facts_named(text)
+    return f"multiple_facts:{'+'.join(sorted(named))}" if len(named) >= 2 and not named <= answered else None
+
+
+# Phase 38: "I forgot my umbrella" is a thing that happened, not "forget my umbrella" and not a request of any kind.
+_FORGOT_STATEMENT = re.compile(r"^\s*(?:please\s+)?(?:i|we)(?:\s+have|['’]ve)?\s+(?:forgot(?:ten)?)\b", re.IGNORECASE)
+# The only ways to tell FRIDAY to delete a stored memory / document by voice: an imperative lead.
+_FORGET_COMMAND = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+|i\s+(?:want|need)\s+you\s+to\s+|you\s+(?:can|should|must)\s+)?"
+    r"(?:forget|delete|erase|remove|clear|wipe|stop\s+remembering)\b", re.IGNORECASE
+)
+
+
+def _check_forget_intent(text: str, u: Understanding) -> str | None:
+    """`memory.forget` / `knowledge.forget` delete stored data, so the words must ask for that: an imperative
+    forget/delete/erase ("forget my old address"). "I forgot my umbrella" and "don't forget my umbrella" do not."""
+    if (u.skill or "") not in ("memory.forget", "knowledge.forget"):
+        return None
+    if not _FORGET_COMMAND.match(text or ""):
+        return "not_a_forget_instruction"
+    # memory.forget deletes what the user TOLD FRIDAY; a document / file / note is another skill's (knowledge.forget, files,
+    # notes), so a "forget the knowledge about onboarding" the matcher gave to memory.forget by a hair is not direct
+    target = _MEMORY_FORGET.match(text or "")
+    if u.skill == "memory.forget" and target and _NOT_MEMORY.search(target.group("target")) and not _TOLD_YOU.search(target.group("target")):
+        return "forget_target_is_not_a_memory"
+    return None
+
+
+def _check_forgot_statement(text: str, u: Understanding) -> str | None:
+    """"I forgot ..." describes the past. Whatever skill the matcher picked, it was not asked for -- unless the
+    sentence closes with a recall question about a personal fact ("I forgot my blood type, what was it?")."""
+    if not _FORGOT_STATEMENT.match(text or "") or personal_memory_question(text):
+        return None
+    return "not_a_request:past_statement"
 
 
 def _is_recall_question(text: str) -> bool:
@@ -403,9 +506,14 @@ def explicit_store(text: str) -> str | None:
     words = re.findall(r"[\w']+", fact)
     if len(words) < 2 or (not m.group("that") and words[0].lower() in _NOT_A_FACT_START):
         return None
-    if sum(1 for clause in intent.clause_verbs(mask_operands(text)) if clause) >= 2:
-        return None
+    if sum(1 for clause in intent.clause_verbs(mask_operands(text)) if clause) >= 2 or len(request_clauses(text)) >= 2:
+        return None  # "remember my laptop's name is Orion and shut it down" stores nothing and shuts nothing down
     return fact
+
+
+# Phase 38: the one shape of store instruction that is safe to make deterministic whatever the matcher guessed:
+# "remember my <thing> is <value>". Anything vaguer ("remember the meeting at 5") keeps the narrower Phase 30.1 rule.
+_ASSERTION = re.compile(r"^(?:that\s+)?(?:my|our)\s+(?P<scope>(?:[a-z]+(?:['’]s)?\s+){0,2}[a-z]+(?:['’]s)?)\s+(?:is|are|was|were)\s+\S", re.IGNORECASE)
 
 
 # An unmistakable request to LIST the indexed documents. The matcher scores "list my documents" a hair closer
@@ -496,9 +604,55 @@ _NOT_PERSONAL_MORE = frozenset((
 ).split())
 
 
+# Phase 38, gap 1: "what is my laptop's name" -- the owner is a thing, not on the personal-noun list, and the matcher
+# scores it as system.battery ("laptop"), which then ties with process.top, so the gate sent it to the planner. No skill
+# reports a machine's name, so a "<thing>'s name" can only be what the user once told FRIDAY. Only the attribute
+# "name"/"nickname" is added (never "laptop" itself: "my laptop's battery level" stays a system question), and the
+# owner may not be a network / account / process word whose name a system skill DOES answer ("my wifi name").
+_NAME_OF_MINE = re.compile(r"^(?:[a-z]+\s+)?[a-z]+(?:'s)?\s+(?:name|nickname)$", re.IGNORECASE)
+_NAME_NOT_PERSONAL = frozenset(
+    "wifi wi fi network ssid router hotspot bluetooth vpn user username account profile host hostname process service "
+    "task device session server domain workgroup printer gpu cpu ram project workspace desktop repo branch monitor app".split()
+)
+# Phase 38, gap 2: "I forgot my blood type, what was it?" opens with a statement, so the question frame never matched
+# (it only reached recall on a lucky 0.65 score). The statement only counts with a recall question closing it, so
+# "I forgot my passport at home" is not a lookup.
+_FORGOT_Q = re.compile(
+    r"^\s*(?:please\s+)?(?:i|i['\u2019]ve)\s+(?:forgot(?:ten)?|have\s+forgotten|can['\u2019]?t\s+remember|cannot\s+remember"
+    r"|don['\u2019]?t\s+remember|do\s+not\s+remember)\s+(?P<rest>my\b.+?)[,;:]?\s*"
+    r"(?:and\s+)?(?:what\s+(?:was|is|were|are)\s+(?:it|that|they)|(?:can|could|would)\s+you\s+(?:tell|remind)\s+me"
+    r"|do\s+you\s+(?:know|remember)(?:\s+(?:it|that|them))?)\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _personal_scope(scope: str) -> bool:
+    """Is the phrase after "my" a personal fact the user can have told FRIDAY: a personal noun, or the "name" of
+    something that is not a network / account / process / hardware thing?"""
+    scope = re.sub(r"\s+(?:was|is|were|are)$", "", scope.strip().lower())  # "what did I say my laptop's name was"
+    scope_words = re.findall(r"[a-z]+", scope)
+    if any(w in _PERSONAL_NOUNS for w in scope_words):
+        return True
+    return _NAME_OF_MINE.match(scope.replace("’", "'")) is not None and not any(w in _NAME_NOT_PERSONAL for w in scope_words)
+
+
+def personal_statement(text: str) -> bool:
+    """"My cat's name is Tom" / "my blood type is O positive": a DECLARATION about the user. It tells FRIDAY something
+    and asks nothing, so it is never a lookup; whether to keep it is for the user to say ("remember ...")."""
+    t = (text or "").strip()
+    m = _ASSERTION.match(t)
+    if m is None or len(t.split()) > 20 or "?" in t or _READ_LEAD.match(t) or len(request_clauses(t)) >= 1:
+        return False
+    words = re.findall(r"[a-z]+", t.lower().replace("’", "'"))
+    return not any(w in _NOT_PERSONAL or w in _NOT_PERSONAL_MORE for w in words) and _personal_scope(m.group("scope"))
+
+
 def personal_memory_question(text: str) -> bool:
     t = (text or "").strip()
-    if len(t.split()) > 14 or not _PM_FRAME.match(t):
+    if len(t.split()) > 14 or len(request_clauses(t)) >= 2:
+        return False
+    forgot = _FORGOT_Q.match(t)
+    if not (forgot or _PM_FRAME.match(t)):
         return False
     words = re.findall(r"[a-z]+", t.lower().replace("\u2019", "'"))
     if any(w in _NOT_PERSONAL or w in _NOT_PERSONAL_MORE for w in words):
@@ -506,11 +660,11 @@ def personal_memory_question(text: str) -> bool:
     if _DO_I_HAVE.match(t):
         scope = t
     else:
-        m = _MY_PHRASE.search(t)
+        m = _MY_PHRASE.search(forgot.group("rest") if forgot else t)
         if m is None:
             return False
         scope = m.group(1)
-    return any(w in _PERSONAL_NOUNS for w in re.findall(r"[a-z]+", scope.lower()))
+    return _personal_scope(scope)
 
 
 def _recall_for_personal_memory(text: str, u: Understanding) -> Understanding:
@@ -541,6 +695,94 @@ def _recall_for_personal_memory(text: str, u: Understanding) -> Understanding:
     )
 
 
+def _hold_statement(text: str, u: Understanding) -> Understanding | None:
+    """Phase 38: a sentence that only DESCRIBES something ("My cat's name is Tom", "I forgot my umbrella") asks for
+    nothing, so nothing runs: not a recall (it is not a question), not a clock / lock / forget (the matcher's guess).
+    FRIDAY says what it would take instead. Left alone: a near-verbatim taught phrase of the memory skills (the
+    existing "my sister's name is priya" convention), and any decision that is already not a direct skill call."""
+    if personal_statement(text):
+        if (u.skill or "").startswith("memory.remember") or u.action not in (Action.ACT, Action.ASK_SLOT, Action.UNKNOWN):
+            return None
+        speech = "That sounds like something to keep rather than a question. If you want me to store it, say 'remember' and then the fact."
+    elif _FORGOT_STATEMENT.match(text or "") and not request_clauses(text):
+        speech = "Sounds like that slipped your mind. I haven't forgotten or deleted anything; tell me what you'd like me to do."
+    elif _DONT_FORGET_THING.match(text or "") and len(request_clauses(text)) <= 1 and u.action in (Action.ACT, Action.ASK_SLOT, Action.UNKNOWN):
+        speech = ("I haven't stored or deleted anything. If you want me to keep something in mind, say 'remember' and then the fact, "
+                  "like 'remember my umbrella is by the door'.")
+    else:
+        return None
+    return Understanding(action=Action.UNKNOWN, utterance=u.utterance, normalized=u.normalized, score=u.score, speech=speech)
+
+
+# "don't forget my umbrella": a bare thing, not a fact ("don't forget my car is parked on level 3" states one and keeps
+# storing, and "don't forget to call mom" / "don't forget that ..." keep their own paths). Nothing is stored, nothing deleted.
+_DONT_FORGET_THING = re.compile(
+    r"^\s*(?:please\s+)?(?:don['’]?t|do\s+not)\s+forget\s+(?!to\b|that\b)(?!.*\b(?:is|are|was|were)\b)\S.*$", re.IGNORECASE | re.DOTALL
+)
+
+# Phase 38: an imperative forget of something the user TOLD FRIDAY is `memory.forget`, whatever the matcher guessed. The
+# matcher cannot tell it from `knowledge.forget` (indexed documents: 0.78 vs 0.77) or from recall, and an ambiguous
+# delete rightly goes to the planner -- which made "forget that my cat is named Tom" a roundabout, non-deterministic
+# route. Evidence for memory is required and documents veto it: a sentence about a document / file / note is left to
+# the ordinary rules, and "I forgot ..." / "don't forget ..." never match (they have no imperative lead).
+_MEMORY_FORGET = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+|i\s+(?:want|need)\s+you\s+to\s+|you\s+(?:can|should|must)\s+)?"
+    r"(?:forget|delete|erase|remove|clear|wipe)\s+(?P<target>\S.*?)\s*[.!]?\s*$", re.IGNORECASE | re.DOTALL
+)
+_TOLD_YOU = re.compile(
+    r"\b(?:the\s+fact|what\s+(?:i|you)\s+(?:said|told|know)|(?:i|you)\s+(?:told|said|mentioned)|that\s+(?:i|my|our)\b|memor(?:y|ies))", re.IGNORECASE
+)
+_NOT_MEMORY = re.compile(
+    r"\b(?:documents?|docs?|files?|pdfs?|folders?|knowledge|index(?:ed)?|library|articles?|papers?|notes?|reminders?|alarms?"
+    r"|routines?|schedules?|tasks?|history|cache|downloads?)\b|\.\w{2,4}\b", re.IGNORECASE
+)
+
+
+def _forget_memory(text: str, u: Understanding) -> Understanding | None:
+    skill = REGISTRY.get("memory.forget")
+    m = _MEMORY_FORGET.match(text or "")
+    if skill is None or m is None or _NOT_MEMORY.search(m.group("target")) or len(request_clauses(text)) >= 2:
+        return None
+    mine = _MY_PHRASE.search(m.group("target"))
+    # evidence that this is something the user said: an explicit "the fact I told you" frame, or "my <personal thing>"
+    if not (_TOLD_YOU.search(m.group("target")) or (mine is not None and (u.skill == skill.name or _personal_scope(mine.group(1))))):
+        return None
+    if u.skill and u.skill != skill.name and u.score >= CONFIDENT_SCORE and u.skill != "plan.run":
+        return None  # a near-verbatim phrase of another skill ("delete my 3pm reminder") stays that skill's
+    args, missing = extract(skill, text.strip())
+    if missing:
+        return None
+    # the rivals are not carried over: knowledge.forget at 0.77 would make this deliberate decision a "coin-flip"
+    return Understanding(
+        action=Action.ACT, utterance=u.utterance, normalized=u.normalized, skill=skill.name, args=args,
+        score=u.score, candidates=[Match(skill=skill.name, score=u.score, matched_example="")],
+    )
+
+
+def _store_assertion(text: str, u: Understanding) -> Understanding | None:
+    """Phase 38: "Remember my laptop's name is Orion." / "Remember my blood type is O positive." Whatever the matcher
+    guessed (screen.observe, notes.add, the planner), an anchored store verb plus a "my <thing> is <value>" assertion
+    is `memory.remember`: nothing smaller than a planner may be trusted to keep a user's fact. The raw sentence is
+    passed, not the normalised one, which lower-cases the value and drops characters ("O+" became "o"). The decision
+    still runs through `assess`, the executor (L1 permission), the audit trail and the skill's own redaction."""
+    skill = REGISTRY.get("memory.remember")
+    fact = explicit_store(text)
+    m = _ASSERTION.match(fact) if fact is not None else None
+    if skill is None or m is None or not _personal_scope(m.group("scope")):
+        return None  # "remember my car is blue" keeps the narrower Phase 30.1 rule; only personal facts are made deterministic
+    if u.skill and u.skill != skill.name and u.score >= CONFIDENT_SCORE and u.skill != "plan.run" and not u.skill.startswith("memory."):
+        return None
+    args, missing = extract(skill, text.strip())
+    if missing:
+        return None
+    # The matcher's other guesses are not rivals of an unmistakable store instruction, so none is carried over:
+    # left in, notes.add at 0.65 would make this deliberate decision a "coin-flip" for `ambiguous_route`.
+    return Understanding(
+        action=Action.ACT, utterance=u.utterance, normalized=u.normalized, skill=skill.name, args=args,
+        score=u.score, candidates=[Match(skill=skill.name, score=u.score, matched_example="")],
+    )
+
+
 def refine(text: str, u: Understanding) -> Understanding:
     """Phase 30.1: route an explicit store instruction to `memory.remember` (see the module docstring).
 
@@ -551,6 +793,15 @@ def refine(text: str, u: Understanding) -> Understanding:
     other direct route."""
     if personal_memory_question(text):
         return _recall_for_personal_memory(text, u)
+    held = _hold_statement(text, u)
+    if held is not None:
+        return held
+    stored = _store_assertion(text, u)
+    if stored is not None:
+        return stored
+    forgotten = _forget_memory(text, u)
+    if forgotten is not None:
+        return forgotten
     if u.action not in (Action.ACT, Action.ASK_SLOT) or not u.skill or u.skill in ("memory.remember", "plan.run"):
         return u
     if u.skill == "knowledge.ask" and explicit_list_documents(text):
@@ -605,8 +856,11 @@ def assess(text: str, u: Understanding) -> Assessment:
             _check_whole_sentence_arg(u),
             _check_second_instruction(u),
             _check_compound_request(text, u),
+            _check_multiple_facts(text, u),
             _check_action_mismatch(text, u),
             _check_ambiguous_route(u, text),
+            _check_forget_intent(text, u),
+            _check_forgot_statement(text, u),
         ) if r
     ]
     return Assessment(not reasons, tuple(reasons))

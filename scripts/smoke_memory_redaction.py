@@ -122,7 +122,148 @@ async def main_async() -> int:
         told = await SESSION.handle("when is my mother's birthday", actor="text")
         check("once told, the birthday is recalled", "march" in told.speech.lower(), told.speech)
 
-    return finish("Phase 25 — memory secret redaction", time.perf_counter() - t0, min_assertions=22, min_scenarios=7)
+        scenario("H: Phase 38 — 'my laptop's name' / 'I forgot my blood type' are memory questions; system questions are not")
+        from friday.registry import SkillResult  # noqa: E402
+
+        # No Ollama: any phrase that falls through to the planner (plan.run) is intercepted here.
+        planner_goals: list[str] = []
+        real_run = SESSION._run
+
+        async def _no_planner(skill_name, args, *, actor):
+            if skill_name == "plan.run":
+                planner_goals.append(str(args.get("goal", "")))
+                return SkillResult(speech="(planner disabled in this smoke)", ok=False)
+            return await real_run(skill_name, args, actor=actor)
+
+        SESSION._run = _no_planner  # type: ignore[method-assign]
+        try:
+            for row in memory.all_memories(limit=500):
+                memory.forget(row["id"])
+            memory.remember("my sister priya lives in chennai", kind="fact")
+            memory.remember("my favorite color is teal", kind="fact")
+
+            laptop_q = await SESSION.handle("what is my laptop's name?", actor="text")
+            check("H1 untold laptop name is declined", not laptop_q.ok, laptop_q.speech)
+            check("H1 ...and does not return an unrelated stored fact",
+                  not any(w in laptop_q.speech.lower() for w in ("priya", "chennai", "teal")), laptop_q.speech)
+            check("H1 ...via memory.recall, not the planner", SESSION.last_skill == "memory.recall" and not planner_goals,
+                  f"{SESSION.last_skill!r} planner={planner_goals}")
+            blood_q = await SESSION.handle("I forgot my blood type, what was it?", actor="text")
+            check("H2 untold blood type ('I forgot' frame) is declined", not blood_q.ok, blood_q.speech)
+            check("H2 ...and does not return an unrelated stored fact",
+                  not any(w in blood_q.speech.lower() for w in ("priya", "chennai", "teal")), blood_q.speech)
+            check("H2 ...via memory.recall, not the planner", SESSION.last_skill == "memory.recall" and not planner_goals,
+                  f"{SESSION.last_skill!r} planner={planner_goals}")
+
+            stored_laptop = await SESSION.handle("remember my laptop's name is orion-test", actor="text")
+            if not (stored_laptop.ok and any("orion" in m["value"].lower() for m in memory.all_memories(limit=500))):
+                print(f"  NOTE: 'remember my laptop's name ...' did not store via SESSION ({stored_laptop.speech!r}); using memory.remember directly")
+                memory.remember("my laptop's name is orion-test", kind="fact")
+            else:
+                print("  NOTE: laptop fact was stored through SESSION.handle")
+            stored_blood = await SESSION.handle("remember my blood type is O positive", actor="text")
+            if not (stored_blood.ok and any("positive" in m["value"].lower() for m in memory.all_memories(limit=500))):
+                print(f"  NOTE: 'remember my blood type ...' did not store via SESSION ({stored_blood.speech!r}); using memory.remember directly")
+                memory.remember("my blood type is O positive", kind="fact")
+            else:
+                print("  NOTE: blood-type fact was stored through SESSION.handle")
+
+            laptop_told = await SESSION.handle("what is my laptop's name?", actor="text")
+            check("H3 once told, the laptop name is recalled", "orion" in laptop_told.speech.lower(), laptop_told.speech)
+            blood_told = await SESSION.handle("I forgot my blood type, what was it?", actor="text")
+            check("H3 once told, the blood type is recalled via the 'I forgot' frame", "positive" in blood_told.speech.lower(), blood_told.speech)
+
+            planner_goals.clear()
+            for question in ("what is my laptop's battery level?", "what is my cpu usage"):
+                res = await SESSION.handle(question, actor="text")
+                low = res.speech.lower()
+                check(f"H4 {question!r} does not return a stored memory fact", "orion" not in low and "positive" not in low, res.speech)
+                check(f"H4 {question!r} is not routed to memory.recall", SESSION.last_skill != "memory.recall",
+                      f"{SESSION.last_skill!r}")
+            check("H5 'remember my laptop's name ...' was stored through SESSION (deterministic route, no planner)",
+                  stored_laptop.ok and not planner_goals, f"{stored_laptop.speech!r} planner={planner_goals}")
+            check("H5 'remember my blood type ...' was stored through SESSION (deterministic route, no planner)",
+                  stored_blood.ok and not planner_goals, f"{stored_blood.speech!r} planner={planner_goals}")
+        finally:
+            SESSION._run = real_run  # type: ignore[method-assign]
+
+        scenario("I: Phase 38 — statements and 'I forgot ...' delete nothing and store nothing; explicit writes keep the value; explicit forgets still work")
+        for row in memory.all_memories(limit=500):
+            memory.forget(row["id"])
+        memory.remember("my umbrella is red", kind="fact")
+        memory.remember("my old address is 12 test lane", kind="fact")
+        before = sorted(m["value"] for m in memory.all_memories(limit=500))
+        for phrase in ("I forgot my umbrella", "my cat's name is Tom", "my blood type is O positive"):
+            res = await SESSION.handle(phrase, actor="text")
+            check(f"I1 {phrase!r} is declined (not ok) with an explanation", not res.ok and bool(res.speech), res.speech)
+            check(f"I1 ...and the stored memories are exactly as they were",
+                  sorted(m["value"] for m in memory.all_memories(limit=500)) == before, f"{phrase!r}")
+        for query in ("I forgot my umbrella", "i forgot my old address", "don't forget my umbrella", "I've forgotten my umbrella"):
+            res = memory_skill.forget(query)
+            check(f"I2 memory.forget({query!r}) refuses and deletes nothing", not res.ok and res.data.get("deleted") is False
+                  and sorted(m["value"] for m in memory.all_memories(limit=500)) == before, res.speech)
+        res = memory_skill.forget("forget my old address is 12 test lane")
+        remaining = [m["value"] for m in memory.all_memories(limit=500)]
+        check("I3 an explicit forget still removes the matching synthetic memory", res.ok and "my old address is 12 test lane" not in remaining
+              and "my umbrella is red" in remaining, f"{res.speech!r} {remaining}")
+        res = await SESSION.handle("Remember my blood type is O+.", actor="text")
+        check("I4 'Remember my blood type is O+.' is stored, the plus sign intact", res.ok and any("blood type is O+" in m["value"] for m in memory.all_memories(limit=500)),
+              f"{res.speech!r} {[m['value'] for m in memory.all_memories(limit=500)]}")
+
+        scenario("J: Phase 38 — an explicit memory forget is deterministic AND confirmed + audited; 'I forgot' / 'don't forget' touch nothing")
+        from friday import audit  # noqa: E402
+        from friday.permissions import EXECUTOR  # noqa: E402
+
+        for row in memory.all_memories(limit=500):
+            memory.forget(row["id"])
+        for fact in ("my cat's name is Tom", "my old address is 12 test lane", "my umbrella is red"):
+            memory.remember(fact, kind="fact")
+        asked: list[str] = []
+        answer = {"yes": False}
+
+        async def _confirm(skill, args, preview):
+            asked.append(preview)
+            return answer["yes"]
+
+        real_confirm = EXECUTOR._confirm
+        EXECUTOR.set_confirm_handler(_confirm)
+        planner_goals = []
+        real_run = SESSION._run
+
+        async def _no_planner(skill_name, args, *, actor):
+            if skill_name == "plan.run":
+                planner_goals.append(str(args.get("goal", "")))
+                return SkillResult(speech="(planner disabled in this smoke)", ok=False)
+            return await real_run(skill_name, args, actor=actor)
+
+        SESSION._run = _no_planner  # type: ignore[method-assign]
+        try:
+            def values() -> list[str]:
+                return sorted(m["value"] for m in memory.all_memories(limit=500))
+
+            start = values()
+            res = await SESSION.handle("forget that my cat is named Tom", actor="text")
+            check("J1 an explicit forget goes straight to memory.forget (no planner) and asks for confirmation",
+                  SESSION.last_skill == "memory.forget" and not planner_goals and len(asked) == 1, f"{SESSION.last_skill!r} planner={planner_goals} asked={asked}")
+            check("J2 ...declined: nothing is deleted", values() == start, f"{values()} {res.speech!r}")
+            answer["yes"] = True
+            res = await SESSION.handle("forget that my cat is named Tom", actor="text")
+            check("J3 ...approved: only the matching memory is deleted", res.ok and values() == [v for v in start if "cat" not in v], f"{values()} {res.speech!r}")
+            check("J4 ...and the audit trail names memory.forget", (audit.recent(1) or [{}])[0].get("skill") == "memory.forget", str(audit.recent(1)[:1]))
+            res = await SESSION.handle("forget the fact I told you about my old address", actor="text")
+            check("J5 'forget the fact I told you about my old address' is a confirmed memory.forget that deletes only the address",
+                  res.ok and SESSION.last_skill == "memory.forget" and values() == ["my umbrella is red"] and not planner_goals, f"{values()} {SESSION.last_skill!r} {res.speech!r}")
+            memory.remember("my cat's name is Tom", kind="fact")
+            now, asked_before = values(), len(asked)
+            for phrase in ("I forgot my umbrella", "don't forget my umbrella"):
+                res = await SESSION.handle(phrase, actor="text")
+                check(f"J6 {phrase!r} stores nothing, deletes nothing and asks no confirmation",
+                      values() == now and len(asked) == asked_before and not res.ok and not planner_goals, f"{values()} {res.speech!r} planner={planner_goals}")
+        finally:
+            SESSION._run = real_run  # type: ignore[method-assign]
+            EXECUTOR.set_confirm_handler(real_confirm)
+
+    return finish("Phase 25 — memory secret redaction", time.perf_counter() - t0, min_assertions=56, min_scenarios=10)
 
 
 def main() -> int:
