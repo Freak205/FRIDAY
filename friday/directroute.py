@@ -297,8 +297,8 @@ def _check_action_mismatch(text: str, u: Understanding) -> str | None:
     if scope.basis != "verbs":
         return None  # no recognised verb at all ("crank it up"): nothing to compare against
     if scope.allowed & intent.ACTING and possible <= intent.PASSIVE:
-        if skill == "memory.recall" and _is_recall_question(text):
-            return None  # "do you remember ..." is a lookup that happens to contain the word remember
+        if skill == "memory.recall" and (_is_recall_question(text) or personal_memory_question(text)):
+            return None  # "do you remember ..." / "remind me what my X is" is a lookup, not a change
         return "action_mismatch:asked to change something, the skill can only look"
     return None
 
@@ -467,6 +467,80 @@ def _recall_for_personal_fact(text: str, u: Understanding) -> Understanding:
     )
 
 
+# Phase 37: a question ABOUT THE USER ("when is my mother's birthday", "do i have any allergies", "remind me what my
+# locker number is", "tell me my blood type") can only be answered from what the user told FRIDAY. The matcher
+# scores these against whichever skill has a similar frame (system.time, weather.now, timer.set, battery ...) and
+# the first two of those were SAFE direct routes: FRIDAY answered a birthday question with the clock, and a
+# "remind me what my locker number is" would have set a timer. The question frame, a possessive phrase whose noun
+# is a personal one, and the absence of any system / file word are all required, so it is deliberately narrow.
+_PM_FRAME = re.compile(
+    r"^\s*(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?"
+    r"(?:(?:what|when|where|who|whom|whose|which)\b|how\s+(?:old|tall)\b|(?:tell|remind)\s+me\s+(?:what|when|where|who|which)\b"
+    r"|tell\s+me\s+(?=my\b)|do\s+you\s+(?:know|remember)\b|do\s+i\s+have\b|did\s+i\s+(?:tell|say|mention)\b)",
+    re.IGNORECASE,
+)
+_DO_I_HAVE = re.compile(r"^\s*(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?do\s+i\s+have\b", re.IGNORECASE)
+_MY_PHRASE = re.compile(r"\bmy\s+((?:[a-z]+(?:['\u2019]s)?\s+){0,2}[a-z]+(?:['\u2019]s)?)", re.IGNORECASE)
+_PERSONAL_NOUNS = frozenset((
+    "allergy allergies birthday birthdate anniversary blood size phone passport licence license plate locker insurance "
+    "doctor dentist therapist mother mom mum father dad sister brother sibling wife husband spouse partner girlfriend "
+    "boyfriend son daughter child kids cousin aunt uncle grandmother grandfather grandma grandpa boss manager teacher "
+    "landlord neighbor neighbour roommate dog cat pet hobby hobbies favorite favourite medication prescription "
+    "address nickname"
+).split())
+# Words that make "my <noun>" a thing on this machine (a file's size, the screen, a MAC address) rather than a fact
+# about the user. Added to the system / developer words the narrower personal-fact rule already refuses.
+_NOT_PERSONAL_MORE = frozenset((
+    "file files folder folders directory download downloads document documents window windows display monitor drive font "
+    "image picture photo app apps browser tab clipboard mac os version"
+).split())
+
+
+def personal_memory_question(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t.split()) > 14 or not _PM_FRAME.match(t):
+        return False
+    words = re.findall(r"[a-z]+", t.lower().replace("\u2019", "'"))
+    if any(w in _NOT_PERSONAL or w in _NOT_PERSONAL_MORE for w in words):
+        return False
+    if _DO_I_HAVE.match(t):
+        scope = t
+    else:
+        m = _MY_PHRASE.search(t)
+        if m is None:
+            return False
+        scope = m.group(1)
+    return any(w in _PERSONAL_NOUNS for w in re.findall(r"[a-z]+", scope.lower()))
+
+
+def _recall_for_personal_memory(text: str, u: Understanding) -> Understanding:
+    """Make `memory.recall` (which only reads) the decision for a `personal_memory_question`, whatever the matcher
+    preferred, unless the phrase is a near-verbatim taught example of another skill (score >= CONFIDENT_SCORE) or
+    it is already a clear recall. The recall skill itself declines when nothing stored backs the answer."""
+    recall = REGISTRY.get("memory.recall")
+    if recall is None:
+        return u
+    if u.skill:
+        if u.action not in (Action.ACT, Action.ASK_SLOT):
+            return u
+        if u.skill != "plan.run" and u.score >= CONFIDENT_SCORE and not u.skill.startswith("memory."):
+            return u
+        if u.skill == recall.name and not any(
+            0 <= u.score - c.score < AMBIGUITY_MARGIN for c in u.candidates if c.skill != recall.name
+        ):
+            return u
+    elif u.action is not Action.UNKNOWN:
+        return u  # no skill was matched at all ("what is my favorite food"): that is where recall is needed most
+    args, missing = extract(recall, u.normalized or text)
+    if missing:
+        return u
+    rest = [c for c in u.candidates if c.skill not in (recall.name, u.skill) and not 0 <= u.score - c.score < AMBIGUITY_MARGIN]
+    return Understanding(
+        action=Action.ACT, utterance=u.utterance, normalized=u.normalized, skill=recall.name, args=args,
+        score=u.score, candidates=[Match(skill=recall.name, score=u.score, matched_example="")] + rest,
+    )
+
+
 def refine(text: str, u: Understanding) -> Understanding:
     """Phase 30.1: route an explicit store instruction to `memory.remember` (see the module docstring).
 
@@ -475,6 +549,8 @@ def refine(text: str, u: Understanding) -> Understanding:
     has `memory.remember` among its candidates, is changed; the new decision still runs through the executor
     (L1 permission, audit under the real skill name, redaction in the skill) and through `assess` like any
     other direct route."""
+    if personal_memory_question(text):
+        return _recall_for_personal_memory(text, u)
     if u.action not in (Action.ACT, Action.ASK_SLOT) or not u.skill or u.skill in ("memory.remember", "plan.run"):
         return u
     if u.skill == "knowledge.ask" and explicit_list_documents(text):

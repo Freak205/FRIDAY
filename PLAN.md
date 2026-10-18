@@ -8748,6 +8748,14 @@ suites and the known pre-existing failures were not run.
   `memory.recall` is among the tied candidates, so some personal-fact questions still fall back to the planner by design
   (e.g. "what are my allergies", "what is my laptop's name"). "remember my blood type is O+" routes to `memory.remember`
   but is still judged unsafe by the ambiguity check, and the stored text loses its "+" (pre-existing quirk).
+- Phase 37 (personal-memory questions): `directroute.personal_memory_question` -- a question frame (what/when/where/who/which, "do i have",
+  "tell me my", "remind me what ...", "do you remember", "what did i tell you about") + a possessive phrase whose noun is on a short
+  personal list (birthday, allergies, blood type, relatives, doctor, pets, phone/passport, favourite ...) + no system / file word -> `memory.recall`,
+  even over a 0.8-ish pick of another skill (before: "when is my birthday" ran `system.time`, "remind me what my locker number is" set a
+  timer, "do i have any allergies" ran `weather.now`) and when no skill matched at all ("what is my favorite food"). A near-verbatim taught
+  phrase (>= 0.90) of another skill still wins. Limits: the personal-noun list is finite ("what is my laptop's name" still goes to
+  `system.battery`/the planner); recall answers only from stored memories and declines otherwise; a question phrased outside the frames
+  ("I forgot my blood type, what was it") is not covered.
 
 ---
 

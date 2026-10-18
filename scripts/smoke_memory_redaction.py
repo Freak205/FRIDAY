@@ -111,7 +111,18 @@ async def main_async() -> int:
         check("an untold personal fact is declined, not answered with an unrelated memory",
               not blood.ok and "priya" not in blood.speech.lower() and "chennai" not in blood.speech.lower(), blood.speech)
 
-    return finish("Phase 25 — memory secret redaction", time.perf_counter() - t0, min_assertions=18, min_scenarios=6)
+        scenario("G: Phase 37 — a question about the user is answered from memory or declined, never by the clock / weather / a timer")
+        bday = await SESSION.handle("when is my mother's birthday", actor="text")
+        check("an untold birthday is declined (not the current time)", not bday.ok and "priya" not in bday.speech.lower(), bday.speech)
+        allergy = await SESSION.handle("do i have any allergies", actor="text")
+        check("an untold allergy is declined (not a weather report)", not allergy.ok, allergy.speech)
+        locker = await SESSION.handle("remind me what my locker number is", actor="text")
+        check("an untold locker number is declined and sets no timer", not locker.ok and "timer" not in locker.speech.lower(), locker.speech)
+        await SESSION.handle("remember my mother's birthday is march 3rd", actor="text")
+        told = await SESSION.handle("when is my mother's birthday", actor="text")
+        check("once told, the birthday is recalled", "march" in told.speech.lower(), told.speech)
+
+    return finish("Phase 25 — memory secret redaction", time.perf_counter() - t0, min_assertions=22, min_scenarios=7)
 
 
 def main() -> int:

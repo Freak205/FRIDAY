@@ -507,12 +507,49 @@ def suite_store_and_questions() -> None:
     check("synthetic: a dev.git / memory.recall coin-flip on a personal fact becomes recall", r.skill == "memory.recall" and directroute.assess(tie.utterance, r).safe, f"{r.skill}")
     git_tie = U("dev.git", {}, "what is my git status", score=0.68, candidates=[Match("dev.git", 0.68, ""), Match("memory.recall", 0.678, "")])
     check("synthetic: the same coin-flip on 'what is my git status' is left alone", directroute.refine(git_tie.utterance, git_tie) is git_tie)
-    clear = U("dev.git", {}, "what is my blood type", score=0.75, candidates=[Match("dev.git", 0.75, ""), Match("memory.recall", 0.678, "")])
+    tie2 = U("dev.git", {}, "what is my lucky number", score=0.68, candidates=[Match("dev.git", 0.68, ""), Match("memory.recall", 0.678, "")])
+    r2 = directroute.refine(tie2.utterance, tie2)
+    check("synthetic: the generic rule still resolves a recall coin-flip for a noun outside the personal list", r2.skill == "memory.recall" and directroute.assess(tie2.utterance, r2).safe, f"{r2.skill}")
+    clear = U("dev.git", {}, "what is my lucky number", score=0.75, candidates=[Match("dev.git", 0.75, ""), Match("memory.recall", 0.678, "")])
     check("synthetic: a clear lead for another skill is not overridden", directroute.refine(clear.utterance, clear) is clear)
-    other = U("weather.now", {}, "what are my allergies", score=0.668, candidates=[Match("weather.now", 0.668, ""), Match("screen.active_window", 0.656, "")])
+    other = U("weather.now", {}, "what are my lucky numbers", score=0.668, candidates=[Match("weather.now", 0.668, ""), Match("screen.active_window", 0.656, "")])
     check("synthetic: a tie that does not involve memory.recall is left alone", directroute.refine(other.utterance, other) is other)
     nonact = U("dev.git", {}, "what is my blood type", score=0.68, action=Action.UNKNOWN, candidates=[Match("dev.git", 0.68, ""), Match("memory.recall", 0.678, "")])
     check("synthetic: a non-ACT decision is never touched", directroute.refine(nonact.utterance, nonact) is nonact)
+
+    say("\n--- 8c. Phase 37: a question about the user is answered from memory, never by the clock / weather / a timer ---\n")
+    for text in ("when is my mother's birthday", "when is my birthday", "remind me what my locker number is", "do i have any allergies",
+                 "what are my allergies", "what did i tell you about my allergies", "tell me my blood type", "do you remember my allergies",
+                 "what's my passport number", "who is my doctor"):
+        u, a = _decide(text)
+        check(f"personal memory: {text!r} -> memory.recall, direct and safe", u.skill == "memory.recall" and a.safe and u.action is Action.ACT, f"{u.skill} {a.reason}")
+    for text in ("what do you know about my allergies", "what is my favorite food"):
+        u, a = _decide(text)
+        check(f"personal memory with no matching skill at all: {text!r} -> memory.recall instead of a dead end",
+              u.skill == "memory.recall" and a.safe and u.action is Action.ACT, f"{u.skill} {u.action} {a.reason}")
+    for text, want in [
+        ("what time is it", "system.time"), ("what is my battery level", "system.battery"), ("what's my wifi name", "network.status"),
+        ("what is my git status", "dev.git"), ("what is my cpu usage", "system.info"), ("what is my volume", "system.volume.get"),
+    ]:
+        u, a = _decide(text)
+        check(f"a system question is not stolen: {text!r} stays on {want}", u.skill == want, f"{u.skill}")
+    for text in ("what is the size of my downloads folder", "what is my file size", "what's my screen size", "what is my ip address",
+                 "when is my meeting", "remind me to call my mother", "what is the capital of France", "what is my mother's birthday and set a timer for 5 minutes",
+                 "set a timer for 5 minutes", "remember my mother's birthday is march 3rd", "show my git log"):
+        check(f"personal_memory_question({text!r}) is False", not directroute.personal_memory_question(text))
+    for text in ("when is my mother's birthday", "remind me what my locker number is", "tell me my blood type", "do i have any allergies",
+                 "what did i tell you about my allergies", "can you tell me what my phone number is", "how old is my dog"):
+        check(f"personal_memory_question({text!r}) is True", directroute.personal_memory_question(text))
+    clock = U("system.time", {}, "when is my birthday", score=0.81, candidates=[Match("system.time", 0.81, ""), Match("knowledge.ask", 0.76, "")])
+    r = directroute.refine(clock.utterance, clock)
+    check("synthetic: a 0.81 system.time pick for a birthday question becomes recall", r.skill == "memory.recall" and directroute.assess(clock.utterance, r).safe, f"{r.skill}")
+    taught = U("system.time", {}, "when is my birthday", score=0.95, candidates=[Match("system.time", 0.95, "")])
+    check("synthetic: a near-verbatim taught phrase (>= CONFIDENT_SCORE) of another skill is left alone", directroute.refine(taught.utterance, taught) is taught)
+    modal = U("dev.git", {}, "when is my birthday", score=0.8, action=Action.UNKNOWN, candidates=[Match("dev.git", 0.8, "")])
+    check("synthetic: a non-ACT decision that carries a skill is still never touched", directroute.refine(modal.utterance, modal) is modal)
+    planner = U("plan.run", {"goal": "do i have any allergies"}, "do i have any allergies", score=0.5, candidates=[])
+    check("synthetic: a planner hand-off for a personal-memory question becomes recall (the planner would invent an answer)",
+          directroute.refine(planner.utterance, planner).skill == "memory.recall")
 
     say("\n--- 8b. a clear knowledge question stays on knowledge.ask ---\n")
     ask_cases = ["how much is the marketing budget", "when does the office lease need renewing", "who is sending over the signed contract"]
@@ -788,6 +825,10 @@ def mutation_testing() -> int:
            [mock.patch.object(directroute, "explicit_store", lambda t: t)])
     killed("the personal-fact route removed (a tied 'what is my blood type' goes to the planner again)", suite_store_and_questions,
            [mock.patch.object(directroute, "_recall_for_personal_fact", lambda t, u: u)])
+    killed("the personal-memory route removed (a birthday question is answered with the clock again)", suite_store_and_questions,
+           [mock.patch.object(directroute, "_recall_for_personal_memory", lambda t, u: u)])
+    killed("every question counts as personal memory (system / file questions get stolen)", suite_store_and_questions,
+           [mock.patch.object(directroute, "personal_memory_question", lambda t: True)])
     killed("every 'what is my ...' question counts as a personal fact (git / system questions get stolen)", suite_store_and_questions,
            [mock.patch.object(directroute, "personal_fact_question", lambda t: True)])
     killed("the clear-question waiver removed (knowledge questions go to the planner again)", suite_store_and_questions,
