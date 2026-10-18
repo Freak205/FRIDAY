@@ -338,25 +338,34 @@ class VoiceSession:
             if not self._try_acquire():
                 log.info("late result %s: voice is busy; shown on screen only, not spoken over it", request_id)
                 return False
-            spoke = False
+            attempted = spoke = False
             try:
                 if may_start is not None and not may_start():
                     log.info("late result %s: a conversation is in progress; shown on screen only", request_id)
                     return False
                 log.info("late result %s: announcing", request_id)
+                attempted = True  # from here audio may have reached the speakers, whatever happens next
                 try:
                     self._speak(text, cancel_check=esc_pressed)
                     spoke = True
                 except TtsBackendError:
                     log.exception("tts failed while announcing a late result")
+                except Exception:
+                    # any other TTS failure: announce() never raises, and the busy guard is still released below
+                    log.exception("unexpected tts error while announcing a late result")
                 return spoke
             finally:
-                self._release()
-                if spoke and after is not None:
-                    try:
-                        after()
-                    except Exception:
-                        log.exception("post-announcement hook failed")
+                # The hook runs while the guard is STILL held, so the wake scanner (which stands down while busy) cannot
+                # score the tail of this speech before the detector has been reset; and it runs whenever speech was
+                # attempted, not only when it finished cleanly. The guard is released last, whatever the hook does.
+                try:
+                    if attempted and after is not None:
+                        try:
+                            after()
+                        except Exception:
+                            log.exception("post-announcement hook failed")
+                finally:
+                    self._release()
 
     def _log_timings(self, timings: dict[str, float]) -> None:
         """Logs one line: per-stage deltas since the previous named stage,

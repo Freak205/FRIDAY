@@ -233,12 +233,110 @@ def main() -> int:
         resets = wake.reset_calls
         check("H4 idle: spoken once, and the detector is reset afterwards (its own voice cannot wake it)",
               loop.announce_late({**info, "request_id": "h4"}) is True and len(tts2.spoken) == 1 and wake.reset_calls == resets + 1, f"{tts2.spoken} {wake.reset_calls}")
+
+        scenario("I: Phase 43 -- lifecycle: a wake word that loses the race, TTS failures, hook ordering, scanner recovery")
+        from friday.voice.types import TtsBackendError  # noqa: E402
+
+        def fresh(speak):
+            w = ScriptedWake()
+            s = VoiceSession(capture=lambda d=None: None, transcribe=lambda a: None, handle_text=lambda t: SkillResult(speech="x"), speak=speak)
+            lp = ConversationLoop(
+                session=s, wake_detector=w, mic_device=None, wake_threshold=0.5, wake_cooldown_s=0.0, follow_up_enabled=False,
+                follow_up_timeout_s=1.0, confirm_listen_timeout_s=1.0, post_tts_cooldown_s=0.0,
+            )
+            chimes: list[float] = []
+            lp._play_wake_sound = lambda t: chimes.append(t)  # type: ignore[method-assign]
+            return w, s, lp, chimes
+
+        ev = {"request_id": "i-0", "utterance": "x", "speech": "Done.", "ok": True, "error": False, "cancelled": False, "actor": "voice"}
+
+        # I1 a wake word that slips through while an announcement holds the session
+        w, s, lp, chimes = fresh(lambda t, **_: True)
+        assert s._try_acquire()
+        lp._on_wake_detected(0.0)
+        s._release()
+        check("I1 a wake word while the session is busy changes nothing: still IDLE, no chime over the speech", lp.fsm.state is State.IDLE and chimes == [], f"{lp.fsm.state} {chimes}")
+
+        # I2 the cycle loses the acquire race AFTER the busy check passed -> the conversation must not stay in WAKE_DETECTED
+        w, s, lp, chimes = fresh(lambda t, **_: True)
+        lp._session.try_run_cycle_locked = lambda **_k: None  # type: ignore[method-assign]  # the acquire was lost
+        lp._on_wake_detected(0.0)
+        check("I2 a wake-triggered cycle that never started returns the conversation to IDLE (the wake word is not left dead)", lp.fsm.state is State.IDLE, str(lp.fsm.state))
+        qq2: _q.Queue = _q.Queue()
+        qq2.put(block)
+        lp._tick(qq2, State.IDLE)
+        check("I3 ...and the scanner scores again afterwards", w.feed_calls == 1, str(w.feed_calls))
+
+        # I4 the post-announcement reset runs while the guard is still held, and the guard is released afterwards
+        seen: list[bool] = []
+        w, s, lp, chimes = fresh(lambda t, **_: True)
+        s.announce({**ev, "request_id": "i-4"}, after=lambda: seen.append(s.busy))
+        check("I4 the post-announcement hook runs while the session is still busy; busy is released after it", seen == [True] and s.busy is False, f"{seen} busy={s.busy}")
+
+        # I5 a TTS failure (backend error and any other error): never raises, guard released, reset still done, usable again
+        for label, exc in (("TtsBackendError", TtsBackendError("no audio device")), ("RuntimeError", RuntimeError("engine died"))):
+            hooks: list[int] = []
+            calls: list[str] = []
+
+            def flaky(text, _exc=exc, _calls=calls, **_):
+                _calls.append(text)
+                if len(_calls) == 1:
+                    raise _exc
+                return True
+
+            w, s, lp, chimes = fresh(flaky)
+            try:
+                first_ok = s.announce({**ev, "request_id": "i-5a"}, after=lambda: hooks.append(1))
+                raised = False
+            except Exception:
+                first_ok, raised = None, True
+            check(f"I5 {label} from TTS: announce() does not raise, returns False, the busy guard is free and the detector reset still ran",
+                  not raised and first_ok is False and s.busy is False and hooks == [1], f"raised={raised} ok={first_ok} busy={s.busy} hooks={hooks}")
+            second = s.announce({**ev, "request_id": "i-5b"})
+            check(f"I6 after a {label} failure the next announcement works, and the failed id is not retried",
+                  second is True and s.announce({**ev, "request_id": "i-5a"}) is False and len(calls) == 2, f"{second} {calls}")
+
+        # I7 a failing hook cannot leave the session stuck busy
+        w, s, lp, chimes = fresh(lambda t, **_: True)
+
+        def bad_hook():
+            raise RuntimeError("hook broke")
+
+        spoke = s.announce({**ev, "request_id": "i-7"}, after=bad_hook)
+        check("I7 a post-announcement hook that raises still leaves the session free", spoke is True and s.busy is False)
+
+        # I8 nothing spoken -> no reset needed and none done
+        w, s, lp, chimes = fresh(lambda t, **_: True)
+        ran: list[int] = []
+        s.announce({**ev, "request_id": "i-8"}, may_start=lambda: False, after=lambda: ran.append(1))
+        check("I8 an announcement refused before speaking runs no reset hook", ran == [] and s.busy is False)
+
+        # I9 the scanner is held off DURING the speech and recovers right after it
+        probe: dict[str, int] = {}
+        qq3: _q.Queue = _q.Queue()
+        holder: dict[str, object] = {}
+
+        def speak_and_probe(text, **_):
+            qq3.put(block)
+            holder["loop"]._tick(qq3, State.IDLE)  # type: ignore[attr-defined]
+            probe["feeds_during"] = holder["wake"].feed_calls  # type: ignore[attr-defined]
+            return True
+
+        w, s, lp, chimes = fresh(speak_and_probe)
+        holder["loop"], holder["wake"] = lp, w
+        resets_before = w.reset_calls
+        spoke = lp.announce_late({**ev, "request_id": "i-9"})
+        qq3.put(block)
+        lp._tick(qq3, State.IDLE)
+        check("I9 the wake scanner scored nothing during the announcement, was reset after it, and scores again once it is over",
+              spoke is True and probe["feeds_during"] == 0 and w.reset_calls == resets_before + 1 and w.feed_calls == 1,
+              f"spoke={spoke} during={probe} resets={w.reset_calls - resets_before} feeds={w.feed_calls}")
     finally:
         BUS.unsubscribe(LATE_TOPIC, handler)
         backend_mod.SESSION = real_session
         b.loop.call_soon_threadsafe(b.loop.stop)
 
-    return finish("Phase 42 -- late results announced to voice users", time.perf_counter() - t0, min_assertions=27, min_scenarios=8)
+    return finish("Phase 42 -- late results announced to voice users", time.perf_counter() - t0, min_assertions=38, min_scenarios=9)
 
 
 if __name__ == "__main__":

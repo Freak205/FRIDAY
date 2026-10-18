@@ -459,11 +459,23 @@ class ConversationLoop:
             return
 
     def _on_wake_detected(self, detected_at: float) -> None:
+        if getattr(self._session, "busy", False):
+            # Phase 43: a cycle or a spoken late result already holds the voice session, so this wake can start nothing.
+            # Drop it BEFORE any state change or chime (the chime would play over that speech).
+            log.info("WAKE WORD IGNORED (the voice session is busy)")
+            return
         self.fsm.wake_detected()
         self._emit_fsm()
         self._play_wake_sound(detected_at)
         log.info("COMMAND LISTENING STARTED (wake-triggered)")
         self._run_cycle_with_bargein()
+        if self.fsm.state is State.WAKE_DETECTED:
+            # Phase 43: the busy check above is not atomic with the cycle's own acquire, so the cycle can still lose the
+            # race (e.g. to an announcement starting in between) and never run. Nothing else would ever leave
+            # WAKE_DETECTED, and `_tick` stands down for every state but IDLE -- the wake word would be dead for good.
+            log.info("wake-triggered cycle did not start (session became busy); returning to wake standby")
+            self.fsm.cancelled()
+            self._emit_fsm()
         self._run_followup_loop()
         self._enter_idle_cooldown()
 

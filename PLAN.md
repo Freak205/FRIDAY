@@ -101,7 +101,18 @@ ConversationLoop); `smoke_voice_conversation.py` (102), `smoke_voice_pipeline.py
 pass. Limitations: no barge-in ("Hey Friday") during an announcement (Esc still cancels speech); a late result that arrives while
 voice is busy / mid-conversation is on screen only; the hotkey-only fallback path (no `ConversationLoop`) has no idle-FSM check but
 keeps the busy guard; the check-then-speak window against a simultaneous wake word is not atomic (the busy guard makes the loser
-skip, so at worst that one wake is dropped); not exercised against a real speaker. Still open: the known "how do I get on the network at home"
+skip, so at worst that one wake is dropped); not exercised against a real speaker.
+**Phase 43 (done):** lifecycle hardening of the Phase 42 path, each gap reproduced first. (1) A wake word that slipped through
+while an announcement held the session moved the conversation to `WAKE_DETECTED`, played the chime over the speech and then lost the
+cycle's acquire - nothing ever left `WAKE_DETECTED`, and `_tick` stands down for every state but IDLE, so the wake word stayed dead.
+`ConversationLoop._on_wake_detected` now drops a wake while the session is busy (before any state change or chime) and, because
+that check is not atomic with the cycle's own acquire, returns a cycle that never started to IDLE. (2) `VoiceSession.announce`
+released the busy guard BEFORE the post-announcement reset, so the scanner could score the tail of the speech first; the reset now
+runs while the guard is held and is released last (also if the hook raises). (3) The reset ran only after a clean finish and only
+`TtsBackendError` was caught; it now runs whenever speech was attempted and any TTS error is logged, never raised. Not guaranteed:
+the busy check / acquire pair is still not atomic (a wake word can at worst be dropped or one cycle lost the race). Tests:
+`scripts/smoke_voice_late.py` (38); `smoke_voice_conversation.py` (102) and `smoke_voice_pipeline.py` (76, isolated) still pass.
+Still open: the known "how do I get on the network at home"
 recall case (matcher: `network.status` 0.79 > `memory.recall` 0.69, identical at Phase 37).
 
 **Deferred work.** Self-extension; daemon API authentication; recursive folder copy/move/delete (26); drag-timing hardening (27:
