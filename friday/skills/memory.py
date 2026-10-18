@@ -30,6 +30,26 @@ _QUESTION = re.compile(
     re.IGNORECASE,
 )
 
+# A hit this strong is believed on similarity alone. Between the 0.55 floor and this line the embedding
+# is only mildly related ("what's my blood type" scores 0.57 against "my sister's name is priya"), so such
+# a hit must also share a content word with the question, or it is treated as no answer at all.
+_SOLID = 0.62
+_FILLER = frozenset(
+    "a an the is are was were am do does did what whats which who whose when where why how my your me i you "
+    "to of in on at for and or about that this it its be been have has had can could will would should tell "
+    "told say said know remember called".split()
+)
+
+
+def _content_words(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", text.lower().replace("'s", ""))
+    return {w[:-1] if len(w) > 3 and w.endswith("s") else w for w in words if w not in _FILLER}
+
+
+def grounded_hit(query: str, value: str, score: float) -> bool:
+    """True when a recalled memory can be trusted to answer `query`."""
+    return score >= _SOLID or bool(_content_words(query) & _content_words(value))
+
 
 @skill(
     name="memory.remember",
@@ -61,7 +81,7 @@ def remember(
     # storing questions corrupts the memory for every later lookup.
     if not had_lead and _QUESTION.match(value):
         hits = memory.recall(value, k=3)
-        strong = [h for h in hits if h.score >= 0.55]
+        strong = [h for h in hits if h.score >= 0.55 and grounded_hit(value, h.value, h.score)]
         if strong:
             return SkillResult(
                 speech=strong[0].value,
@@ -139,7 +159,7 @@ def recall(
             )
 
     hits = memory.recall(query, k=4)
-    strong = [h for h in hits if h.score >= 0.55]
+    strong = [h for h in hits if h.score >= 0.55 and grounded_hit(query, h.value, h.score)]
 
     if not strong:
         return SkillResult(

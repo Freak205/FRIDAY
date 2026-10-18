@@ -29,7 +29,10 @@ async def undo_last(
     lines = await undo.undo_last(count)
     if not lines:
         return SkillResult(speech="There's nothing I can undo.", ok=False)
-    return SkillResult(speech=" ".join(lines), data={"undone": lines})
+    # Only a line that says "Reversed" is a reversal; a declined or failed one is not success.
+    return SkillResult(
+        speech=" ".join(lines), data={"undone": lines}, ok=all(l.startswith("Reversed") for l in lines),
+    )
 
 
 @skill(
@@ -48,7 +51,7 @@ async def undo_last(
 def capabilities(
     area: Annotated[str, "optional group filter, e.g. 'system' or 'files'"] = "",
 ) -> SkillResult:
-    skills = sorted(REGISTRY.all(), key=lambda s: s.name)
+    skills = sorted((s for s in REGISTRY.all() if not s.internal), key=lambda s: s.name)
     if area:
         skills = [s for s in skills if s.name.startswith(area.lower())]
         if not skills:

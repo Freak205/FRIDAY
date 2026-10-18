@@ -14,9 +14,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from friday.brain import BRAIN
+from friday import directroute
 from friday.brain.engine import Action, Understanding
 from friday.bus import BUS
 from friday.log import get
+from friday.orchestrator import run_verified
 from friday.permissions import EXECUTOR, PermissionError_
 from friday.registry import REGISTRY, Skill, SkillResult
 
@@ -129,6 +131,8 @@ class Session:
         # Phase 21.0: the `data` of that same call — lets "read more" advance a page
         # cursor the tool itself reported (`next_offset`), see `_maybe_continue_read`.
         self.last_data: dict[str, Any] = {}
+        # Phase 30.0: why the direct-route gate last handed a turn to the planner (None = it did not).
+        self.last_route_gate: dict[str, Any] | None = None
         # Phase 21.0: (goal_id, original goal text) of the report-only goal that
         # finished on the PREVIOUS turn, so an explicit "yes, fix it" can widen that same
         # goal's scope (`_maybe_expand_scope`). Single-use: consumed by the next turn
@@ -272,6 +276,11 @@ class Session:
             if resolved is not None:
                 return resolved
 
+        # Phase 34.0: a few exact recovery sentences go straight to the operator-only recovery skills.
+        recovered = await self._maybe_route_recovery(text, actor=actor)
+        if recovered is not None:
+            return recovered
+
         # Phase 21.0: the user's own explicit follow-up to a report-only goal ("yes, fix
         # it") widens THAT goal's scope; "read more" / "next page" advances the last
         # read's cursor. Both still dispatch through the normal EXECUTOR path —
@@ -358,6 +367,11 @@ class Session:
                     # entity types with no canonical phrase mapping.
                     text = substituted
                     understanding = BRAIN.understand(text)
+
+        # Phase 30.0: the last gate before a direct route may EXECUTE. Whatever got here -- plain
+        # understanding, a compound reroute, a resolved reference -- is checked against the user's own
+        # words; a route whose arguments do not account for them is handed to the planner instead.
+        understanding = await self._gate_direct_route(text, understanding)
 
         self.last_utterance = text
         await BUS.publish(
@@ -549,6 +563,45 @@ class Session:
         return await self._run(
             "plan.run", {"goal": objective, "resume_goal_id": goal_id, "scope_expansion": text}, actor=actor,
         )
+
+    async def _maybe_route_recovery(self, text: str, *, actor: str) -> SkillResult | None:
+        """Phase 34 (see friday/recoveryroute.py): an exact recovery sentence runs the matching
+        operator-only recovery skill through `_run` -> `run_verified` -> `EXECUTOR.run`, so permission,
+        confirmation (restore / cleanup / migrate), the unattended ceiling and the audit trail apply
+        unchanged. A listing or an unclear restore never runs anything but the read-only listing.
+        None = not a recovery sentence; the turn continues exactly as before. Never raises."""
+        from friday import recoveryroute
+        from friday.config import CFG
+
+        if not CFG.brain.recovery_routing:
+            return None
+        try:
+            route = recoveryroute.classify(text)
+        except Exception:
+            log.exception("recovery routing failed (non-fatal)")
+            return None
+        if route is None:
+            return None
+        if route.skill and route.skill not in recoveryroute.ROUTED_SKILLS:
+            log.error("recovery route named %s, which is not a recovery skill; ignored", route.skill)
+            return None
+        await BUS.publish("session.recovery_route", kind=route.kind, skill=route.skill, actor=actor)
+        self.last_utterance = text
+        if route.kind == recoveryroute.EXPLAIN:
+            return SkillResult(speech=route.speech, ok=False, data={"clarification": "recovery_cleanup_scope"})
+        if route.kind == recoveryroute.CLARIFY_RESTORE:
+            listing = await self._run(route.skill, route.args, actor=actor)
+            rows = (listing.data or {}).get("snapshots") or []
+            if not listing.ok or not rows:
+                return SkillResult(
+                    speech=listing.speech if not listing.ok else "There are no recovery copies, so there is nothing to restore.",
+                    ok=False, data={"clarification": "recovery_snapshot", **(listing.data or {})},
+                )
+            return SkillResult(
+                speech=f"{route.speech}\n{listing.speech}\nTell me which one, for example: restore snapshot <id>",
+                ok=False, data={"clarification": "recovery_snapshot", **(listing.data or {})},
+            )
+        return await self._run(route.skill, route.args, actor=actor)
 
     async def _guard_dangling_confirmation(
         self, text: str, understanding: Understanding, followup: tuple[str, str] | None,
@@ -750,6 +803,55 @@ class Session:
             skill="plan.run", args={"goal": text}, score=understanding.score,
         )
 
+    async def _gate_direct_route(self, text: str, understanding: Understanding) -> Understanding:
+        """Phase 30.0 (see friday/directroute.py): may this single-skill decision execute as it stands?
+
+        Safe (or the gate is off, or it is not a direct skill route at all): returned untouched. Unsafe:
+        it becomes the same `plan.run` decision `_maybe_route_to_plan` builds, so the planner's tool
+        schemas, intent guard, verification and confirmation all apply. With no planner to hand it to,
+        a doubtful ACT is refused (never executed on a guess) and a doubtful ASK_SLOT is asked about,
+        as before. Never raises: a gate that crashed must not take the turn down with it."""
+        from friday.config import CFG
+
+        self.last_route_gate = None
+        if not CFG.brain.direct_route_guard:
+            return understanding
+        try:
+            from friday.intelligence import goals as goals_mod
+
+            # "no, I meant the college project" is a correction (already recorded as bookkeeping in
+            # `_record_correction_if_any`), not a request: it must not start a planner goal of its own.
+            if goals_mod.looks_like_correction(text):
+                return understanding
+            # Phase 30.1: an explicit "remember ..." is a STORE; send it to the skill that stores before judging it.
+            understanding = directroute.refine(text, understanding)
+            verdict = directroute.assess(text, understanding)
+        except Exception:
+            log.exception("direct-route gate failed (non-fatal; the route is left as it was)")
+            return understanding
+        if verdict.safe:
+            return understanding
+        self.last_route_gate = {
+            "skill": understanding.skill, "action": understanding.action.value, "reasons": list(verdict.reasons),
+        }
+        log.info("direct route %s rejected: %s", understanding.skill, verdict.reason)
+        await BUS.publish(
+            "session.direct_route_rejected",
+            skill=understanding.skill, action=understanding.action.value, reasons=list(verdict.reasons),
+        )
+        if CFG.planner.enabled and REGISTRY.get("plan.run") is not None:
+            return Understanding(
+                action=Action.ACT, utterance=text, normalized=understanding.normalized or text,
+                skill="plan.run", args={"goal": text}, score=understanding.score,
+            )
+        if understanding.action is Action.ASK_SLOT:
+            return understanding
+        return Understanding(
+            action=Action.UNKNOWN, utterance=text, normalized=understanding.normalized or text,
+            score=understanding.score,
+            speech="I'm not sure I understood all of that well enough to do it safely. Could you say it as one simple step?",
+        )
+
     def _maybe_route_to_open_ended(self, text: str, understanding: Understanding) -> Understanding | None:
         """Phase 17.0: the actual bridge from `Action.UNKNOWN` into
         open-ended goal handling. `BRAIN.understand` only ever scores an
@@ -804,6 +906,11 @@ class Session:
         from friday.intelligence import context_resolver
 
         if not context_resolver.contains_reference(text):
+            return False
+        # Phase 30.0: a request that NAMES its target ("Copy the file C:\a.txt to C:\b.txt") has
+        # nothing to resolve: "the file" is the path beside it. Resolving anyway answered "I don't have
+        # a recent file to refer to" to a request that spelled the file out (Phase 29 `fs_copy`, 3/3).
+        if directroute.explicit_operands(text):
             return False
         if u.action is not Action.ACT:
             return True
@@ -932,7 +1039,14 @@ class Session:
         self.last_data = {}
         self._confirm_actor = actor
         try:
-            result = await EXECUTOR.run(skill_name, args, actor=actor)
+            if skill_name == "plan.run":
+                result = await EXECUTOR.run(skill_name, args, actor=actor)
+            else:
+                # Phase 30.0: a direct skill call gets the same post-condition read-back a planned
+                # step gets (orchestrator.run_verified), so "the function returned" is not "it worked".
+                result = await run_verified(
+                    skill_name, args, actor=actor, runner=lambda t, a: EXECUTOR.run(t, a, actor=actor),
+                )
         except PermissionError_ as exc:
             return SkillResult(speech=f"I'm not allowed to do that. {exc}", ok=False)
         except KeyError:

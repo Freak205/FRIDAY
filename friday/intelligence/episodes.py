@@ -59,13 +59,17 @@ class Episode:
         )
 
 
-def _sanitize_args(args: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key, value in args.items():
-        if any(marker in key.lower() for marker in _SECRET_KEY_MARKERS):
+def _sanitize_args(args: dict[str, Any], tool: str = "") -> dict[str, Any]:
+    """Phase 35: the field-aware form of `friday.auditview` (file content, typed text, messages and code are
+    reduced to a length marker), on top of the original rule that a credential-named argument is redacted."""
+    from friday import auditview
+
+    out = auditview.sanitize_args(tool, args)
+    if not isinstance(out, dict):
+        return {}
+    for key in list(out):
+        if any(marker in str(key).lower() for marker in _SECRET_KEY_MARKERS):
             out[key] = "[redacted]"
-        else:
-            out[key] = value
     return out
 
 
@@ -93,14 +97,20 @@ def record(
     """Persist one episode. `steps` are the orchestrator's own observations —
     args are sanitized, everything else is kept as-is (bounded already by
     the orchestrator's own per-observation speech truncation)."""
+    from friday import auditview
+
+    echoes = [v for o in steps for v in auditview.content_values(o.step.tool, o.step.args)]
     plan = [
         {
-            "tool": o.step.tool, "args": _sanitize_args(o.step.args),
-            "ok": o.ok, "error": o.error,
+            "tool": o.step.tool, "args": _sanitize_args(o.step.args, o.step.tool),
+            "ok": o.ok,
+            # Phase 36: the same minimisation `friday.dbscrub` applies to history, so new rows stay clean
+            "error": auditview.sanitize_error(o.error, auditview.content_values(o.step.tool, o.step.args)),
         }
         for o in steps
     ]
-    errors = "; ".join(o.speech for o in steps if not o.ok)[:500]
+    errors = auditview.scrub_free_text("; ".join(o.speech for o in steps if not o.ok)[:500], echoes) or ""
+    context = auditview.scrub_free_text(context, echoes) or ""
 
     c = store.conn()
     cur = c.execute(

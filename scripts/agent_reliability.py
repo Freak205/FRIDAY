@@ -1294,4 +1294,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import iso_env  # Phase 35: a throwaway database + recovery store; the real ones are refused
+
+    with iso_env.isolated_runtime():
+        asyncio.run(main())

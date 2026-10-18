@@ -38,6 +38,11 @@ class SkillResult:
     speech: str
     data: dict[str, Any] = field(default_factory=dict)
     ok: bool = True
+    # Phase 32.0: the inverse of THIS call, when it depends on what actually happened (which
+    # snapshot of the overwritten file was kept). Same shape as the journal's inverse:
+    # {"skill": ..., "args": {...}} or {"steps": [that, ...]}. The Executor records it only for a
+    # call that succeeded; it takes precedence over the static `undo=` of the skill.
+    undo: dict[str, Any] | None = None
 
     @staticmethod
     def coerce(value: Any) -> "SkillResult":
@@ -93,6 +98,10 @@ class Skill:
     # cursor (`offset`/`page`), so ignoring the cap can never hide content the
     # planner has no other way to reach. Empty for every state-changing tool.
     presentational: tuple[str, ...] = ()
+    # Phase 32.0: a skill that exists only to be run by the undo journal (files.restore). It is
+    # still an ordinary registered skill -- the Executor runs it under the same policy -- but it
+    # is not offered to the planner, the matcher, or the skill listing as something to ask for.
+    internal: bool = False
 
     async def __call__(self, **kwargs: Any) -> SkillResult:
         known = {p.name for p in self.params}
@@ -203,6 +212,7 @@ def skill(
     risk: Callable[..., bool] | None = None,
     action: Any = None,
     presentational: tuple[str, ...] = (),
+    internal: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Register a function as a skill. Returns the function unchanged."""
 
@@ -221,6 +231,7 @@ def skill(
                 risk=risk,
                 action=action,
                 presentational=tuple(presentational),
+                internal=internal,
             )
         )
         return fn

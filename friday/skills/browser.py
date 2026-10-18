@@ -159,7 +159,19 @@ async def click(
     except browser.BrowserError as exc:
         return _fail(exc, "That click failed")
 
-    return SkillResult(speech=f"Clicked {clicked}.", data={"clicked": clicked})
+    # Phase 31.0: a click that took the browser to another page says so -- for the planner, the
+    # difference between "nothing visible happened" and "the form was submitted" is the next step.
+    # (`browser.click` returns a ClickInfo; a bare label -- its pre-Phase-31 contract -- still works.)
+    label = getattr(clicked, "label", None) or str(clicked)
+    url, title = getattr(clicked, "url", ""), getattr(clicked, "title", "")
+    navigated = bool(getattr(clicked, "navigated", False))
+    speech = f"Clicked {label}."
+    if navigated:
+        speech += f" The browser moved to a new page: {title or url}."
+    return SkillResult(
+        speech=speech,
+        data={"clicked": label, "url": url, "title": title, "navigated": navigated},
+    )
 
 
 @skill(

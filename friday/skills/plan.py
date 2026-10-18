@@ -87,6 +87,7 @@ from friday.log import get
 from friday.orchestrator import NOT_EXECUTED_ERRORS, Orchestrator
 from friday.permissions import current_actor
 from friday.registry import REGISTRY, SkillResult, skill
+from friday.verify import UNCONFIRMED_NOTE
 
 if TYPE_CHECKING:
     from friday.intelligence.goals import GoalContract, GoalMode, Subgoal
@@ -174,6 +175,8 @@ async def run(
             goal_id = _start_goal(goal)
             contract = _seed_contract(goal_id, goal)
 
+    _ensure_stoppable(goal, goal_id)
+
     mode = GoalMode(contract.mode) if contract.mode else GoalMode.DIRECT_ACTION
     if expanded:
         mode = GoalMode.DIRECT_ACTION  # the user has now asked to act; the report-only discovery pass is done
@@ -181,7 +184,7 @@ async def run(
         action_scope = _action_scope_for(goal_id, goal, contract)
     started = time.perf_counter()
 
-    tools = [s.name for s in REGISTRY.all() if s.name != "plan.run"]
+    tools = [s.name for s in REGISTRY.all() if s.name != "plan.run" and not s.internal]
     orch = Orchestrator(
         tools=tools,
         actor=current_actor(),
@@ -404,7 +407,7 @@ async def run(
             speech = f"{speech} But it did not check out: {'; '.join(gv.failed)[:300]}.".strip()
     elif gv is not None and gv.status in ("unverified", "partial") and result.stopped == "completed":
         # Spoken text stays short — the per-tool reasons are in data["verification"].
-        speech = f"{speech} I couldn't verify that it actually took effect, so treat it as unconfirmed.".strip()
+        speech = f"{speech} {UNCONFIRMED_NOTE}".strip()
     verified = not unverified and (gv is None or gv.verified_ok)
 
     return SkillResult(
@@ -517,6 +520,20 @@ def _start_goal(goal: str) -> str | None:
     except Exception:
         log.exception("plan.run: goal tracking failed to start (non-fatal)")
         return None
+
+
+def _ensure_stoppable(goal: str, goal_id: str | None) -> None:
+    """Phase 36 audit: every plan.run entry path must leave the goal in the "running" state before a step runs,
+    or STOP (button, hotkey, typed) has nothing to arm. `_start_goal` does it for a fresh goal; a goal resumed after
+    a clarification, widened by "yes, fix it", or whose tracking failed to start never did, so a stop request
+    answered "nothing running" while the planner kept executing steps."""
+    try:
+        from friday.intelligence.state import INTEL
+
+        if not INTEL.goal_running:
+            INTEL.start_goal(goal, goal_id or "")
+    except Exception:
+        log.exception("plan.run: could not mark the goal running (non-fatal)")
 
 
 async def _maybe_decompose(orch: Orchestrator, goal: str, context: str) -> list["Subgoal"] | None:
@@ -704,7 +721,7 @@ async def _run_discovery(
         from friday.intelligence import discovery
         from friday.intelligence.state import INTEL
 
-        l0_tools = [s.name for s in REGISTRY.all() if s.tier == "L0" and s.name != "plan.run"]
+        l0_tools = [s.name for s in REGISTRY.all() if s.tier == "L0" and s.name != "plan.run" and not s.internal]
         if not l0_tools:
             return context, contract, None
 

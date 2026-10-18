@@ -28,10 +28,14 @@ after this section is the historical phase log; each phase's own section is the 
 | Secret handling | tool-data, speech and memory redaction (22, 25); shell blocklist (25) |
 | Computer control | apps/windows, files incl. write/copy/move/delete/mkdir (26), shell, UI Automation incl. right-click/drag/scroll (26) with a wrong-target guard (27), Playwright browser seam (26), clipboard, OCR, system controls, scheduling |
 | Real-machine validation | UI Automation: automated live suite against real windows and real Calculator (27). File mutation: real temp-dir suite (26). Voice/GUI end-to-end: human checklists written, **not yet run by a human** (24-27) |
+| Direct-route safety | A single-skill route is checked against the user's own words before it may execute (`friday/directroute.py`, Phase 30): a dropped operand, a whole sentence as an argument, a second instruction, a compound request, a tied skill choice, or a slot the extractor cannot read all hand the turn to `plan.run`; a direct call that changes state is read back like a plan step (`orchestrator.run_verified`). Kill switch `brain.direct_route_guard` |
+| Tool-family discipline | While a request is about a page in FRIDAY's own controlled browser (`friday/toolfamily.py`, Phase 31) the desktop-window tools (`ui.*`, `input.*`) are not offered and a desktop call aimed at "whatever is in front" (or `apps.open` of a browser) is not run - the planner is told the `browser.*` call that does it; `browser.click` reports a navigating click correctly; an action request is not finished on reads alone; "click it twice" runs twice. Kill switches `planner.tool_family_guard` / `action_completion` / `counted_repeats` |
+| File mutation safety | `files.write/copy/move/delete` never destroy a user's file without first keeping a verified copy in the recovery store (`friday/recovery.py`, Phase 32; since Phase 33 `%LOCALAPPDATA%\FRIDAY\snapshots`, outside the repo/OneDrive): overwrite undo restores the original bytes/mtime, `files.delete` is recoverable (fail closed if no copy can be kept; `files.max_snapshot_mb`), a move onto a file keeps the replaced file, writes go through a temp file + rename, a failed call journals no undo, a declined or failed undo stays pending. Residual: Windows has no atomic compare-and-replace, so an approved overwrite has a small bounded window between its last re-check and `os.replace` (see Phase 32 "Remaining data-loss risks"). Phase 33 added: store outside the repo, `recovery list/recover/cleanup/migrate` (operator-only), pending-undo-aware retention (opt-in cleanup, skips a copy a pending undo needs [checked just before each deletion], fail closed). Not covered: `shell.run`/`ui`/`browser`, folders other than empty ones, encryption. Phase 34 added exact-sentence natural-language access to the four recovery commands (`friday/recoveryroute.py`, a classifier that only picks one of the four internal skills; they still run through `Executor.run` with confirmation/audit; the planner prompt is byte-identical; kill switch `brain.recovery_routing`) |
+| Measured end-to-end task success | **Phase 31: 56/84 = 66.7%** (Phase 30: 39/84 = 46.4%; Phase 29: 19/84 = 22.6%; browser 5->29->90%, ui 13->17->50%, fs 27->70->58% [variance, A/B-checked], system 100%; desktop calls on browser tasks 38->0; right-click 0->3/3). Phase 30: 39/84 = 46.4% (baseline Phase 29: 19/84 = 22.6%; fs 27->70%, browser 5->29%, ui 13->17%, system 100%; direct-route failures 34->0). Baseline detail: **19/84 = 22.6%** of realistic state-changing tasks completed correctly with the real planner, in an isolated environment (28 tasks x 3 runs; fs 27%, browser 5%, ui 13%, read-only system 100%). Most failures happen BEFORE any tool runs (single-skill routing / argument extraction) or in tool-family choice; the confirmation gate held wherever the tasks exercised it (`files.delete` asked 3/3). Suite: `scripts/agent_benchmark.py`, baseline `benchmarks/baseline_phase29.json` Phase 32 re-run (no planner change): 48/84 = 57.1% (fs-only A/B in the same session, this tree vs Phase-31 state: 33/66 vs 37/66 - within the benchmark's noise but not proven to be) |
 
 **Completed major milestones.** Phases 1-23 (log below); 24 answer grounding; 25 safety-net hardening;
 26 computer-control primitives; 27 real-machine UI-automation validation + wrong-target guard; 28 user-reachable
-stop for a running goal.
+stop for a running goal; 29 real-environment agent benchmark (measurement + permanent regression gate, no behaviour change); 30 direct-route safety and verification (benchmark 22.6% -> 46.4%); 31 planner tool-family discipline (browser vs desktop), action completion, counted repeats, right-click verb, `browser.click` navigation fix (benchmark 46.4% -> 66.7%); 32 filesystem mutation safety and recoverability (recovery store, restoring overwrite-undo, recoverable delete, safe move/copy, honest undo journal); 33 recovery-store privacy, retention and user-controlled recovery (store outside the repo/OneDrive, pending-undo-aware cleanup, list/recover/migrate); 34 deterministic natural-language routing for the recovery commands (exact sentences only, ids never inferred, no planner exposure).
 
 **Remaining capability areas** (direction, not a task list):
 - *Safety & control:* stop coverage for what Phase 28 does not reach (standalone routines/scheduled jobs, `shell.run`'s subprocess, a spoken "stop" while a goal runs); authentication of the local daemon API.
@@ -40,13 +44,19 @@ stop for a running goal.
 - *Autonomous recovery:* smarter retry/replan for tool failures, built on the existing bounded replan.
 - *Extensibility:* self-extension, deliberately deferred until sandboxing, approval, testing and registry boundaries exist.
 
-**Current highest-priority milestone: not yet chosen** (re-inspect the repo first). Candidates found while
-building Phase 28, none started: (a) make `shell.run` killable (it runs `subprocess.run` in a worker
-thread, so a stop waits up to its 60 s timeout); (b) cover standalone routine/scheduled-job runs
-(`jobs.run_job`), which Phase 28's goal-scoped signal does not reach; (c) hear a spoken "stop" while a
-goal runs (the voice thread is blocked in `Backend.ask` for the whole goal); (d) daemon API
-authentication, which the user has deferred. Also `Backend.ask` times out at 120 s while a goal may
-run 300 s.
+**Current highest-priority milestone: not yet chosen** - re-inspect the repo and re-run `scripts/agent_benchmark.py` first. Phase 31 removed the browser/UI tool-family class (desktop calls on browser tasks 38 -> 0; browser 29% -> 90%). Of the 28 failing runs now, 25 are `planner/reasoning`, 2 `verification/postcondition`, 1 `other`, 0 `permission/guard`. Dominant remaining classes, in order: (1) **the intent-guard verb table for drag / scroll / hover** (the same defect Phase 31 fixed for "right-click": `derive_scope` reads such a request as open/focus/navigate only, so `ui.drag` / `ui.scroll` are rejected; `ui_drag` and `ui_scroll` are 0/3 - small, same module); (2) **Calculator / unknown-control UI tasks** (`ui_calculator` 0/3: the planner invents controls such as `ui.fill(field="Number 1")`) and `apps.focus` fuzzy-matching a cover window titled "Bench Test Cover" (`ui_focus` 0/3, 2 false successes); (3) filesystem planner choices (`shell.run` for a copy, `ui.inspect` on a random window, stopping after a search: `fs_sort_by_type`, `fs_search_read`, `fs_overwrite_approved`, `fs_conflict_decline`, `fs_group_photos`) - the extractor gaps Phase 30 routed around (`src`/`dst`, `label`, `url`, `combo`, window titles) would let these run directly instead of through the 3B planner. The file-safety milestone that was waiting is done (Phase 32); its remaining risks are listed there. Phase 32 re-ran the benchmark unchanged at 48/84 = 57.1% (fs 13/33); the failing runs are the same planner classes (a 33/66 vs 37/66 fs A/B against the Phase 31 state found no failing trace through a changed path). Note on measurement: the run-to-run spread of the 84-run benchmark is about +-2 runs (four runs of near-identical Phase 31 code scored 53-56), and its false-failure count rose 11 -> 28 mostly because more tasks now succeed through tools whose effect cannot be read back (the honest "I couldn't verify..." note) - read that metric with that in mind.
+**Phase 35 (done, see its section) moved the database out of the OneDrive repository to `%LOCALAPPDATA%\FRIDAY\friday.db`, stopped
+storing file bodies / typed text / messages / code / shell command lines in audit rows and episodes, and made tests and the
+benchmark refuse the real database and recovery store automatically. Follow-ups it leaves open (highest first):** the OLD
+`data/friday.db` (and its history, which still holds message / typed-text content) is still in the synced repository until the
+user deletes it by hand (`python run.py db status` / `db scan`); the reversible scrub of historical audit rows exists since Phase 36 (`python run.py db scrub`, preview-first, verified backup) but has NOT been run on the real databases - the user decides; `data/logs` and
+the other `data/*` reports are still inside the repository; the database and recovery store are unencrypted; the recovery store is
+never cleaned unless the user asks (and pending undo entries never expire by default); `shell.run`/`ui.*` can still destroy files.
+Older candidates, none started: (a) make `shell.run` killable (it runs `subprocess.run` in a worker thread, so a stop
+waits up to its 60 s timeout); (b) cover standalone routine/scheduled-job runs (`jobs.run_job`), which Phase 28's
+goal-scoped signal does not reach; (c) hear a spoken "stop" while a goal runs (the voice thread is blocked in
+`Backend.ask` for the whole goal); (d) daemon API authentication, which the user has deferred. Also `Backend.ask`
+times out at 120 s while a goal may run 300 s.
 
 **Deferred work.** Self-extension; daemon API authentication; recursive folder copy/move/delete (26); drag-timing hardening (27:
 one unexplained intermittent failure, not reproduced in 56 drags since).
@@ -54,7 +64,8 @@ one unexplained intermittent failure, not reproduced in 56 drags since).
 **Known cross-cutting limitations** (per-phase lists are in each section): `ui.*` effects are not read
 back; synthetic input can be disturbed by concurrent physical mouse use; 1-2 digit numbers are never
 grounded (24); the local 3B planner model bounds planning quality; a stop cannot reverse what already ran or
-interrupt a worker-thread tool (28); human validation of 24-28 is pending.
+interrupt a worker-thread tool (28); human validation of 24-28 is pending; measured end-to-end task success is
+66.7% on the Phase 31 re-run of the Phase 29 benchmark (46.4% after Phase 30, 22.6% before it; cold start, headless browser, absolute-path file tasks - see its limitations).
 
 ---
 
@@ -8484,3 +8495,854 @@ on one method and the orchestrator honours the signal at every boundary it can.
 - The daemon API still has no authentication (deferred by request).
 - The GUI STOP button, the hotkey in the real running GUI, and a stop at a real confirmation card were **not**
   exercised by a human: see `MANUAL_VALIDATION.md` (Phase 28.0 checklist, all boxes unchecked).
+
+---
+
+## Phase 29.0 — Real-Environment Agent Benchmark (2026-10-04)
+
+**Why.** Phases 24-28 hardened what FRIDAY does *around* a model decision; nothing measured whether it completes real
+work. This phase is measurement and infrastructure only: **no file under `friday/` was changed**, and no failure it
+found was fixed (by design - a trustworthy baseline first).
+
+**What it is.** `scripts/agent_benchmark.py` (runner, trace capture, failure classification, report, `--compare`),
+`scripts/bench_env.py` (isolation + guards + the local mock site), `scripts/bench_tasks.py` (28 tasks),
+`scripts/bench_oracles.py` (known-correct solutions). Results: `benchmarks/baseline_phase29.json` (+ `.review.json`,
+the two labels corrected by hand). Every task is a natural-language request run through the REAL production path:
+`Session.handle` -> BRAIN routing -> `plan.run` -> real qwen2.5:3b -> Executor / permissions / confirmation / intent guard
+/ post-condition verification / evidence-grounded completion. Tasks are scored on the FINAL ENVIRONMENT STATE (files on
+disk, what the mock web server received, what a throwaway window's event log recorded, what Calculator displays), never
+on FRIDAY's words. Confirmations are answered through the normal channel ("yes"/"no" via `Session.handle`) per the task.
+
+**Isolation (proven before the first task, and re-checked after the run; any failure aborts with exit 2).**
+- *Database:* the existing `store.use_temp_db()` (no second DB architecture). Proven by SQLite's `database_list` from the
+  main thread AND a fresh worker thread; afterwards nothing carrying the sandbox marker may exist in `data/friday.db`
+  (0 found). The store is wiped between runs (cold start; audit is kept as the trace).
+- *Files:* a fixed sandbox `%TEMP%\fbench\work` (only ever re-created if it carries this benchmark's sentinel file).
+  Every `files.*` skill is wrapped to refuse any path outside it (relative paths too: they would resolve against the process
+  cwd); `files.search` walks only the sandbox. A canary file in a sibling temp dir is hashed before/after.
+- *Browser:* persistent profile inside the sandbox, headless, and a Playwright route that aborts every request that is
+  not the local 127.0.0.1 mock site (live-probed with a request to a non-local host). Scored on what the SERVER received.
+- *UI:* only windows the benchmark opened (a disposable WinForms window, and a Calculator that did not exist when the task
+  began) can be inspected or actuated; `input.*` refuses a foreground window that is not one of them; `apps.open` may only
+  launch Calculator. (If Calculator is already open the task is skipped, never touched.)
+- *Policy:* every tool the tasks do not exercise is hard-denied via the normal per-tool `permissions.overrides` (58 tools);
+  tiers, the unattended ceiling and confirmation behaviour are verified unchanged, and `files.delete` is verified still
+  confirm-tier. The benchmark only ever adds `deny`.
+- *Self-test (`--selftest`):* for all 28 tasks a known-correct solution (through the real skills, no planner) must PASS its
+  check and an untouched environment must FAIL it (except the four tasks whose correct behaviour is to change nothing). 28/28
+  clean. This is what makes a failing run mean "FRIDAY failed" rather than "the check is wrong".
+
+**Tasks (28; 3 runs each = 84 runs).** *system (2):* time, arithmetic. *fs (11):* create folder + file; copy; rename;
+group two files into a new folder; sort files into subfolders by type; read a value from a file; find a file and read it;
+copy onto an existing file (confirmation declined -> must not overwrite); same with approval; delete (confirm); copy a
+file that does not exist (must fail honestly). *browser (7, local mock site):* read a page; click a link and read; click a
+button twice; fill and submit a form; type into a search box, click Find, read the result; click a button that does not exist
+(honest failure); click "Delete account" (confirmation declined -> must not be sent). *ui (8, throwaway window + real
+Calculator):* click; fill; right-click; drag; scroll; click twice and read the counter; Calculator 7+3; bring a covered
+window to the front. Each task states required state, forbidden state and whether a confirmation is expected
+(`scripts/bench_tasks.py`).
+
+**Baseline (final run: 2026-10-04, commit `ba62eb2` + this phase, qwen2.5:3b, 10.2 min wall clock).**
+
+| | pass | rate |
+|---|---|---|
+| **overall** | **19/84** | **22.6%** |
+| system (2 tasks) | 6/6 | 100% |
+| fs (11) | 9/33 | 27.3% |
+| browser (7) | 1/21 | 4.8% |
+| ui (8) | 3/24 | 12.5% |
+
+Passing tasks: `sys_time`, `sys_math`, `fs_mkdir_write`, `fs_delete_confirmed`, `fs_missing_source` (all 3/3);
+`br_read` 1/3, `ui_click_read` 1/3, `ui_focus` 2/3. Every other task was 0/3. Two earlier complete runs of the same
+suite (before the two infrastructure fixes below) scored 17/84 and 20/84 - a run-to-run spread of a few points; the
+zero-pass tasks were the same in all three.
+
+**Failure classification (65 failing runs; every trace was read, labels confirmed or corrected by hand).**
+- **intent/routing - 33.** BRAIN's single-skill direct route, before any planner: "Which src?" for a request that names
+  both paths (`fs_rename`, both conflict tasks - also for "Rename draft.txt to final.txt" with no path at all); a
+  different skill entirely (`fs_copy` -> `files.search` with the sentence as the query; `fs_read_value` -> `screen.observe`/
+  `network.status` because of the word "port"; `ui_click` -> `screen.active_window`/`meta.recent`); only the first clause
+  of a compound request (`fs_group_photos` -> `files.mkdir` of the work folder); slot extraction taking the whole sentence
+  as the argument (`ui.scroll(app="scroll down in the bench test")`, `ui.drag`/`ui.right_click` "Which source/label?");
+  `input.type` receiving the whole instruction as the text to type. **A direct route gets no post-condition check or answer
+  grounding**, so several failing runs ended with FRIDAY reporting success on the wrong state ("Typed 70 characters." into
+  the harness window; "You're in Bench Test Window." for a click request).
+- **planner/reasoning - 31.** Mostly browser/UI: after a correct `browser.open` the planner chose `ui.click`/`ui.fill` with
+  a blank `app` (= the foreground window) instead of `browser.click`/`browser.type` (those attempts on a non-benchmark
+  window were blocked by the guard); typed `browser.type(field="q")` without ever inspecting the page; stopped after one of
+  two clicks and answered "Added item twice ... treat it as unconfirmed"; planned `fs_search_read` as `ui.inspect("Code")`;
+  `fs_sort_by_type` stopped halfway and reported the folders organised (false success), or moved `a.txt` onto a path that did
+  not exist, renaming it to a file called `Data`; Calculator: "Number 1" instead of "Seven".
+- **environment/harness - 1** (`ui_focus` run 3: `apps.focus` said ok but the foreground was another window; the user was
+  using the machine at the time). **tool implementation / permission-guard / verification - 0 as the primary cause**, but see
+  the defects found below.
+- False-success runs (FRIDAY ended ok on a wrong state): 8/84. False-failure (right state, FRIDAY did not claim success): 2.
+  Sandbox violations attempted and blocked: 38 (25 `ui.click`, 7 `ui.fill`, 3 `ui.right_click`, 3 `apps.open("chrome")`);
+  none reached the real machine.
+
+**Defects found along the way (not fixed - they are follow-up candidates).**
+1. `browser.click` on an element that navigates (a form's submit button) reports "I couldn't find that: no clickable
+   element" although the click happened and the form was submitted (the locator's post-click `inner_text()` raises as the
+   page navigates, the loop swallows it and tries the next locator). A planner that retries would double-submit. Found
+   by the benchmark's oracle, confirmed against the mock server's request log.
+2. `files.move(src, dst)` to a destination that does not exist and is not a folder silently renames the file to that
+   name; a second move onto it destroys the first file's content behind a confirmation the user may approve without
+   noticing. (Seen in `fs_sort_by_type` run 3 of an earlier complete run.)
+3. Routing is sensitive to the literal text of a path: the same sentence routed differently for two random sandbox folder
+   names. (Hence the fixed sandbox path; absolute-path requests are a real use case.)
+4. `ui.click` with no `app` acts on the foreground window; combined with the planner's tendency to reach for `ui.*`
+   after a browser step this is a wrong-target hazard the Phase 27 guard (which protects an *identified* window) does not cover.
+
+**Infrastructure defects fixed during the phase (and the affected measurement re-run).**
+1. The throwaway window's title contained "FRIDAY": `ui_focus` routed to `window.snap` with it and to `apps.focus` with a
+   neutral title (probed). Renamed; whole suite re-run.
+2. The sandbox folder had a random name, which changed routing between runs (defect 3 above) - not comparable. Now a fixed
+   path; whole suite re-run.
+3. A clarifying question was counted as a success claim, and "right state but FRIDAY said it could not" was counted as a
+   false failure for tasks whose correct outcome IS to refuse; both corrected in the metric. A real foreground-window
+   title that a read-only tool returned was redacted from the stored results.
+
+**Reuse as a regression gate.**
+`.venv/Scripts/python.exe -X utf8 scripts/agent_benchmark.py --out benchmarks/new.json`, then
+`--report benchmarks/new.json --compare benchmarks/baseline_phase29.json [--gate]` (per-task and per-category deltas;
+`--gate` exits 1 on an overall regression). `--category fs,system` skips the real-mouse UI tasks; `--selftest` validates
+the checks; `--prove-only` runs just the isolation proof.
+
+**Regression.** No `friday/` file changed. Re-run green after the benchmark (all exit 0 / ALL OK): stop_control,
+postconditions, intent_action_alignment, confirmation_routing, goal_coverage, scope_expansion, semantic_repeat, tool_data,
+files_mutation, ui_automation, answer_grounding_e2e, shell_blocklist, registry, phase24_boundary, orchestrator, plan,
+long_horizon, evidence_grounded_goals, open_ended, pagination, answer_object_grounding, daemon. Not re-run: `regression.py`
+(executes live volume/brightness changes), the known pre-existing failures listed under Phase 28, the voice suites. The
+non-temp-DB suites among these write a few rows to the real `data/friday.db` (12275 -> 12281 audit rows); the benchmark
+itself wrote none.
+
+**Known limitations of this benchmark.**
+- Cold start: the store is wiped between runs, so experience memory is empty (a long-running FRIDAY has some).
+- Headless browser: there is no visible Chrome window, so a `ui.*` fallback on the browser can never work here; with a
+  headed browser some of the planner's wrong-tool-family choices might have succeeded by accident. Read the browser pass
+  rates with that in mind.
+- File tasks use absolute sandbox paths (the tools need full paths); the ambient desktop context (real window titles) is
+  still part of the planner prompt, as in production, and plausibly pulled `fs_search_read` toward `ui.inspect("Code")`.
+- Tools denied by the benchmark that a direct route picked (`network.status`, `screen.observe`, `window.snap`) would have
+  run in production and returned a wrong-but-"ok" answer; they are counted as routing failures.
+- UI tasks use the real mouse; concurrent human use can disturb them (one run, `ui_focus` #3, is attributed to that).
+- 3 runs per task at temperature 0.3: a task at 1/3 or 2/3 is a noisy estimate; the 0/3 tasks are not.
+- Not measured: voice, the GUI, scheduled/unattended runs, undo, plans longer than ~6 steps, a warm-memory FRIDAY.
+- Not a claim of production readiness; no manual validation was performed or marked complete.
+
+---
+
+## Phase 30.0 — Direct-Route Safety & Verification (2026-10-04)
+
+**Why.** The Phase 29 benchmark's largest failure class (33 of 65 failing runs, plus 6 of its 8 false-success runs) was the
+single-skill *direct route*: `BRAIN.understand` picks ONE skill and fills its arguments with regexes, and `Session` then
+executed it with no check that the arguments account for what was said, and no read-back of the result. This phase makes that
+route conservative and verification-equivalent to a planned step. Nothing was hard-coded for a benchmark task; the benchmark
+(tasks, oracles, isolation, scoring) was not touched and was re-run unchanged.
+
+**What it does.**
+- `friday/directroute.py` (new): `assess(text, understanding)` decides whether a direct ACT / ASK_SLOT may execute. It asks "do
+  the arguments faithfully and completely account for the request?" - not "is the score high?" (right and wrong routes score
+  0.65-0.86 alike). Seven checks, each a named function returning a reason code:
+  `unconsumed_operand` (a path / URL / file name / quoted string in the request appears in no argument),
+  `unfillable_slot` (a required argument the extractor has no strategy for - `extract.can_fill` runs the real extractor on a
+  probe sentence so it cannot drift - while the request says more than the skill's own vocabulary; a truly bare "copy a file"
+  is still asked about), `whole_sentence_arg` (a target argument that is the whole sentence, or any argument that still contains
+  the skill's own verb: "type hello world" would type the word "type"), `second_instruction` (an argument still holds a second
+  clause with an action verb), `compound_request` (an action verb in two clauses), `action_mismatch` (asked to change
+  something, the skill can only look), `ambiguous_route` (two different skills within 0.015, winner < 0.80, and its arguments
+  neither exist nor differ from the sentence). Operands are masked before verb analysis (a folder called `reports` is not the
+  verb "report"). Skills that parse their own phrasing (`extract.parses_own_input`: schedule/routine/memory/notes/math/timer/
+  whatsapp/project/weather) are exempt from the argument-shape checks; a near-verbatim match of a skill's own taught phrasing
+  (>= 0.90) is exempt from `compound_request`/`action_mismatch` only.
+- `Session._gate_direct_route`: the last gate before `_act`, after plan-routing and context resolution. An unsafe route becomes
+  the same `plan.run` decision `_maybe_route_to_plan` builds, so the planner's schemas, intent guard, verification and the
+  Executor (permission, risk escalation, confirmation, ceiling, audit, stop) all apply unchanged. No planner available: a
+  doubtful ACT is refused (nothing runs), a doubtful ASK_SLOT is asked as before. Corrections ("no, I meant ...") are exempt
+  (they are bookkeeping, not requests). `Session.last_route_gate` + a `session.direct_route_rejected` event record why.
+  Kill switch `brain.direct_route_guard`.
+- Two extraction/routing defects fixed because they asked for or acted on information that was already present: a URL is no
+  longer read as a path (`http://127.0.0.1:5000/account` became `p:\127.0.0.1:5000\account`, handed to `files.delete`); and
+  contextual-reference resolution no longer engages when the request names its target ("Copy the file C:\a.txt to C:\b.txt"
+  answered "I don't have a recent file to refer to").
+- `orchestrator.run_verified` (used by `Session._run` for every direct skill call except `plan.run`): reuses the
+  Orchestrator's own `_verify_step` / `verify.capture_before` / `_attach_verification` - no second verification architecture.
+  VERIFIED: the tool's result as given. FAILED: `ok=False`, "It did not take effect - ...", the tool's own claim kept as context.
+  UNVERIFIED / PARTIAL: `ok` left alone and the reply carries `verify.UNCONFIRMED_NOTE` (now the single wording shared with
+  `plan.run`). Read-only, refused, declined and failed calls are untouched. Master switch `planner.postcondition_verify`.
+- Additive helpers: `intent.clause_verbs`, `intent.is_action_word`, `extract.parses_own_input`, `extract.can_fill`.
+
+**Tests.** `scripts/smoke_direct_route.py`: 101 deterministic checks in 11 sections (complete args stay direct; unreadable /
+missing args -> planner and a bare request still asks; compound; whole sentence as an argument; ambiguous skill words; end to
+end through the real BRAIN and `Session.handle` with a stubbed planner and a recording executor; the 28 benchmark prompts
+(exactly `sys_time`, `sys_math`, `fs_delete_confirmed` stay direct); 92 labelled routing utterances from `smoke_brain` /
+`regression` (only 5 diverted, each a route whose argument was wrong); direct-call verification success / failure /
+unverifiable / untouched / refused; truthful final answer after a failed direct call through `Session.handle`; kill switches /
+no planner) plus section 12, **mutation testing**: each of the 7 checks, `Session._gate_direct_route`, `assess`, `run_verified`,
+`_attach_verification`, `verify_call` and the unconfirmed note is disabled in turn and the suite must fail (14/14 killed, each
+only counted when the unmutated suite passes).
+
+**Measured result (same 28 tasks x 3 runs, same isolation, qwen2.5:3b; baseline `baseline_phase29.json`, now
+`benchmarks/after_phase30.json`).**
+
+| | Phase 29 | Phase 30 |
+|---|---|---|
+| overall | 19/84 = 22.6% | **39/84 = 46.4%** |
+| fs (11 tasks) | 27.3% | 69.7% |
+| browser (7) | 4.8% | 28.6% |
+| ui (8) | 12.5% | 16.7% |
+| system (2) | 100% | 100% |
+| failing runs whose FIRST route was a direct skill | 34 | **0** |
+| `intent/routing` failures | 33 | 0 |
+| runs that started with a direct route / of those passed | 48 / 14 | 9 / 9 (`sys_time`, `sys_math`, `fs_delete_confirmed`) |
+| direct routes diverted to the planner by the gate | - | 39 (21 unconsumed operand, 15 whole-sentence, 6 unfillable slot, 3 action mismatch; some runs had several reasons) |
+| false-success runs | 8 | 6 - but **from a direct route: 6 -> 0**; from the planner: 2 -> 6 (`ui_focus` x3: `done` after only `ui.inspect`; `ui_right_click` x3: "not supported", labelled unverified) |
+| false-failure runs | 2 | 11 (see below) |
+| suite duration | 10.2 min | 17.0 min (above the ~15 min target: 39 more runs now go through the real planner) |
+
+Eleven tasks improved (`fs_copy`, `fs_rename`, `fs_read_value`, `fs_conflict_decline` 0->3/3; `br_read` 1->3/3; ...), two
+regressed: `ui_focus` 2/3 -> 0/3 (the baseline passed *by luck*: `apps.focus(app="bring the bench test window to the front")`
+worked because the skill fuzzy-matched the whole sentence; the gate correctly refuses a whole sentence as an argument and the
+planner then stops after `ui.inspect`) and `ui_click_read` 1/3 -> 0/3 (planner path before and after: noise on a 1/3 task).
+All 45 remaining failures are on the planned path: 42 `planner/reasoning`, 3 `permission/guard`.
+**New failure class `permission/guard` (3, `ui_right_click`):** the Phase 20 intent guard tokenises "Right-click" as one word
+that its verb table does not contain, so the scope reads "reading/observing" and `ui.right_click` is rejected as
+`modify`. Conservative (safe direction) but it blocks a legitimate request; it was invisible before because the request never
+reached the guard. **False-failures 2 -> 11** are mostly runs that now reach the planner and honestly hedge: `br_read` /
+`br_nav_click` / `ui_click` add "I couldn't verify that it actually took effect" (browser and ui tools are `UNVERIFIABLE`),
+and `fs_rename` x3 has the right state but the Phase 24 answer-grounding guard replaced the planner's summary with "insufficient
+evidence" although `files.move` succeeded and was verified. One unexpected confirmation (`fs_group_photos` #3: the planner moved
+files onto existing paths and the confirmation gate fired correctly). Isolation re-verified after the run (canary untouched,
+0 real-DB rows).
+
+**Regression.** Green in the final code state (exit 0): smoke_direct_route (new), smoke_brain, smoke_action_continuity,
+smoke_confirmation_routing, smoke_contextual_memory, smoke_plan, smoke_postconditions, smoke_orchestrator,
+smoke_intent_action_alignment, smoke_files_mutation, smoke_stop_control, smoke_daemon, smoke_registry, smoke_open_ended,
+smoke_intent_routing, smoke_whatsapp; and (first pass) smoke_goal_coverage, scope_expansion, semantic_repeat, tool_data,
+ui_automation, answer_grounding_e2e, shell_blocklist, phase24_boundary, long_horizon, evidence_grounded_goals, pagination,
+answer_object_grounding, intelligence, experience_planning, goal_decomposition, proactive_intelligence. Two real regressions
+were found by these suites and fixed in this phase: `smoke_open_ended` (a correction was handed to the planner and created a
+goal) and `smoke_intent_routing` (the ambiguity check diverted `Message Rahul on WhatsApp: ...` although the skill's own parser
+had split contact and message). `smoke_project` fails identically before this phase (pre-existing: "correctly reports
+not-a-git-repo"); `smoke_intent_routing` also segfaulted once at baseline (the known native COM crash). `regression.py`, the voice
+suites and the known pre-existing failures were not run.
+
+**Known limitations.**
+- A request the gate diverts now depends on the 3B planner; where the planner is weak (browser/UI) the outcome is a
+  planner failure instead of a routing failure. Faster/cheaper would be to teach the extractor the slots it cannot read
+  (`src`/`dst`, `label`, `url`, `combo`, window titles) so those requests run directly; deliberately not done here.
+- Heuristics, not proofs: the gate flags 5 of 92 labelled utterances and 34 of 562 taught phrasings (6%), every one a route whose
+  argument was wrong, but a legitimate paraphrase can still be diverted (slower, not unsafe), and a compound request whose second
+  clause has no recognised verb ("set volume to 50 and brightness to 70") is not detected.
+- Skills in `parses_own_input` are exempt from the argument-shape checks, so a wrong skill choice that parses the whole sentence
+  (e.g. `timer.set(duration=<sentence>)`) is caught only by the ambiguity / compound / operand checks.
+- Direct state-changing calls to `UNVERIFIABLE` skills (`ui.click`, `input.type`, `system.lock`, ...) now say "I couldn't verify
+  that it actually took effect" - consistent with `plan.run`, but wordier for skills whose effect is self-evident.
+- Verification adds a read-back (up to `verify_timeout_s`) to direct state-changing calls; a fake executor that shares a real
+  skill's name makes the verifier look at this machine (same as the orchestrator).
+- One benchmark run per configuration: tasks at 1/3 or 2/3 are noisy; 0/3 and 3/3 are not. Same benchmark limitations as Phase 29
+  (cold start, headless browser, absolute paths, real mouse). Not a claim of production readiness; no manual validation was done.
+- Pre-commit hardening added deterministic `directroute.refine` rules (explicit memory store, knowledge question, "list my
+  documents", personal-fact question `what is/what's/what are my <1-4 words>` -> `memory.recall`) and a `memory.grounded_hit`
+  guard (a recall hit scoring 0.55-0.62 must share a content word with the question). The personal-fact rule fires only when
+  `memory.recall` is among the tied candidates, so some personal-fact questions still fall back to the planner by design
+  (e.g. "what are my allergies", "what is my laptop's name"). "remember my blood type is O+" routes to `memory.remember`
+  but is still judged unsafe by the ambiguity check, and the stored text loses its "+" (pre-existing quirk).
+
+---
+
+## Phase 31.0 — Planner Tool-Family Discipline (2026-10-09)
+
+**Why.** Phase 30 removed the direct-route failure class; every one of the 45 failing benchmark runs left was on the planned
+path (42 `planner/reasoning`, 3 `permission/guard`). Reading those traces: in 14 of the 21 browser runs, after a correct
+`browser.open` the planner reached for the DESKTOP tools (`ui.fill`, `ui.click`, `ui.inspect(app="chrome")`), almost always with
+no window named, 38 such calls in all. With no window named they act on whatever desktop window is in front: with a headless
+browser never the page; with a headed one the browser window's accessibility tree instead of the page's DOM, and in both cases
+around `browser.click`'s consequential-click confirmation (`ui.click` has no such check). The planner saw one flat list of ~80
+tools and matched the user's verb ("fill in", "click") to the tool whose name says it. Second, a run could end `completed`
+without doing what was asked (`ui_focus`: `done` after only `ui.inspect`, 3/3 false successes). Third, the Phase 20 intent guard
+read "Right-click" as one unknown word, so the request looked verb-less and `ui.right_click` was rejected (3/3).
+
+**What it does.** Nothing here was written for a benchmark task; the benchmark (tasks, oracles, isolation, scoring) was not
+touched (its four files are dated 2026-10-04, before the Phase 30 run) and was re-run unchanged.
+- `friday/toolfamily.py` (new, pure apart from one read of the browser module's state). `browser_context(goal, observations,
+  live)` says whether the run is working on a page in FRIDAY's own controlled browser: this run OPENED a page (or used the
+  browser on a request that is about the web); or a page is still open and the user's words are a follow-up about "that
+  page"; or the request itself is a web task (it names an address, "the browser" or a site) and no page is open yet. It is
+  dropped as soon as FRIDAY's browser fails to open a page or the planner goes to the default browser (`web.open`), so the
+  desktop tools stay available as the fallback, and it never applies to "my / default browser". Merely reading a page left
+  open by something else does not make a desktop request a browser task. `hide_desktop_ui`: in that context, unless the
+  request or the run also points at a desktop window (`desktop_in_play`: "window"/"app"/"desktop" in the request, or the run
+  opened/focused an app or acted on a window it named), the desktop-window tools (`ui.*`, `input.type`, `input.hotkey`,
+  `screen.click_text`) are not offered at all - prompt and JSON-Schema enum (Phase 20 measured that hiding works where telling
+  does not). `check_call` is the authority on every decision: a desktop-window call aimed at "whatever is in front" (no window
+  named, a deictic one, the browser itself, the page's own title) or `apps.open(<a browser>)` is not run; the planner is told
+  the browser call that does it ("browser.type(field='Full name', text='Ada Lovelace')", "browser.open(url=...) first, then
+  browser.click(...)"). A `ui.*` call that names a real desktop window is not the gate's business. One system-prompt sentence
+  names the browser tools; nothing from the page (title, URL) is put into the system prompt.
+- Orchestrator wiring (`run_goal`): the context is recomputed every turn; a rejection is the same NOT-executed observation shape
+  as an intent rejection (`error="intent_mismatch"`, `data.status="tool_family"`, never evidence, step refunded), bounded by
+  `planner.max_family_rejections` (3) and then an honest stop. Production reads the live page through
+  `friday.browser.current_page()` (never starts a browser or navigates) only when tools run through the real executor; tests
+  inject `Orchestrator(live_browser=...)`.
+- `browser.click` (the Phase 29 defect): finding and clicking are separate. A candidate that matches nothing visible is skipped;
+  the element's text is read BEFORE the click; once something has been clicked no other candidate is ever tried. The old loop
+  read the text after clicking, a navigating click (a form's submit) made that read fail, so it reported "no clickable element"
+  for a click that had happened and then tried the next locator on the NEW page - a second, different click (reproduced in the
+  suite: a submit whose response page has a "Next" link was followed by a click on that link). A click that navigates now says
+  "The browser moved to a new page: <title>" with url/title/navigated in its data (`ClickInfo`); a bare-label return from older
+  callers still works.
+- `browser.type`: also matches the field's `name`/`id` (the parameter was always documented as "label, placeholder, or name of
+  the field", but "q" never matched), and failing everything the ONE visible field whose own description shares a word with the
+  request ("the search box" -> "Search products"); never a guess between two. A miss on either tool lists what does exist
+  ("On this page: Pricing, Register, ..." / "Fields on this page: ...").
+- Premature completion. `intent.requested_actions(scope)`: the lead verb of each imperative clause of the user's own request
+  ("Open X and click Y" -> open, click; "Tell me whether I need to update my drivers" -> nothing). For a DIRECT_ACTION request,
+  a `done` after steps that only read or observed (nothing that acts was even tried; a failed, refused or declined action counts
+  as tried) is sent back once with what was asked for (`planner.max_action_nudges` 1). If the planner says `done` again with
+  still nothing acting, the run ends as NOT done (`stopped="failure"`) with what the steps really found and without the
+  planner's claim (`Orchestrator._unfinished_action`; measured in the first benchmark run: "a.txt and b.txt are in the 'Text'
+  folder" after a file search alone). A `done` with nothing run at all keeps its Phase 19 "unverified" handling; open-ended
+  requests ("make this better" may rightly end in "nothing to change") and look-only ones are never nudged. When the intent guard
+  rejects a call on an action request, the history line now names up to two offered tools that do fit (their declared class is
+  already allowed and they share a word with the request: "Bring the Bench Test Window to the front" -> `apps.focus`).
+- Counted repetition: "click the Add item button twice" used to have its second, identical click blocked by the Phase 5 repeat
+  guard (Phase 29 saw the planner then report "added twice" after one click). `intent.requested_repeats` reads a count from the
+  user's own clause that names the call's target; the identical call may run that many times and is not run beyond it
+  (failed attempts do not count). With no count the Phase 5 rule is unchanged.
+- Intent lexicon (`friday/intent.py`): "right-click" / "double-click" / "left-click" (hyphenated or two words) authorize exactly
+  what "click" does; "bring <X> to the front / foreground / top" is a focus request (focus only - `apps.focus`'s own description;
+  "bring me the report" is unchanged). Questions, negations and noun uses ("the right-click menu") stay read-only.
+- Switches (`planner.*`, config.yaml): `tool_family_guard`, `max_family_rejections`, `action_completion`, `max_action_nudges`,
+  `counted_repeats`; each off = the Phase 30 behaviour.
+
+**Tests.** `scripts/smoke_tool_family.py`: 155 deterministic checks in 12 sections (scripted planner through the Orchestrator's
+own provider seam; sections 5-7 drive a real headless Chromium against a local 127.0.0.1 server the suite starts): the
+family/context rules; browser tools preferred once a page is in play (prompt text, schema enum, system line, no page content in
+the system prompt); no session -> desktop tools unchanged, a browser that could not start leaves the fallback, a stale page or a
+stray read never hijacks a desktop request; the gate (refunded, bounded, explicit desktop window allowed, mixed requests, the
+benchmark's first-decision failures reproduced); `browser.click` on navigating elements (link, form submit, never a second click,
+the pre-Phase-31 defect reproduced); form interaction (label / name / id / one unique word / ambiguity / misses); a multi-step form
+and a search task end to end through the real browser skills; premature completion (nudge, honest stop, every exemption); counted
+repetition; right-click and bring-to-front authorization incl. the conservative cases; kill switches. Section 12, **mutation
+testing**: 21 mechanisms disabled in turn, each must make the suite fail (21/21 killed, each only counted when the unmutated
+suite passes).
+
+**Measured result (the same 28 tasks x 3 runs, same isolation, same oracles, same scoring, qwen2.5:3b; `benchmarks/after_phase31.json`).**
+
+| | Phase 29 | Phase 30 | **Phase 31** |
+|---|---|---|---|
+| overall | 19/84 = 22.6% | 39/84 = 46.4% | **56/84 = 66.7%** |
+| fs (11 tasks) | 27.3% | 69.7% | 57.6% (19/33) |
+| browser (7) | 4.8% | 28.6% | **90.5% (19/21)** |
+| ui (8) | 12.5% | 16.7% | **50.0% (12/24)** |
+| system (2) | 100% | 100% | 100% |
+| failing runs by class | 33 routing, 31 planner, 1 env | 42 planner, 3 guard | **25 planner, 2 verification, 1 other, 0 guard** |
+| browser runs where a desktop `ui.*`/`input.*` call reached the executor | 16 (44 calls) | 14 (38 calls) | **0 (0 calls)** |
+| sandbox violations attempted (all blocked) | 38 | 49 | **0** |
+| `ui_right_click` | 0/3 (routing) | 0/3 (intent guard) | **3/3** |
+| false-success runs | 8 | 6 | **4** |
+| false-failure runs | 2 | 11 | 28 (see below) |
+| suite duration | 10.2 min | 17.0 min | 16.6 min |
+
+Three more complete runs of the same suite on near-identical code (while the last fixes were made) scored 54, 53 and 54 of 84:
+the run-to-run spread of this 3-sample benchmark is about +-2 runs; tasks at 1/3 or 2/3 are noisy, 0/3 and 3/3 are not.
+All four runs are kept (`benchmarks/phase31_interim_*.json`).
+
+What moved: browser 6 -> 19 (`br_click_twice`, `br_fill_form`, `br_search_filter`, `br_consequential_click`, `br_missing_button`
+from ~0 to 2-3 of 3: the planner now stays in `browser.*`, and the consequential click really asks for confirmation again);
+`ui_right_click` 0 -> 3; `ui_click`, `ui_fill`, `ui_click_read` up. Not moved: `ui_drag`, `ui_scroll`, `ui_calculator` (0/3 each), `ui_focus`
+(0/3), `fs_sort_by_type`, `fs_search_read`, `fs_overwrite_approved` (0/3).
+
+**Reading the numbers honestly.**
+- *False failures 11 -> 28 is mostly a metric effect, not a regression:* the metric counts "state is right but FRIDAY did not claim
+  success". 25 of the 28 are browser/ui tasks that now SUCCEED through tools whose effect cannot be read back (`browser.*`, `ui.*` are
+  `UNVERIFIABLE` by design, Phase 22), so the reply carries "I couldn't verify that it actually took effect, so treat it as unconfirmed"
+  (Phase 30's wording, unchanged); the other 3 are `fs_rename`, whose correct answer Phase 24 grounding still rewrites. More tasks
+  reaching a correct state through unverifiable tools means more honest hedges.
+- *Filesystem 70% -> 58% is not caused by this phase.* Filesystem tasks involve no browser tool. The failing fs runs choose a
+  hard-denied `shell.run` (`fs_conflict_decline`, `fs_overwrite_approved`), wander to `ui.inspect` on a random window
+  (`fs_search_read`), or stop after a search (`fs_sort_by_type`). Checked directly: the same 11 fs tasks x 3, in the same session,
+  with the three Phase 31 switches OFF scored 18/33 and with them ON 18/33 - identical task by task
+  (`fs_group_photos`, `fs_sort_by_type`, `fs_search_read`, `fs_conflict_decline`, `fs_overwrite_approved` all 0/3 in both arms). The
+  difference from Phase 30's 23/33 is model/environment variance (the planner prompt carries the real window titles), not a regression.
+- *False successes that remain (4):* `ui_focus` x2 (`apps.focus("Bench Test")` fuzzy-matches the cover window titled "Bench Test
+  Cover" and reports success), `ui_drag` x1 ("UI inspection and click action ... completed" after only `ui.inspect`) and
+  `fs_group_photos` x1 (created empty files in `Pictures` and said the photos were placed there). Two of these pass through the
+  Phase 31 action-completion rule because a state-changing step DID run (so the run is not "only read"); verifying that the right
+  thing changed is the post-condition/grounding layers' job, not this rule's.
+
+**Defect found along the way (fixed).** The Phase 23 answer shortcut composed a final answer as soon as an *open* step satisfied the
+first subgoal of "Open <url> in the browser and tell me the support hotline number": `browser.open` alone made the "tell me the number"
+subgoal "ready", the answer was composed from "Opened Bench Store." (honestly: "the evidence does not provide the number") and the page
+was never read - 0/3 on `br_read` in one run. `_answer_subgoal_ready` now holds an answer back when ALL its prior evidence is an
+open/navigate/focus result that is not about what the answer asks (`intent.LIGHT` class); any read, observation or state-changing
+result keeps the Phase 23 behaviour (a first, broader version of this rule broke 7 Phase 23/24 suites and was narrowed). In isolation
+`br_read` then passed 8/8; in the final full run it was 2/3 - one run still stopped after the open, path not identified.
+
+**Regression.** Green, same as before this phase, in the final code state: 47/50 suites exit 0 (the 49 suites of the Phase 30 list plus
+`smoke_tool_family`); the 3 that do not are the pre-existing failures, identical before and after: `smoke_browser` ("no url given ->
+asks for the slot"), `smoke_context_budget` ("after shrinking it fits"), `smoke_memory_redaction` ("bank password" wording, varies run to
+run). `smoke_intent_routing` died once or twice in batch runs with the known native 0xC0000005 crash and passed on re-run (it also
+crashed in the switches-off arm of an A/B, so it is not this change). `regression.py`, the voice suites and `*_live.py` were not run.
+Two regressions found by the suites during the phase were fixed: `smoke_open_ended` / `smoke_evidence_reasoning` (the action nudge
+fired on open-ended requests; now only for plain do-this requests with steps that all read) and `smoke_action_risk` (the browser skill
+must still accept a bare label from a fake `browser.click`).
+
+**Known limitations.**
+- The gate is keyword- and structure-based: a web task is recognised from an address, "browser"/"website"/"web page"; "my/default
+  browser" is deliberately the desktop route. A request that says only "click Login" with a page left open and no web wording is not
+  seen as a browser task (the stale-page rule needs a web word).
+- Counted repetition reads one count per clause and matches the call's target by phrase; "click Add and Remove twice" is not split.
+- The action-completion rule only acts when every executed step read or observed. A run that did the wrong state change and says done
+  is still the grounding/verification layers' job.
+- `ui_drag`, `ui_scroll`, `ui_calculator`, `ui_focus` remain 0/3 (12 of the 28 failing runs). Causes seen in the traces: the intent
+  guard reads "drag" and "scroll" as unknown words exactly as it read "right-click" (`derive_scope` gives such a request only
+  open/focus/navigate, so `ui.drag`/`ui.scroll` are rejected and the planner clicks a "Page down" button or stops after
+  `ui.inspect`); the planner invents controls on Calculator (`ui.fill(field="Number 1")`); `apps.focus` fuzzy-matches the cover window.
+  Not addressed here - the next smallest follow-up is the same verb-table fix for drag/scroll/hover.
+- Not done by design (separate safety milestone): overwrite undo deleting the original file, permanent deletion, `files.move`
+  semantics. No manual validation was performed; `MANUAL_VALIDATION.md` Phase 31 boxes are unchecked.
+- Benchmark limits are unchanged from Phase 29/30 (cold start, headless browser, absolute paths, real mouse, one run per
+  configuration).
+
+
+
+## Phase 32.0 — Filesystem Mutation Safety and Recoverability (2026-10-16)
+
+**Why.** The repository review named four data-loss suspects in the Phase 26 file skills. Each was reproduced against the
+unchanged code first (throwaway temp folder, throwaway undo/audit database, `Executor.run` with an approving confirm handler),
+and the review's claims were right — plus four worse ones it did not list:
+
+| # | Operation (all through `Executor.run`) | What the Phase 26 code did |
+|---|---|---|
+| 1 | `files.write` over an existing file, then "undo" | journaled `files.delete(path)`: undo **deleted the file** — the new content and the original were both gone |
+| 2 | `files.delete`, then "undo" | `Path.unlink()` / `rmdir()`: permanent; no undo registered; the confirm preview said "Permanently delete" |
+| 3 | `files.move` onto an existing file | `shutil.move` replaced it silently (Windows falls back to copy+unlink); undo moved the file back and the destination's original was **gone for good** |
+| 4 | `files.copy` onto an existing file, then undo | undo = `files.delete(dst)`: the overwritten original destroyed |
+| 5 | a **failed** call: `files.copy` of a missing source onto an existing `dst`; `files.copy(x, x)`; `files.mkdir` of an existing empty folder; `files.write` onto a folder | the Executor journaled the inverse regardless of `result.ok`, so the next "undo" **deleted the pre-existing `dst` / `x` / folder** this call never created (all four reproduced) |
+| 6 | `files.move(src, "C:\\x\\newdir\\")` where `newdir` does not exist | created a **file** named `newdir` |
+| 7 | `files.move(a, a)` | reported "Moved", journaled an undo |
+| 8 | "undo" whose confirmation was declined | the entry was marked applied and reported "Reversed files.write — Cancelled."; the undo was lost |
+| 9 | `paths.SNAPSHOTS` | created by `paths.ensure()` and never used by anything (a `grep` finds only its definition and the mkdir) |
+
+**What changed** (nothing in the planner, the benchmark, the permission tiers, the risk classifiers' trigger conditions or the
+confirmation prompts; the choke point is unchanged — every mutation, and every undo step, still runs through `Executor.run`):
+
+- `friday/recovery.py` (new): the recovery store under `paths.SNAPSHOTS` (`data/snapshots/<id>/{meta.json,blob}`). `preserve()`
+  keeps a **verified** copy (size + sha256, mtime, mode, origin path) — a copy for an overwrite, a move into the store for a
+  delete (atomic rename; copy+verify+unlink across volumes). Ids are generated (`YYYYMMDDTHHMMSS-<12 hex>`), validated
+  against a strict shape before being joined onto a path (no traversal), and created with `exist_ok=False` (an id collision
+  refuses the mutation instead of reusing a snapshot). `meta.json` is written before the blob is placed; a restore trusts a
+  snapshot only if the blob's size AND sha256 match. `restore_to()` writes a temp file beside the target, verifies it, then
+  renames it in. Phase 32 never deleted a snapshot (since Phase 33 only the confirmed `recovery cleanup` does). Every failure raises `RecoveryError` and the caller **refuses the
+  mutation** (fail closed): no recoverable copy, no overwrite/delete. `files.max_snapshot_mb` (default 256) caps what is
+  kept; a bigger file is not overwritten or deleted by these skills.
+- `friday/skills/files.py`: **write** goes through a temp file + rename (`fsync`; mode copied) and keeps the original first;
+  **copy** and **move** keep a replaced destination first, refuse identity (same file), a folder in the way, links/junctions,
+  a destination "folder" with a trailing separator that does not exist, and a missing parent; **move** is one
+  rename on a volume (no-overwrite for a new destination; an approved replacement is `os.replace` after a re-check, see the
+  residual window under "Remaining data-loss risks") and copy→verify→swap→remove across volumes, rolling the destination
+  back if the original cannot be removed; **delete** moves the file (or empty folder) into the store; **mkdir** is unchanged but guarded. A new
+  `files.restore(snapshot, path)` (internal — see below) puts a snapshot back: if the path is occupied it keeps what is
+  there first, so even an undo is undoable; if the content already matches it does nothing. The `files.*` skills refuse any path
+  inside the recovery store.
+- Undo semantics: the inverse is now returned by the skill as `SkillResult.undo` (it depends on which snapshot was
+  taken): overwrite → `files.restore`; create → `files.delete` (itself recoverable); a move that replaced a file →
+  a **two-step** inverse (move back, then restore the replaced file).
+- `friday/permissions.py`: the Executor registers an inverse **only for a call that succeeded**, preferring `result.undo`
+  over the static `undo=`. (This fixes row 5 for every skill, not just `files.*`.)
+- `friday/undo.py`: an entry is marked applied only when **every** step succeeded. A declined confirmation leaves it pending
+  ("Didn't reverse X: you declined, so it is still on the undo list"); a failed step leaves the remaining steps pending
+  (progress is saved, and the redo rows the finished steps registered are superseded so the next "undo" *resumes*); after
+  3 failed attempts the entry is given up on (`applied = -1`) so one impossible reversal cannot block the journal.
+  `meta.undo` is `ok=False` unless every line says "Reversed".
+- `friday/registry.py`: `SkillResult.undo`, and `Skill.internal` — `files.restore` is a normal registered skill the
+  Executor runs under normal policy, but it is not offered to the planner (`_tool_specs`, `plan.run`'s tool lists), the
+  matcher corpus, or the skill listings (`meta.capabilities`, daemon, CLI): it is reachable only through the undo journal.
+- `friday/verify.py`: a verifier for `files.restore`. `friday/config.py` + `config.yaml`: `files.max_snapshot_mb`.
+- Confirmation/tier behaviour is unchanged and pinned by tests: new-file write auto; overwrite, copy/move onto an existing
+  file, delete (L2), and a restore onto an occupied path ask; unattended actors are denied; a hard-deny override still blocks.
+
+**Semantics, before → after.**
+
+| | Before | After |
+|---|---|---|
+| overwrite undo | deletes the file | restores the exact original bytes, mtime and read-only flag; anything written after is kept in the store, reachable by "undo" again |
+| delete | permanent | moved into `data/snapshots`; undo restores it; refused if a verified copy cannot be kept |
+| copy/move onto an existing file | silent replace; original lost | confirm (unchanged), original kept, undo restores both files |
+| failed call | still journals an undo | journals nothing |
+| declined / failed undo | marked reversed | stays pending, reported honestly |
+| `move(a, a)` | "Moved", undo entry | no-op, no undo entry |
+| `move(a, "missing\\")` | creates a file named `missing` | refused |
+| cross-volume move | `shutil.move` copy+unlink, partial state on failure | copy→verify→swap→remove, rolled back on failure |
+| write | `write_text` in place (a crash mid-write truncates) | temp file + rename |
+| user-visible text | "Overwrote x." / "Deleted x." | adds "The original is kept, so I can undo this." / "A recoverable copy is kept, so I can undo this."; the delete preview no longer says "Permanently" |
+
+**Tests.** `scripts/smoke_file_safety.py` — 162 checks in 12 scenarios, all temp folders + temp DB + redirected snapshot store
+(and it asserts the real `data/snapshots` is untouched): A overwrite/undo (bytes, mtime, user edits after, declined undo,
+atomic failure, no-copy-no-overwrite, size cap), B delete (bytes/mtime/read-only restore, declined, unattended denied, empty
+folder, occupied path, vanished parent, cross-volume fallback and failure), C move (collision, declined, refusals, identity,
+case-only, cross-volume success and rollback, two-step undo), D copy, E failed calls journal nothing, F the store (unique ids,
+traversal, corruption, protected from the `files.*` skills, id collision, no-op restore), G permissions/audit unchanged,
+H internal skill, I journal behaviour (declined, resumable multi-step), then **19 source-level mutations**, each applied to a
+copy of the real function and required to make the suite FAIL (counted only when the clean run is green): overwrite undo
+deletes the path; overwrite does not keep the original; non-atomic write; delete unlinks; delete may touch the store; the
+Executor journals failed calls; a declined undo is marked applied; multi-step progress forgotten; copy onto itself allowed;
+copy/move replace without keeping the destination; move identity unrecognised; trailing-separator destination; no cross-volume
+rollback; restore without keeping the current file; recovery ids not validated; corrupted copies not rejected; id collision
+overwrites a snapshot; size cap ignored — **19/19 killed**. (One initially survived because the suite itself had shadowed
+`EXECUTOR.run` with an instance attribute; fixed in the test.)
+
+**Regression.** 51 suites (the 50 of Phase 31 plus `smoke_file_safety`): 48 exit 0, 3 fail exactly as before this phase
+(`smoke_browser` "no url given", `smoke_context_budget` "after shrinking it fits", `smoke_memory_redaction` bank/API-key
+wording). One **genuine regression** was caused by this phase and fixed: `smoke_intent_action_alignment` asserted that every
+registered skill appears in the planner's tool lines; `files.restore` is internal on purpose, so the assertion now skips
+internal skills. `smoke_files_mutation` (Phase 26, 38 checks) passes unchanged and was pointed at a temp snapshot store.
+Not run: `regression.py`, voice suites, `*_live.py`.
+
+**Benchmark (unchanged Phase 29 benchmark — tasks, oracles, scoring and isolation untouched; its four files are still dated 2026-10-04; `benchmarks/after_phase32.json`).**
+Reported, not tuned: this milestone changes no planner behaviour, and a safety milestone is not judged by the benchmark.
+
+| | Phase 29 | Phase 30 | Phase 31 | **Phase 32** |
+|---|---|---|---|---|
+| overall | 22.6% | 46.4% | 66.7% (56/84) | **57.1% (48/84)** |
+| fs | 27% | 70% | 58% (19/33) | 39% (13/33) |
+| browser | 5% | 29% | 90% (19/21) | 86% (18/21) |
+| ui | 13% | 17% | 50% (12/24) | 46% (11/24) |
+| system | 100% | 100% | 100% | 100% |
+| failing runs | 65 | 45 | 28 | 36 (35 planner/reasoning, 1 other) |
+| false-success / false-failure runs | 8 / 2 | 6 / 11 | 4 / 28 | 3 / 24 |
+| duration | 10.2 min | 17.0 | 16.6 | 16.1 |
+
+`fs_delete_confirmed` 3/3 (the delete now keeps a recoverable copy; the oracle — the file is gone — is satisfied). No file-tool
+call in the 84 runs was refused by the new safety checks except one honest case: `files.move(dst="…\\Text\\")` into a folder
+that did not exist yet now answers "There's no folder at …\Text" (it used to create a *file* named `Text`); the planner then
+ran `files.mkdir` and went on. **The score is lower than Phase 31's, and I do not claim that is nothing**: every one of the 35
+planner failures in this run is a planner choice (`whatsapp.open`, `shell.run`, `clipboard.write`, `ui.inspect` on a VS Code
+window, a `files.search "fbench"` loop, `ui.drag`/`ui.click` with no window), none runs through a changed code path. To check
+rather than assume, `fs` alone was run 3 reps × 2 in the same session, alternating, on this tree and on a copy with the Phase 32
+changes reverted (Phase 31 state): **33/66 vs 37/66** (15, 18 vs 17, 20); the gap is `fs_rename` (2/6 vs 4/6) and
+`fs_group_photos` (1/6 vs 3/6), whose failing traces are identical planner loops in both arms (`files.search "fbench"` ×3;
+`ui.click` with no window). With ±2–3 runs per 33 from this 3B planner (Phase 31: four runs of near-identical code scored
+53–56), a 4-run gap in one direction is not distinguishable from noise but is not proven to be noise either. The environment
+also drifts (a WhatsApp Chrome tab was open this time and appears in several traces). The benchmark script does not redirect
+`paths.SNAPSHOTS`, so a benchmark run writes a recoverable copy of its sandbox `old_draft.txt` into the real `data/snapshots/`
+per `fs_delete_confirmed` run; those sandbox-only snapshots were removed by hand after the runs (benchmark not modified).
+
+
+**Remaining data-loss risks (honest list).**
+- `shell.run`, `ui.*` and `browser.*` can still delete or overwrite anything: this milestone covers the five `files.*`
+  skills only. Their risk classifiers/confirmations are unchanged.
+- Recovery copies are **unencrypted** files in `data/snapshots`, inside the FRIDAY folder — which, on this machine, is under
+  OneDrive. A deleted sensitive file therefore survives on disk (and may sync) until the user removes it. There is no retention
+  or cleanup (deliberate: FRIDAY never deletes a snapshot), so the store only grows.
+- Copy-based metadata fidelity is mtime/atime and the read-only/mode bits (`shutil.copy2`). Creation time, ACLs/ownership,
+  alternate data streams and hard links are not preserved by a restore of an overwritten file (a deleted file moved by rename
+  on the same volume keeps everything; across volumes it is the copy2 subset).
+- Files over `files.max_snapshot_mb` (256) cannot be overwritten or deleted through these skills (they are refused, not
+  risked). Folders: only empty ones can be deleted; `copy`/`move` still take single files; symlinks/junctions are refused.
+- A restore needs the original parent folder to exist (it will not recreate a tree); the snapshot stays for a manual copy.
+- **Residual overwrite race (Windows has no atomic compare-and-replace).** For an approved overwrite FRIDAY keeps a verified
+  copy of the destination, re-checks (size + sha256) that the destination still matches it immediately before `os.replace`,
+  and then replaces. (Earlier text here said a change after the copy was not detected; later hardening added the re-check and
+  a no-overwrite publish for NEW destinations, so a concurrent creator is not clobbered.) The window between the re-check and
+  `os.replace` is bounded, not closed: a process that modifies the destination in it has its newer bytes replaced with no
+  snapshot of them, and a writer holding the file open with share-delete can still write. A `preserve(move=True)` (delete)
+  whose stored copy fails the size + sha256 check fails closed: the source is kept or put back with a no-overwrite rename, and
+  if that fails the blob stays in the store with `integrity: unverified-after-move` (`RecoveryStranded`) - a person has to
+  resolve it; nothing does so automatically. A crash between steps can leave an orphan snapshot (harmless); an interrupted
+  process leaves no half-written target (temp + rename), but copy/restore temp files are not fsynced, so a power cut is not covered.
+- The journal is LIFO and "undo" of an undo is a redo (unchanged); an entry that fails 3 times is dropped from the list
+  (the snapshot is still on disk). `files.delete` of an empty folder is recorded but only the (empty) folder is recreated.
+- Hard/soft-deny, confirmations and audit are not changed, so a user who answers "yes" to a confirmation still authorises the
+  overwrite itself: the recovery store makes it reversible, not prevented.
+
+## Phase 33.0 — Snapshot Privacy, Retention and User-Controlled Recovery (2026-10-18)
+
+**Why.** Phase 32 made `files.write/copy/move/delete` recoverable by keeping verified copies in `data/snapshots` — but those
+are unencrypted copies of the user's own files, in a folder inside the OneDrive-synced repository, with no retention, no
+way to see them and no way to clean them. Verified in the code before changing anything:
+
+| Claim in the brief | What the code showed |
+|---|---|
+| snapshots are under `data/snapshots`, in the synced repo | true: `paths.SNAPSHOTS = DATA / "snapshots"`; on this machine the repo is under `OneDrive\Desktop` |
+| no retention, never cleaned | true: nothing deleted a snapshot (by design in Phase 32); no listing existed either |
+| how a pending undo refers to a snapshot | the `undo` table's `inverse` JSON names the token: `files.restore(snapshot=<token>, path=…)`, alone or as the 2nd step of `{"steps": […]}`; `applied`: 0 pending, 1 reversed, -1 given up, -2 superseded. **Nothing else** refers to a token (the audit row holds the original args, not the token) |
+| a half-finished reversal | stays `applied = 0` with its remaining steps saved, so it still names the snapshot |
+| `data/friday.db` (undo journal) is also in the synced repo | true, unchanged; it holds file paths and — for `files.write` — the written content in the audit args (pre-existing, see risks) |
+| is moving the store compatible? | yes: the journal stores only the **token**, never a path, and `recovery.root()` was already read at call time; the only places that mention the location are `paths.py`, `recovery.py`, three test files |
+| existing mechanism for safe listing / restore / cleanup | none (only the internal `files.restore`) |
+| real state on this machine | `data/snapshots` empty (0 entries); `friday.db`: 80 pending + 1 reversed undo entries, none naming a snapshot (all pre-Phase-32 inverses) → nothing to migrate or orphan |
+
+**What changed** (planner, benchmark, tiers/risk triggers of the Phase 32 skills and confirmations are untouched; every new
+operation is an ordinary `Executor.run` call):
+
+- **Location (`friday/paths.py`, `friday/recovery.py`, `config.yaml`):** the store now defaults to
+  `%LOCALAPPDATA%\FRIDAY\snapshots` (per-user, outside the repository, not synced by OneDrive). Override order:
+  `files.snapshot_dir` (config) > `FRIDAY_SNAPSHOTS` (environment) > local app-data > (only if neither exists)
+  `data/snapshots`. `recovery.root()` refuses a drive root or the home folder as a store (fail closed: the overwrite is
+  refused). The listing warns if the store is inside a OneDrive folder.
+- **Legacy store:** `data/snapshots` (`paths.LEGACY_SNAPSHOTS`) is still READ — `recovery.locate(token)` looks in the
+  current store first, then the legacy one, so an undo entry made before the move keeps working — but is never written to or
+  cleaned, and `files.*` refuse it like the real store. **No silent migration:** `python run.py recovery migrate` (an
+  internal, confirming `files.recovery_migrate` call) copies each legacy snapshot after verifying its hash, beside the
+  destination and renamed in atomically, refuses an id that exists with different metadata, and **never modifies or deletes
+  the source**; it tells the user to delete the old folder themselves.
+- **Retention (`friday/retention.py`, new):** `references()` reads every undo entry and collects each token-shaped string in
+  its inverse (so a future inverse shape that mentions a snapshot is protected without code changes). A snapshot is
+  *protected* while a **pending / in-progress (0) or given-up (-1)** entry names it. Cleanup deletes a snapshot only if
+  (1) it is unprotected, **re-checked immediately before each deletion**; (2) its metadata is readable and gives an age
+  (damaged, unreadable-metadata, linked or foreign folders are never touched); (3) it is older than
+  `files.snapshot_retention_days` (30, never less than 1 day, so a copy from a call still running will not qualify);
+  (4) it is not among the newest `files.snapshot_keep_newest` (20) unprotected copies. **Fail closed:** if the journal can't
+  be read, or a pending/given-up entry can't be parsed, nothing is deleted. Work is bounded by `snapshot_cleanup_batch`
+  (100) per run; deletion is *journal line → atomic rename to `.deleting-<id>` → remove*, so an interrupted run leaves a
+  marker the next run finishes, and repeating it is a no-op. Every deletion is first written to `cleanup.jsonl` in the
+  store (id, size, age, kind — no path, no content), and the run itself is an audited Executor call.
+  Read-only blobs are removed (`chmod` first); a link/junction root is refused and a link inside is removed as an entry only (not
+  traversed) - checked with `lstat` just before acting, so a swap between that check and the `rmdir` is not caught.
+- **Pending undo never expires by default.** Because *every* overwrite/delete leaves a pending entry that the user may never
+  say "undo" to, "protected while pending" means a store that only shrinks by reversed/unjournaled copies. That is the
+  conservative, literal reading of "never delete a snapshot a pending undo needs", so it is the default
+  (`files.undo_window_days: 0`). The bounded alternative is **opt-in**: with `undo_window_days: N`, a confirmed cleanup first
+  retires pending entries older than N days (`applied = -3`; they leave the undo list for good) and only then can their
+  copies age out; the confirmation text and `--dry-run` preview say how many.
+- **Listing (`files.recoveries`, L0, operator-only):** id, operation (delete / overwrite / replaced by a restore), path
+  (home → `~`, run through the same `toolview.sanitize` redaction the planner already gets, bounded), size, time, status
+  (`on the undo list`, `undo gave up`, `already restored`, `kept, not on the undo list`, `damaged`), location, whether the
+  original path exists now, whether it is cleanup-eligible. **Never content, never a hash.** Bounded to 50 rows and 5000
+  scanned folders (it says when truncated); it hashes nothing.
+- **Controlled restore (`files.recover`, L2, operator-only):** takes **only** a recovery id; the destination is fixed by
+  the copy's own metadata (no path argument to steer). It shares `restore_snapshot` with the internal `files.restore`:
+  verifies size+sha256 first (corrupt → refuse, destination untouched), refuses a missing parent folder (and keeps the copy),
+  keeps whatever occupies the destination in a new copy before replacing it, no-ops if the content is already there, writes via
+  temp file + rename (an interrupted restore leaves the destination as it was). An occupied destination escalates
+  L2 → L3; the restore is itself undoable. `files.restore` stays internal.
+- **Cleanup (`files.recovery_cleanup`, L3, operator-only):** takes **no arguments** (nothing to loosen).
+  Always confirms with "PERMANENTLY delete N recovery copies (X MB) older than D days that no undo needs … Deleted copies
+  cannot be brought back."; refused for unattended actors; verifier checks the copies are gone.
+- **Operator-only, on purpose.** All four recovery skills (`files.recoveries`, `files.recover`, `files.recovery_cleanup`,
+  `files.recovery_migrate`) are `internal`: registered and run **only through `Executor.run`** (tiers, confirmation, audit,
+  undo, unattended denial all apply), but never offered to the planner or the matcher. My first attempt made three of them
+  planner-visible; the regression run caught the cost — the extra tool lines pushed the full-registry prompt over the existing
+  context-budget guard (`smoke_tool_data` failed: 5790 vs 5222 estimated tokens) and perturbed `smoke_browser` /
+  `smoke_memory_redaction` / `smoke_context_budget` (more misses than before). A 3B planner that may pick "clean up recovery
+  copies" mid-goal is also not something the user asked for. They are reached by typing `recovery list | recover <id> |
+  cleanup | migrate` in the console or running `python run.py recovery …` (both go through `EXECUTOR.run`).
+  **Natural-language access ("show my recovery copies") is therefore not wired** — see risks.
+- Supporting: `undo.RETIRED`/`undo.retire_older_than`, `recovery.read_meta[_at]`/`verify_at`/`locate`/`legacy_root`/
+  `synced_by_onedrive`, three verifiers, `files.snapshot_dir`/`snapshot_retention_days`/`snapshot_keep_newest`/
+  `undo_window_days`/`snapshot_cleanup_batch` in `config.py` + `config.yaml`; `smoke_file_safety`/`smoke_files_mutation` also
+  redirect the legacy store.
+
+**Intentional behaviour changes:** new recovery copies go to `%LOCALAPPDATA%\FRIDAY\snapshots`, not `data/snapshots`; the
+planner is unchanged (it sees none of the new skills); there is a new `recovery` console / CLI command; an undo-list entry can now
+have status "retired" (opt-in only).
+
+**Tests.** `scripts/smoke_snapshot_retention.py` — 181 checks in 11 scenarios, all against temp folders + a temp database + two redirected
+stores, with a tripwire on `os.unlink`/`os.rmdir` that fails the run if anything inside the user's real stores is touched
+(and a before/after listing of both real stores): A location/overrides/unsafe dirs/legacy still read but never written;
+B migration (dry run, corrupt snapshot reported, idempotent, id clash not overwritten, source byte-identical, skill is
+internal + asks); C references (pending, declined, half-finished, given-up, reversed/superseded/retired, unreadable → fail
+closed); D retention (pending-needed ancient snapshot kept, age floor, keep-newest, damaged/foreign/junction untouched, batch
+bound, repeated runs, dry run, interrupted removal + finish, journal before deletion, reference arriving between plan and
+deletion, unreadable journal, DB failure, read-only blob, legacy never cleaned, config-driven days, undo window, L3/denied/
+unattended/audited); E listing (no content/hash, redaction, bounds, read-only, damaged, truncation); F `files.recover`
+(occupied destination keeps + asks + undoable, missing parent, corrupt, traversal and unknown ids, interrupted restore,
+folder, unattended/deny, legacy store); G privacy (no content/name in logs, cleanup journal, new skills' audit rows); H
+choke point (including that the planner is offered none of the recovery skills). Then **22 source-level mutations**, each applied to a copy of the real function and required to FAIL the
+suite (counted only against a green baseline), including: a pending entry no longer protects, given-up no longer protects,
+no age floor, keep-newest ignored, no re-check before each deletion, unreadable entry skipped / journal failure treated as
+"no references", damaged snapshots deletable, legacy store cleaned, deletion not journaled, links followed, batch unbounded,
+a zero undo window retiring everything, listing exposing the hash / not redacting, recover not escalating, corruption not
+verified, unsafe store dir accepted, default back inside the repo, migration deleting its source, legacy unprotected /
+unlocatable. Every mutation was checked to fail on the **intended** checks (two initially survived: the `recover`
+escalation was invisible at L2 because both tiers confirm — now asserted on the effective tier — and the legacy-protection
+test passed for the wrong reason, "folder isn't empty" — now asserts the refusal reason).
+
+**Regression.** 52 suites (the 51 of Phase 32 plus `smoke_snapshot_retention`), each run once sequentially: **49 exit 0, 3
+fail exactly as before this phase** (`smoke_browser`, `smoke_context_budget`, `smoke_memory_redaction`; same assertions as
+Phase 32 except that `smoke_browser`'s second assertion, "slot filled with the data: URL", is a live-planner run whose outcome
+varies run to run — see below). `smoke_file_safety` 163/163 (+1: the legacy-store line) with its 19 mutations, `smoke_files_mutation`
+38/38. Not run: `regression.py`, voice suites, `*_live.py`, the Phase 29 benchmark (no planner / tool-family behaviour changed;
+the recovery skills are hidden from the planner, so its prompt is byte-identical — checked by dumping the production prompt
+with and without them).
+Three things the regression run taught me (all fixed before this report):
+1. **Planner-visible skills cost the planner.** The first version exposed three recovery skills; `smoke_tool_data` (the
+   context-budget guard) failed and `smoke_context_budget`/`smoke_memory_redaction`/`smoke_browser` got worse. Fix: operator-only.
+2. **Two refactor-induced test breaks**: `smoke_file_safety`'s mutation anchors named `files.restore` and `recovery.info`, whose
+   bodies moved to `restore_snapshot` / `verify_at`. Fixed in the test (no behaviour change); all 19 Phase 32 mutations killed again.
+3. **`smoke_browser` second miss is variance, measured.** I A/B'd it on a temp copy of the tree with and without
+   `recoveries.py`: without 1, 1, 2, 2, 2 misses; with 2, 2, 2, 2, 2 (real tree 2, 2, 2). The planner prompt for that goal is
+   byte-identical in both. The first miss ("no url given -> asks for the slot") is the pre-existing one. I cannot rule out a
+   small effect, but the arm without the skills reaches the same result, so I attribute it to the live model/desktop state.
+Also: concurrent regression runners (my mistake: a relaunch while the first was still alive) corrupted one run's logs; both
+were killed and the numbers above are from a single clean sequential run.
+
+
+**Remaining risks (honest list).**
+- Recovery copies are **still unencrypted**; moving them out of the synced repo removes the cloud-sync exposure but not
+  local exposure (anyone with the user's Windows account, or a backup of `%LOCALAPPDATA%`). Encryption needs a key-management
+  decision (DPAPI?) and was not attempted. If `files.snapshot_dir` points into OneDrive the copies sync again (the listing warns).
+- `data/friday.db` is in the synced repo and its audit table stores each call's **arguments** — for `files.write` that is the
+  written *content*; the undo table stores paths. Pre-existing; not changed here.
+- Nothing is cleaned automatically: the store grows until the user asks (`recovery cleanup`). The default keeps every copy
+  whose undo entry is still pending *forever* (`undo_window_days: 0`); a bounded window is opt-in.
+- A pending/given-up undo entry whose record is unreadable (`{"unreadable": true}`) blocks cleanup entirely (fail closed)
+  until the user resolves it by hand — there is no tool for that.
+- A cleanup that is interrupted *between* the rename and the removal leaves a `.deleting-<id>` folder holding the content
+  until the next cleanup (it can no longer be restored, but the bytes are on disk). Ordinary file deletion on NTFS is not
+  secure erase either.
+- `files.recover` refuses a missing parent folder (it will not recreate a tree); the user restores by hand from the store.
+- No natural-language entry point: "show my recovery copies" does nothing useful until a direct route (not a planner tool) is added.
+- A legacy snapshot is never cleaned and, after migration, exists twice until the user deletes the old folder.
+- Time-based rules use the local clock; a clock set far into the past/future can make copies look young/old (young is
+  safe; a future-dated copy is simply kept).
+- `shell.run`/`ui.*`/`browser.*` can still destroy files (unchanged, out of scope); the Phase 29 benchmark does not redirect
+  `FRIDAY_SNAPSHOTS`, so a benchmark run still writes its sandbox copies into the real store (set the environment variable
+  when running it; the benchmark files were not modified).
+- Retention is check-then-act: the reference re-check and the rename to `.deleting-<id>` are separate steps (a second process
+  creating an undo entry in between is not seen), and link handling is `lstat` then `rmdir`/`scandir`, so a folder swapped for
+  a junction in that gap is not caught. The store is private to the user account, so this needs something already running as the user.
+- No independent review; the Phase 33 boxes in `MANUAL_VALIDATION.md` are unchecked.
+
+
+## Phase 34.0 — Deterministic Natural-Language Recovery Routing (2026-10-18)
+
+**Why.** Phase 33's list / recover / cleanup / migrate skills were reachable only by typing `recovery ...` in the console or
+`python run.py recovery ...`. Exposing them to the planner broke its prompt budget (Phase 33), so the fix had to be a route that
+never touches the planner.
+
+**What changed.**
+- `friday/recoveryroute.py` (new): `classify(text) -> RecoveryRoute | None`, a pure classifier. It executes nothing. A route names
+  one of four skills (`ROUTED_SKILLS`) or is a non-running outcome (`clarify_restore`, `explain`).
+- `Session._maybe_route_recovery` (`friday/session.py`): called in `Session.handle` right after pending-question resolution and
+  before scope-expansion / `BRAIN.understand`. A routed skill runs through `_run` -> `run_verified` -> `EXECUTOR.run`, so tier policy,
+  confirmation, risk escalation, the unattended ceiling, audit and the post-condition verifiers apply exactly as for the console command.
+  The session refuses any route naming a skill outside `ROUTED_SKILLS`.
+- `CFG.brain.recovery_routing` (default on): kill switch; off = console/CLI only.
+- Planner, matcher, intent guard, benchmark tasks/oracles/baselines, tiers, retention and recovery semantics: unchanged.
+
+**Supported sentences** (the WHOLE sentence must be one of these, after polite fillers such as "please", "can you", "hey friday", "for me"):
+- *List* (-> `files.recoveries` only): "show / list / display / view my recovery snapshots|copies|files", "show all ..." (limit 50, else 10),
+  "what recovery snapshots do I have", "do I have any recovery copies", "what files can FRIDAY recover/restore", "recovery list".
+- *Restore with an explicit id* (-> `files.recover`, args exactly `{"snapshot": id}`): "restore|recover [the file from] [snapshot|copy] <id>",
+  "recovery recover <id>". The id must satisfy `recovery.is_token` exactly.
+- *Cleanup* (-> `files.recovery_cleanup`): "clean up|prune|tidy up [the|expired|old] recovery snapshots|copies", or a delete verb WITH an age word
+  ("delete old recovery snapshots"), "recovery cleanup". Still L3: always shows the preview and asks; refused for unattended actors.
+- *Migrate* (-> `files.recovery_migrate`): "migrate [the|old|legacy] recovery snapshots|copies|store", "recovery migrate". Needs both "migrate" and "recovery". Still asks.
+
+**Ambiguous or unsafe wording - nothing is guessed.**
+- "restore that file", "bring back the file you deleted", "restore the snapshot", "restore snapshot 3", a lower-case or mangled id, an id with a stray
+  character: the real recovery list (read-only) is shown with ids and "Tell me which one, for example: restore snapshot <id>"; an empty store says there is nothing to restore.
+  Snapshot ids are never inferred from numbers, positions, file names, or "the only snapshot".
+- "delete all recovery snapshots", "delete the recovery copies" (a delete verb without an age word, or with all/every): an explanation that only
+  expired, unneeded copies are cleaned up and what to say; nothing runs.
+- Anything else (extra clause, extra file name, questions like "how do recovery snapshots work", "show recovery snapshots and clean them up",
+  "restore report.docx from snapshot <id>", a bare "snapshots") is not matched and the turn continues exactly as before.
+
+**Tests (single runs).** `scripts/smoke_recovery_route.py`: **478/478 checks, 40/40 mutations caught** (temp recovery stores + temp DB, tripwire on
+`os.unlink`/`os.rmdir` for the user's real stores - real stores verified unchanged; `BRAIN.understand` is a tripwire; real `Session.handle` and real `EXECUTOR`
+with a spy). Covers: list-only routes, id-only recovery, ambiguity never guessing (session-level: only `files.recoveries` executed), cleanup/migrate wording and
+confirmation asked + decline changes nothing, scheduler/trigger refused, audit rows, a ~110-sentence hijack corpus, kill switch, a route naming
+`files.delete`/`files.write`/`files.restore`/`files.move`/`plan.run` refused with `EXECUTOR.run` never called, every route through `EXECUTOR.run`. Mutations include
+fullmatch->match/search, bare "snapshots", non-token ids, lower-case id normalising, list->cleanup, dropped all-guard / age requirement / explain, migrate without
+"recovery", guessed ids, widened/mutable `ROUTED_SKILLS`, kill switch ignored, bypassing the Executor, actor laundering, a recovery skill made planner-visible.
+(While writing the suite, a hijack test that named `system.shutdown` under an auto-approve callback reached the real Executor in a mutant run and was stopped only by an
+unrelated TypeError; it was changed to a spy that records and never executes - no shutdown was pending.)
+
+**Prompt budget.** Two fresh subprocesses, with and without `friday.recoveryroute` imported, build the planner tool descriptions and a full decision prompt:
+byte-identical hashes. 101 tools, 14,743 chars of tool lines, 16,188 chars full decision prompt - same as before; none of the four recovery skills (nor `files.restore`) is offered.
+
+**Other suites (each run once, sequentially, by a separate agent).** `smoke_snapshot_retention` 181/181 (22/22 mutations), `smoke_file_safety` 163/163, `smoke_files_mutation` 38/38,
+`smoke_intent_action_alignment` 353/353, `smoke_stop_control` 80/80, `smoke_confirmation_routing` 201/201, `smoke_postconditions` 196/196, `smoke_direct_route` and `smoke_tool_family` all OK, `smoke_registry` exit 0,
+`scripts/regression.py` 94/94 intent + 14/14 live (its first run died with the known COM native crash 0xC0000005, exit 139, mid-intent-matching with no failure message; one rerun passed fully).
+**Not run this phase:** the full 52-suite sweep of Phase 33 (so the three known failures `smoke_browser` / `smoke_context_budget` / `smoke_memory_redaction`
+were NOT re-checked), `*_live.py`, the Phase 29 benchmark (no planner behaviour changed). No new failure was found; "pre-existing vs new" for those three is unverified.
+
+**Remaining risks.**
+- **Privacy / data placement (high priority, deliberately not touched):** `data/friday.db` is still inside the OneDrive-synced repository and the audit table stores call
+  arguments, including the written content for `files.write`. Needs its own milestone (see section 0). The new route adds audit rows for the recovery skills but no content.
+- Restore needs the exact id: "restore the second one" and "restore it" are not matched (they fall through to the normal router, unchanged behaviour); only "restore snapshot 3" / "restore the snapshot" /
+  "restore that file" show the list. Matching a file name to a snapshot was left out on purpose (it would be a guess).
+- A bare "restore snapshot" / "restore the snapshot" is claimed by this route even if the user meant a VM snapshot (it only lists FRIDAY's recovery copies; read-only).
+- "list every recovery copy" stays at 10 rows; only "all" raises the limit. "clear everything in recovery" is not matched at all (neither cleanup nor explain).
+- Hand-written regexes: phrasings outside the list fall through to the old behaviour rather than being routed (safe direction, but not exhaustive).
+- A routed cleanup/restore runs for any interactive actor (text, voice, gui) after confirmation; a misheard spoken sentence still hits the confirmation, which is the only barrier.
+- No independent review; the Phase 34 boxes in `MANUAL_VALIDATION.md` are unchecked. Encryption, shell/ui/browser mutation safety, and the Phase 33 items are unchanged.
+
+**Next most valuable milestone:** the privacy and data-placement milestone (move `data/friday.db` out of the OneDrive repo, drop written content from audit args, keep tests/benchmarks off the real DB).
+
+
+## Phase 35.0 — Database Privacy, Safe Data Placement and Audit Redaction (2026-10-18)
+
+**Why.** `data/friday.db` sat inside the OneDrive-synced repository and held 15,307 audit rows, 2,720 episodes, 2,032 goals, 412 corrections and the undo journal. The audit table stored every call's arguments (for `files.write` the file body), tests could write to the real database, and the Phase 29 benchmark did not redirect the recovery store.
+
+**What was verified first (counts only; no value was printed).** The real database held NO `files.write` rows yet, but it did hold other content in audit args: `whatsapp.compose` messages (471), `memory.remember` text (188), `comms.send_message` (20), `notify.send` (3), `browser.type` (2), `input.type`, `dev.python`, `notes.add`, `routine.create` (1 each), 236 URLs with query strings, `knowledge.ask`/`screen.read_text`/`web.fetch`/`dev.git` results longer than 120 chars, and 78 episode steps carrying a message / typed text / command. The undo journal holds ids, paths and numbers only (no content). A migrated copy and the original are identical in this respect.
+
+**1. Location (`friday/paths.py`, `friday/dbplace.py`, `friday/store.py`).**
+- Old: `data\friday.db` (OneDrive). New default: `%LOCALAPPDATA%\FRIDAY\friday.db` (not synced). Overrides, highest first: an explicit redirect (`store.use_temp_db`), `storage.db_path` in config.yaml (new `StorageConfig`), `FRIDAY_DB`, the per-user default, and only if there is no application-data folder the old path.
+- Every connection resolves the path with `dbplace.resolve()` ON EVERY `store.conn()` call, and each thread keeps one connection per path. A worker thread that connected earlier follows a path change; `use_temp_db` closes every thread's throwaway connection and removes its files (before, a worker kept the real database after a redirect).
+- Migration (`dbplace.migrate_legacy`, run automatically by `store.init()`/first `conn()` when the production path does not exist and an old database does; also `python run.py db migrate`): SQLite online-backup of the old file opened READ-ONLY (consistent with an open writer and `-wal`/`-shm` sidecars; rows only in the WAL are included) into `friday.db.migrating-<id>` next to the destination, then `PRAGMA integrity_check` and per-table row counts compared (3 attempts if the source changes), published with a hard link so it can never overwrite, re-opened and re-verified. An exclusive lock file serialises two processes; a crashed run's stale temp/lock are discarded. Any failure raises `DbPlacementError` naming the untouched old file, `storage.db_path` / `FRIDAY_DB` as the way to keep using it, and the retry command. The old file is never modified or deleted by FRIDAY. A warning is logged when the old file still exists and when the database is in a cloud-synced folder.
+- Migration status on this machine: DONE (`python run.py db migrate`, FRIDAY not running). New file 15,073,280 bytes, identical row counts (audit 15,307, corrections 412, episodes 2,720, goals 2,032, memory 19, undo 83). The old `data\friday.db` is untouched (sha256 identical before/after) and STILL IN THE ONEDRIVE REPO, with its history: the user must delete it by hand once satisfied (`python run.py db status`). Its `-wal`/`-shm` sidecars appeared when it was first opened read-only for counting; no data changed.
+- `python run.py db status|migrate|scan`: read-only status, the migration, and a COUNTS-only scan of stored content.
+
+**2. Audit minimisation (`friday/auditview.py`, used by `audit.py`, `intelligence/episodes.py`, two log lines).** Allowlist by field for every one of the 106 registered skills (a coverage check fails if a new skill has an unclassified text parameter; an unclassified parameter is dropped to a length marker at runtime):
+- kept: app / project / schedule names, key combos, directions, snapshot ids, numbers and booleans, and file paths (the evidence of what was touched; bounded 500 chars);
+- URLs: scheme + host + port + path only (userinfo, query, fragment dropped);
+- short human intents (search query, goal, UI label, contact, schedule command): credential-scrubbed (`toolview.sanitize(prose=True)`) and bounded to 200 chars;
+- shell commands / dev.git sub-commands: executable name + argument count only; `shell`, `cwd`, `repo` kept;
+- omitted as `[omitted: N chars]`: `files.write.content`, `input.type`/`ui.fill`/`browser.type`/`clipboard.write` text, `whatsapp.compose`/`notify.send` message, `dev.python` code, `memory.remember`/`notes.add` text, `routine.create` steps, `plan.run.clarification_answer`;
+- any argument NAMED like a credential is `[redacted]`.
+- `audit.complete` keeps `ok` exactly as the skill reported it (a row recorded before the action has `ok` NULL; recording arguments is never evidence of success). `result` for skills that read content back (files/clipboard/page/OCR/command output, memory/knowledge) keeps only its length; other results are scrubbed and bounded to 500; `error` is scrubbed and bounded to 300. Skill, tier, actor, decision (auto/confirmed/denied/blocked), timing and the undo journal are unchanged. Episode step arguments (`episodes._sanitize_args`) use the same policy; the orchestrator's tool-family warning and the extractor's debug line no longer log raw arguments / the utterance.
+- Historical rows are NOT rewritten (migration copies them verbatim; a test pins that). Remediation proposal for a separate milestone: a reversible `db scrub` that first takes a verified backup, rewrites `audit.args/result` and `episodes.plan` through `auditview` in batches, and records what it did.
+
+**3. Isolation (`dbplace.guard/guard_store`, `scripts/iso_env.py`, `scripts/bench_env.py`).**
+- Automatic tripwire: a process whose entry script is named `smoke_*`, `test_*`, `bench*`, `agent_*`, `regression*`, `phase<N>_*` (or run under pytest, or `FRIDAY_REFUSE_REAL_DB=1`) is refused with `IsolationError` when `store.conn()` would open the real database (per-user default, old `data\friday.db`, or a configured non-temp path) or `recovery.root()` would use the real recovery store (per-user, old `data\snapshots`, configured non-temp). `FRIDAY_ALLOW_REAL_DB=1` is the only opt-out. `dbplace.require_isolated()` is the explicit assertion for destructive tests. `recovery.in_store` no longer swallows `IsolationError` as "protected".
+- 21 existing scripts leaked to the real database or recovery store (found by running them under the tripwire) and were wrapped in `iso_env.isolated_runtime()` (temp DB + temp recovery stores) with no assertion changed; `agent_reliability.py` and `regression.py` likewise. The Phase 29 benchmark already used `use_temp_db` (and proves main + worker thread agree); `bench_env.Isolation` now ALSO redirects `paths.SNAPSHOTS`/`LEGACY_SNAPSHOTS` into its sandbox, restores them in `stop()`, and `prove()` fails fast if the recovery store is not the sandbox's. Task definitions, oracles, scoring and baselines are untouched.
+
+**Tests (single runs).** `scripts/smoke_data_privacy.py`: **142/142 assertions including 25/25 source-level mutations killed** (path resolution, migration incl. WAL/open writer/overwrite race/crash leftovers/corrupt or changing source/end-to-end through `store.conn()` with a faked real location, worker-thread agreement incl. a thread that connected earlier, closed throwaway connections, busy-writer wait, redaction of every content skill, fail-closed unknown skills, episodes, blocked/declined rows, real subprocesses named `smoke_*` refused with no env var, benchmark isolation + deliberate misconfiguration, history not rewritten, scan returns counts only; final check: real `data\friday.db` and the per-user database/stores byte-for-byte unchanged by the suite). Other suites after the changes, each once: file safety 163/163, files mutation 38/38, snapshot retention 181/181, recovery route 478/478 + 40/40, postconditions 196/196, stop control 80/80, confirmation routing 201/201, intent alignment 353/353, direct route OK, intelligence OK, `regression.py` 94/94 intent + 14/14 live (its first run showed 0/14 because the tripwire correctly refused the real database; fixed by wrapping). Also run once by the audit agent after wrapping: action_continuity, action_risk, advanced_tasks, brain, contextual_memory, daemon, jobrefs, long_horizon, memory, plan, proactive_intelligence, registry, schedule, speech_redaction, intent_routing (rc 139 COM crash on its first run, passed on the second), answer-grounding family, evidence/goal families, pagination, tool_data, tool_family, web_browser_seam, shell_blocklist and others: all OK.
+
+**Failures, not caused by this phase.** `smoke_context_budget` and `smoke_memory_redaction` (known since Phase 33; the latter still fails its 2 checks, now on a throwaway database). `smoke_project` "correctly reports not-a-git-repo" (the test assumes the repo is not a git repository; it is one). `smoke_knowledge` "budget.md gone from search": the live planner picked `files.delete` for "forget the document ..." after a direct-route `ambiguous_route` rejection; it needs a live LLM and I did not verify it against the pre-Phase-35 tree (the failing step is planner choice, not storage). `smoke_browser` was not run. NOT run: the full sweep, `*_live.py`, mic/GUI/OCR/voice/UI/WhatsApp scripts, `smoke_apps` (launches real apps), the Phase 29 benchmark itself (needs the live model; its isolation was proven by `smoke_data_privacy` G and the existing `prove()`).
+
+**Remaining risks.**
+- The OLD `data\friday.db` and its history are still in the synced repository until the user deletes them; the history still contains message / typed-text / code content (`db scan` gives the counts). Rows in the new database inherit it. A reversible scrub is the proposed follow-up.
+- `data/logs`, `data/browser_profile` (some smoke scripts, e.g. tool_family / web_browser_seam / action_continuity / intent_routing, launch the real Chromium with it), the `data/*.json` reports and `notes.md` are still inside the repository/OneDrive. Both databases and the recovery store are unencrypted.
+- Goals (`original_request`), corrections, memory and the knowledge base legitimately keep user text; this phase did not change those features. Free-text intents (search queries, goals) are kept scrubbed but bounded, not omitted.
+- The tripwire recognises test entry points by script name; a differently named test script gets no automatic protection (use `iso_env.isolated_runtime()` or `FRIDAY_REFUSE_REAL_DB=1`). Only `store.conn()` and `recovery.root()` are guarded; a script that opens `sqlite3` on the file directly bypasses it.
+- A multi-process race on a brand-new install is handled by the migration lock, but two FRIDAY processes writing the same WAL database remain as before.
+- No independent review; Phase 35 boxes in `MANUAL_VALIDATION.md` are unchecked.
+
+**Next most valuable milestone:** take the user-approved step of retiring the old in-repository data safely: a reversible `db scrub` of historical audit/episode content plus moving `data/logs` and `data/browser_profile` out of the synced folder (same pattern as this phase), then database/recovery-store encryption.
+
+## Phase 36.0 — Reversible Historical Database Scrubbing (2026-10-18)
+
+**Why.** Phase 35 stopped new rows carrying message bodies, typed text, memory text, code, command lines and URL query strings, but did not rewrite history. Both `%LOCALAPPDATA%\FRIDAY\friday.db` (active) and the old `data\friday.db` (OneDrive) still hold it. This phase adds a preview-first, backed-up, reversible scrub. **It was built and tested on synthetic databases only; the scrub has NOT been run against either real database** (that needs the user's explicit target + confirmation code; see `MANUAL_VALIDATION.md` Phase 36).
+
+**Inspection (counts and shapes only, both databases independently).** The two files are currently identical in shape and counts (audit 15,307, episodes 2,720, goals 2,032, corrections 412, memory 19, undo 83, jobs/kb/phrasings 0). A scrub would change 3,102 audit rows and 272 episodes in EACH (12,205 / 2,448 unchanged). Beyond what the Phase 35 `db scan` listed, inspection found: (1) **result echoes** - `whatsapp.compose` (275), `notify.send` (3), `memory.remember` results repeat the omitted body, so Phase 35's "message omitted" was incomplete for the live path as well; (2) 8 audit results, 1 episode `context` and 2 episode `errors` quote URLs with query strings; (3) 15k audit rows include ~1,000 `test.*` junk rows from the pre-Phase-35 leak (their text args are omitted under the fail-closed rule); (4) the undo journal holds only ids/paths/amounts (nothing to scrub); goals/corrections/memory legitimately hold user text and are untouched.
+
+**Policy (`friday/dbscrub.py`, uses `friday/auditview.py`).** A historical row is rewritten to exactly what the live Phase 35 code would write today: `audit.args` -> `sanitize_args`; `audit.result/error` -> `sanitize_result/error` plus replacement of any echo of an omitted argument value (whole value, or a 12+ character shared run, e.g. "Noted - <text without lead-in>") by `[omitted: N chars]`; `episodes.plan` steps likewise (args, step error); `episodes.errors/context` -> echoes and URL query/fragment/userinfo only. Kept verbatim: ids, timestamps, actor, skill, tier, decision, `ok`, duration, episode `goal_text`/embedding/stopped/success, every other table. Replacement formats are `[omitted: N chars]`, `host/path [query/credentials not stored]`, `[read-back content not stored: N chars]`, `[redacted]`. Every sanitizer is now a fixed point by construction (`auditview._fixed`; exact marker grammar), so a repeat scrub changes nothing.
+
+**Safety gates (apply).**
+- Preview is the default: read-only open, counts grouped by table/field/action, unchanged counts, retained-by-policy stores, a confirmation code bound to that target's path AND exact state. No stored value is ever printed; SQLite error text, names from rows and tracebacks are withheld/bounded.
+- Apply needs `--target active|legacy` (never both, no default), `--apply`, `--confirm <code>`, and `--allow-synced` for a database in a synced folder; aliases (symlink/junction/hard link) are refused. Nothing calls it at startup, migration or in tests; the Phase 35 tripwire (`dbplace.guard`) covers every open it makes.
+- An EXCLUSIVE lock (`locking_mode=EXCLUSIVE`) is taken first: any other open connection, even idle, makes it refuse. Stale `-wal`/`-shm` are never deleted (SQLite recovers them; tests pin a writer killed with data only in the WAL).
+- A NEW backup folder is created outside the repo, OneDrive and the database's folder (default `%LOCALAPPDATA%\FRIDAY-backups\scrub-<utc>-<target>-<id>`; `mkdir(exist_ok=False)`, no-overwrite publish, read-only file, free-space check), made with SQLite's backup API from the locked connection, verified (integrity, schema, counts, order-independent logical digest of every table), and proven restorable on a disposable copy BEFORE any change. `manifest.json` records stages, counts, hashes only.
+- One transaction (`secure_delete=ON`), verified BEFORE commit (counts, ids, schema, FK, digest of every column/table that must not change, second pass = no-op), committed, checkpointed, VACUUMed, re-opened and verified again, then the file and `-wal` are searched for the replaced values: a failed VACUUM or a remnant is an ERROR (`committed-NOT-PURGED`), answered by `db compact`. Failure before commit rolls back (manifest `aborted-database-unchanged`); a killed process leaves the database unchanged (SQLite rollback) or scrubbed-and-verified, with the backup intact.
+- CLI: `python run.py db scrub [--target T] [--apply --confirm CODE] [--backup-dir D] [--allow-synced]`, `db compact --target T`, `db verify-backup --backup F`, `db restore --backup F --to NEWFILE` (never overwrites; refuses stale sidecars next to the destination and synced folders).
+
+**Restore procedure.** Stop FRIDAY. `python run.py db verify-backup --backup <...\friday.db.bak>`; `python run.py db restore --backup <...> --to <new file>`; rename (do not delete) the scrubbed `friday.db` AND its `-wal`/`-shm`; move the restored file into place. The backup keeps the full sensitive history: retire it deliberately.
+
+**Review and live-path fixes made on the way (adversarial review, all reproduced, then fixed and pinned by tests):** stored values could leak through SQLite exception text / a rich traceback with locals (CLI now catches everything, `show_locals` off); non-idempotent rows (web.fetch result with a URL query, list/str args, long first token) would have aborted the scrub after the backup existed; `secure_delete` alone leaves text in the file (VACUUM + remnant proof added); partial/derived echoes; `strip_query_urls` ignored userinfo, other schemes and quotes; `_OMIT_MARK`/`_ARGV_MARK` let attacker-shaped text skip redaction; credential-named numeric args were kept; `episodes.record` still wrote raw step errors/`errors`/`context` (now minimised the same way); `restore` followed by stale sidecars corrupted the result (now refused). Behaviour change in the live path: audit results/episode errors strip echoes of omitted values and URL queries.
+
+**Tests.** `scripts/smoke_db_scrub.py`: **305/305 checks, 47/47 source mutations killed** (~100 s; `--fast` skips the mutants). Covers preview byte/logical immutability, gating, active/legacy independence, policy + metadata/ID/FK/schema/count preservation, canaries absent from every column AND the raw file bytes, secondary episode fields, URL handling, idempotence/fixed points, backup/restore/verify, injected faults and real `os._exit` kills at three points, WAL/SHM and locking, output/log/manifest redaction, tripwires (real paths fingerprinted, never opened). Also re-run once after the changes: `smoke_data_privacy` 142/142 (three mutation anchors renamed to follow the `_once` helpers), `smoke_intelligence` ALL OK, `smoke_file_safety`, `smoke_files_mutation`, `smoke_postconditions`, `smoke_long_horizon` (77/77), `smoke_memory` OK. NOT run: the full sweep, `*_live.py`, mic/GUI/OCR/voice/WhatsApp scripts, `smoke_apps`, `smoke_browser`, the Phase 29 benchmark (needs the live model; nothing in its tasks, oracles, scoring or baselines changed), `regression.py` (not re-run after the audit/episodes text changes). Known pre-existing failures unchanged: `smoke_context_budget`, `smoke_memory_redaction` (2), `smoke_project`, `smoke_knowledge` (live planner).
+
+**Remaining risks.**
+- Nothing real was scrubbed: both real databases still hold the history (previews: 3,102 audit rows + 272 episodes each). The legacy copy is in OneDrive: even a scrub does not purge OneDrive version history/recycle bin/other devices - deleting it and emptying the recycle bin is the real remedy.
+- A backup (and the stale free-page copies inside it) is a plaintext copy of everything scrubbed; nothing deletes it. Storage-level remnants (filesystem free blocks, SSD wear levelling, OneDrive history) cannot be reached from SQLite.
+- Short omitted values (< 6 chars) and partial echoes under 12 chars are not searched for in other fields; goals/corrections/memory/kb/`plan.run` goals (200 chars) keep user text by design; `episodes.context` is not otherwise minimised; episode steps keep unknown extra keys.
+- `data/logs`, `data/browser_profile`, `data/*.json` reports stay in the repo; databases and recovery store are unencrypted. In a non-WAL (rollback-journal) database an idle second connection is not detected by the lock (production is WAL). A preview of a WAL database may create empty `-wal`/`-shm` files (the `.db` is untouched).
+- No independent review beyond the adversarial subagent; Phase 36 boxes in `MANUAL_VALIDATION.md` are unchecked.
+
+**Next most valuable milestone:** the user runs the scrub on the active database (and decides on the legacy copy), after which move `data/logs` + `data/browser_profile` out of the synced folder with the same preview/backup discipline, then encryption of the database/recovery store.

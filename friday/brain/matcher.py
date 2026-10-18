@@ -68,6 +68,8 @@ class Matcher:
         corpus: list[tuple[str, str]] = []
 
         for skill in REGISTRY.all():
+            if skill.internal:
+                continue
             for example in skill.examples:
                 corpus.append((example.lower().strip(), skill.name))
             # The description is a weak but useful extra anchor.

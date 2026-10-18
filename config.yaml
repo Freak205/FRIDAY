@@ -16,6 +16,10 @@ brain:
   # Below this, FRIDAY asks for clarification instead of guessing.
   clarify_threshold: 0.45
   embedding_model: BAAI/bge-small-en-v1.5
+  # Phase 30.0: a single-skill route whose arguments do not faithfully account for the request (a
+  # dropped path/URL, a whole sentence as an argument, a second instruction, a compound request, two
+  # skills tied) is handed to the planner instead of being executed. false = the old behaviour.
+  direct_route_guard: true
 
 permissions:
   # Per-tier policy: auto | confirm | deny
@@ -32,6 +36,29 @@ permissions:
   # Global emergency-stop hotkey: stops the goal FRIDAY is running (no further step
   # starts; an interruptible step in flight is interrupted). Blank disables it.
   stop_hotkey: "ctrl+alt+x"
+
+files:
+  # Largest file (MB) that files.write / copy / move may overwrite and files.delete may remove.
+  # A verified recoverable copy is kept first (the recovery store); a larger file is refused
+  # rather than changed without one.
+  max_snapshot_mb: 256
+  # Where the recovery store lives. Empty = %LOCALAPPDATA%\FRIDAY\snapshots (per-user, outside the
+  # repository and outside OneDrive). Set a full path to move it. The recovery copies are
+  # UNENCRYPTED copies of your files: keep this on a drive you trust.
+  snapshot_dir: ""
+  # Retention. FRIDAY never deletes a recovery copy by itself: only an explicit "clean up recovery
+  # copies" (which asks first, and shows what it would delete) does, and only copies that
+  #   - no pending, unfinished or given-up undo entry refers to,
+  #   - are older than snapshot_retention_days (never less than 1 day),
+  #   - and are not among the newest snapshot_keep_newest such copies.
+  snapshot_retention_days: 30
+  snapshot_keep_newest: 20
+  # 0 = a pending undo entry never expires, so its copy is kept for as long as you could still say
+  # "undo". N > 0 = a cleanup first retires pending undo entries older than N days (they can no
+  # longer be undone) so their copies can age out. Leave at 0 unless you want a bounded undo window.
+  undo_window_days: 0
+  # Most copies one cleanup run deletes (run it again for more).
+  snapshot_cleanup_batch: 100
 
 knowledge:
   # Cosine similarity a document chunk needs to count as relevant.
@@ -181,6 +208,20 @@ planner:
   tool_data_total_chars: 1500
   semantic_repeat_guard: true
   confirmation_guard: true
+  # Phase 31.0 (friday/toolfamily.py, PLAN.md Phase 31.0):
+  #   tool_family_guard     while a request is about a page in FRIDAY's own controlled browser, the
+  #                         desktop-window tools (ui.*, input.*) are not offered to the planner (unless
+  #                         the request also names a desktop window) and one that would act on
+  #                         "whatever window is in front" is not run -- the browser.* tool is named instead
+  #   max_family_rejections such decisions one run may burn before it stops truthfully
+  #   action_completion     "click X" / "bring X to the front": a "done" after only reading is sent back
+  #                         (max_action_nudges times), never for a look-only request
+  #   counted_repeats       "click it twice" runs the identical click twice, never a third time
+  tool_family_guard: true
+  max_family_rejections: 3
+  action_completion: true
+  max_action_nudges: 1
+  counted_repeats: true
 
 intelligence:
   # Phase 10: bounded state/memory/experience layer — see friday/intelligence/.

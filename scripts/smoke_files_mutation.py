@@ -45,8 +45,13 @@ def main() -> int:
 
     import tempfile
 
-    with tempfile.TemporaryDirectory(prefix="friday_fs_smoke_") as tmp:
+    from friday import paths
+
+    real_snapshots, real_legacy = paths.SNAPSHOTS, paths.LEGACY_SNAPSHOTS
+    with tempfile.TemporaryDirectory(prefix="friday_fs_smoke_") as tmp,             tempfile.TemporaryDirectory(prefix="friday_fs_snaps_") as snaps:
         root = Path(tmp)
+        paths.SNAPSHOTS = Path(snaps)  # Phase 32: overwrite/delete keep a recovery copy; keep it out of the real store
+        paths.LEGACY_SNAPSHOTS = Path(tmp) / "legacy_none"  # Phase 33: and never read the old in-repo one
 
         scenario("A: files.write creates a new file with the given content")
         target = root / "notes.txt"
@@ -155,6 +160,48 @@ def main() -> int:
         checks_cp = v_copy.check({"src": str(src), "dst": str(dst)}, {"src": str(src), "dst": str(dst)}, {})
         check("files.copy verifier confirms the copy exists", all(c.passed for c in checks_cp), checks_cp)
 
+        scenario("H: Phase 32.1 -- a destination that appears mid-move is never overwritten; a delete that can't be verified keeps the file")
+        import os as _os
+
+        race_src = root / "race_src.txt"
+        race_src.write_text("race source", encoding="utf-8")
+        race_dst = root / "race_dst.txt"
+        real_rename = _os.rename
+
+        def foreign_first(src, dst, *a, **k):
+            if Path(dst) == race_dst:
+                race_dst.write_text("foreign file", encoding="utf-8")
+            return real_rename(src, dst, *a, **k)
+
+        _os.rename = foreign_first
+        try:
+            r_race = files.move(src=str(race_src), dst=str(race_dst))
+        finally:
+            _os.rename = real_rename
+        check("move refuses when a file appeared at the destination after the check", not r_race.ok, r_race.speech)
+        check("...the foreign file is untouched and the source is intact",
+              race_dst.read_text(encoding="utf-8") == "foreign file" and race_src.read_text(encoding="utf-8") == "race source")
+
+        keep = root / "keep_me.txt"
+        keep.write_text("original bytes", encoding="utf-8")
+        real_replace = _os.replace
+
+        def changing_replace(src, dst, *a, **k):
+            if str(dst).endswith("blob") and Path(src) == keep:
+                with open(src, "ab") as fh:
+                    fh.write(b" + late write")
+            return real_replace(src, dst, *a, **k)
+
+        _os.replace = changing_replace
+        try:
+            r_keep = files.delete(path=str(keep))
+        finally:
+            _os.replace = real_replace
+        check("delete fails when the file changes while it is being kept", not r_keep.ok, r_keep.speech)
+        check("...and the file is still in place with every byte", keep.exists() and keep.read_bytes() == b"original bytes + late write")
+        check("...with no recoverable claim", not r_keep.data.get("recoverable"), r_keep.data)
+
+    paths.SNAPSHOTS, paths.LEGACY_SNAPSHOTS = real_snapshots, real_legacy
     return finish("Phase 26 — filesystem mutation skills", time.perf_counter() - t0, min_assertions=30, min_scenarios=7)
 
 

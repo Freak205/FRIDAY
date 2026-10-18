@@ -99,6 +99,7 @@ async def skills() -> list[dict[str, Any]]:
             "examples": s.examples,
         }
         for s in sorted(REGISTRY.all(), key=lambda x: x.name)
+        if not s.internal
     ]
 
 

@@ -905,7 +905,7 @@ def section_h() -> None:
           all(" | e.g. " not in s.line() and not (s.example != "{}" and s.example in s.line()) for s in specs))
     check("a per-call rule tool is tagged with its rule label", "[L1 click]" in by["ui.click"].line())
 
-    all_named = all(p.name in by[s.name].line() for s in REGISTRY.all() for p in s.params)
+    all_named = all(p.name in by[s.name].line() for s in REGISTRY.all() if not s.internal for p in s.params)  # Phase 32: an internal skill (files.restore) is never offered
     check("every registered parameter of every skill appears in its line (registry is the single source)", all_named)
     check("...and the params string is built from Param objects, never a second schema table",
           "_format_params" in inspect.getsource(orch_mod) and "PARAM_SCHEMA" not in inspect.getsource(orch_mod) and "PARAM_SCHEMA" not in inspect.getsource(intent))

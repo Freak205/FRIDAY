@@ -12,9 +12,10 @@ import sqlite3
 import tempfile
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from friday import paths
+from friday import dbplace, paths
 from friday.log import get
 
 log = get(__name__)
@@ -191,23 +192,64 @@ def _migrate(c: sqlite3.Connection) -> None:
     c.commit()
 
 
+_registry_lock = threading.RLock()
+_registry: dict[str, list[sqlite3.Connection]] = {}  # resolved path -> every thread's connection to it
+
+
+def _key(path: Any) -> str:
+    return dbplace._norm(path)
+
+
 def conn() -> sqlite3.Connection:
-    """Thread-local connection. SQLite objects aren't shareable across threads."""
-    existing = getattr(_local, "conn", None)
+    """Thread-local connection to THE database. SQLite objects aren't shareable across threads.
+
+    Phase 35: the path is resolved on EVERY call (`dbplace.resolve`), and each thread keeps one connection per
+    path. A worker thread that opened the real database before `use_temp_db()` started therefore switches to the
+    temporary one inside the block, and back after it -- the main thread and its workers can never disagree
+    about which database they are writing to. The first open of a production path migrates the old
+    in-repository database (never overwriting, never touching the old file) and a test/benchmark entry point is
+    refused the real database (`dbplace.IsolationError`)."""
+    path = dbplace.resolve()
+    key = _key(path)
+    mine: dict[str, sqlite3.Connection] | None = getattr(_local, "conns", None)
+    if mine is None:
+        mine = _local.conns = {}
+    existing = mine.get(key)
     if existing is not None:
         return existing
 
+    dbplace.guard(path)
     paths.ensure()
-    c = sqlite3.connect(paths.DB_PATH, check_same_thread=False)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    dbplace.ensure_ready(Path(path))
+    c = sqlite3.connect(path, check_same_thread=False, timeout=15)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=15000")
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
     c.execute("PRAGMA foreign_keys=ON")
     c.executescript(SCHEMA)
     c.commit()
     _migrate(c)
-    _local.conn = c
+    mine[key] = c
+    with _registry_lock:
+        _registry.setdefault(key, []).append(c)
     return c
+
+
+def _close_all(path: Any) -> None:
+    """Close every thread's connection to `path` (used when a throwaway database is torn down)."""
+    key = _key(path)
+    with _registry_lock:
+        conns = _registry.pop(key, [])
+    for c in conns:
+        try:
+            c.close()
+        except Exception:
+            pass
+    mine = getattr(_local, "conns", None)
+    if mine is not None:
+        mine.pop(key, None)
 
 
 def now() -> str:
@@ -220,45 +262,27 @@ def dumps(value: Any) -> str:
 
 def init() -> None:
     conn()
-    log.info("store ready at %s", paths.DB_PATH)
+    log.info("store ready at %s", dbplace.resolve())
 
 
 @contextlib.contextmanager
 def use_temp_db():
-    """Phase 14.0 — test-only escape hatch: redirect the store to a
-    throwaway SQLite file for the duration of the block, restoring the real
-    path/connection afterward.
+    """Phase 14.0 -- test-only escape hatch: redirect the store to a throwaway SQLite file for the duration of
+    the block, restoring the real path afterward.
 
-    Nothing in `paths.DB_PATH`/`conn()` supports redirection on its own
-    (every smoke test before this phase ran against the real, shared,
-    ever-growing `data/friday.db` — see PLAN.md Phase 12.0/13.0's
-    documented top-k-crowding flakiness this fixes). Production code never
-    calls this. Only the calling thread's connection is affected —
-    `conn()`'s thread-local caching means this is safe for the
-    single-threaded smoke scripts that use it, not a general multi-thread
-    guarantee.
-    """
+    Phase 35: the redirect is `paths.DB_PATH`, which `dbplace.resolve()` honours for every connection, so a
+    worker thread started before (or inside) the block uses the same throwaway file as the main thread. On exit
+    every thread's connection to the throwaway file is closed and its files removed. Production code never
+    calls this."""
     previous_path = paths.DB_PATH
-    previous_conn = getattr(_local, "conn", None)
     fd, tmp_path = tempfile.mkstemp(prefix="friday-test-", suffix=".db")
     os.close(fd)
     try:
         paths.DB_PATH = tmp_path
-        if hasattr(_local, "conn"):
-            del _local.conn
         yield
     finally:
-        current = getattr(_local, "conn", None)
-        if current is not None:
-            try:
-                current.close()
-            except Exception:
-                pass
-        if hasattr(_local, "conn"):
-            del _local.conn
+        _close_all(tmp_path)
         paths.DB_PATH = previous_path
-        if previous_conn is not None:
-            _local.conn = previous_conn
         for suffix in ("", "-wal", "-shm"):
             try:
                 os.remove(tmp_path + suffix)

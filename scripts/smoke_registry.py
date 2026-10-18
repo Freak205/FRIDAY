@@ -36,5 +36,8 @@ async def try_calls() -> None:
 
 
 if __name__ == "__main__":
-    show()
-    asyncio.run(try_calls())
+    import iso_env  # noqa: E402  (Phase 35: throwaway database + recovery store)
+
+    with iso_env.isolated_runtime():
+        show()
+        asyncio.run(try_calls())

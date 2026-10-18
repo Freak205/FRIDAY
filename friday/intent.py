@@ -291,6 +291,11 @@ _add(_G_MODIFY,
      "append insert replace upgrade configure adjust tweak rewrite reset put store index undo revert record "
      "test raise lower increase decrease reduce boost")
 _add(_G_CLICK, "click press tap select hit choose")
+# Phase 31.0: the compound click verbs. `_WORD_RE` keeps a hyphenated word whole, so "Right-click the
+# Context Target button" was ONE unknown token: the request read as verb-less ("unspecified" -> open/
+# focus/navigate only) and `ui.right_click` was rejected as `modify`. They authorize exactly what "click"
+# does -- nothing more -- whether hyphenated (here) or written as two words (`_PHRASES`).
+_add(_G_CLICK, "right-click double-click left-click")
 _add(_G_DELETE, "delete remove erase wipe clear trash uninstall kill close quit exit terminate forget discard drop purge")
 _add(_G_COMM, "send message text email mail whatsapp reply post tweet share forward dm call publish ping")
 _add(_G_TRANSACT, "buy purchase pay order checkout donate subscribe book")
@@ -310,7 +315,27 @@ _PHRASES: dict[tuple[str, ...], str] = {
     ("place", "an", "order"): _G_TRANSACT,
     ("shut", "down"): _G_SYSTEM, ("log", "out"): _G_SYSTEM, ("sign", "out"): _G_SYSTEM,
     ("log", "off"): _G_SYSTEM, ("power", "off"): _G_SYSTEM,
+    ("right", "click"): _G_CLICK, ("double", "click"): _G_CLICK, ("left", "click"): _G_CLICK,
 }
+
+# Phase 31.0: "bring <the X window> to the front / foreground" is the standard way to ask for a window to
+# be focused (it is `apps.focus`'s own description), but "bring" alone is not a verb here ("bring me the
+# report" is not a window request), and the phrase is discontinuous. It grants FOCUS only.
+_FRONT_WORDS = frozenset({"front", "foreground", "forefront", "top"})
+
+
+def _brings_to_front(toks: list[str], i: int) -> bool:
+    """`toks[i]` is "bring" and the same clause goes on to "... to (the) front / foreground / top"."""
+    rest = toks[i + 1:i + 12]
+    for j, tok in enumerate(rest[:-1]):
+        if tok != "to":
+            continue
+        nxt = rest[j + 1]
+        if nxt == "the" and j + 2 < len(rest):
+            nxt = rest[j + 2]
+        if nxt in _FRONT_WORDS:
+            return True
+    return False
 
 # Words that are just as often nouns ("the note", "a set", "read text"): only a
 # verb in imperative/infinitive position ("Close it", "then send", "to save").
@@ -410,6 +435,8 @@ def _lookup(toks: list[str], i: int, ignored: set[int]) -> tuple[str, int, str] 
     if group is None:
         if word == "tell":  # "tell Rahul ..." is a message; "tell me ..." was a phrase above
             group = _G_COMM
+        elif word == "bring" and _brings_to_front(toks, i):
+            group = _G_FOCUS
         else:
             group = _WORDS.get(word)
         if group is None:
@@ -506,6 +533,125 @@ def derive_scope(goal: str, mode: str = "", wants_mutation: bool | None = None) 
         goal=goal.strip(), allowed=frozenset(allowed), supporting=frozenset(supporting),
         intents=tuple(dict.fromkeys(groups)), basis=basis, explicit_click=explicit_click,
     )
+
+
+def is_action_word(word: str) -> bool:
+    """Is `word` one of the verbs `derive_scope` recognises ("click", "type", "focus", "find")?"""
+    return (word or "").lower() in _WORDS
+
+
+def clause_verbs(text: str) -> list[list[tuple[str, str]]]:
+    """For each clause of `text` (split exactly as `derive_scope` splits it), the action verbs it
+    contains as (verb group, word). The same lookup as `derive_scope`, none of the authorisation
+    logic: questions are not skipped, so "tell me the total" counts. Phase 30.0: lets the
+    direct-route gate see that a request, or an extracted argument, carries a SECOND instruction.
+    Pure; read-only."""
+    out: list[list[tuple[str, str]]] = []
+    for sentence in _SENT_SPLIT.split((text or "").lower()):
+        for sub in _CLAUSE_SPLIT.split(sentence):
+            toks = _WORD_RE.findall(sub)
+            if not toks:
+                continue
+            ignored: set[int] = set()
+            for i, t in enumerate(toks):
+                if t in _NEG:
+                    ignored.update({i + 1, i + 2})
+            hits: list[tuple[str, str]] = []
+            i = 0
+            while i < len(toks):
+                hit = _lookup(toks, i, ignored)
+                if hit is None:
+                    i += 1
+                    continue
+                group, span, word = hit
+                hits.append((group, word))
+                i += span
+            out.append(hits)
+    return out
+
+
+# -- Phase 31.0: what the request asks to DO, and how many times -------------------------------------------
+
+_ACTION_PHRASES: dict[str, str] = {
+    _G_OPEN: "open, start or go to something",
+    _G_FOCUS: "bring a window to the front or rearrange it",
+    _G_MODIFY: "change something (type, write, move, create, set...)",
+    _G_CLICK: "click something",
+    _G_DELETE: "delete or close something",
+    _G_COMM: "send a message",
+    _G_TRANSACT: "buy, pay or order something",
+    _G_SYSTEM: "change a system setting",
+}
+
+
+def requested_actions(scope: GoalScope | None) -> list[str]:
+    """What the user's OWN words directly ask FRIDAY to do, one short phrase per acting verb group
+    ("click something", "bring a window to the front ..."): the LEAD verb of each imperative clause
+    ("Open X and click Y", "In the window, type Z", "please fix it"). [] for a request that only
+    looks (read / check / a question), one whose verbs are not recognised, one clamped to read-only,
+    and an action merely mentioned inside another instruction ("tell me whether I need to update my
+    drivers" asks to be TOLD). Pure, from the scope's goal text; it widens and narrows nothing. Used to
+    tell a premature `done` (nothing that acts has run) from a finished request."""
+    if scope is None or scope.basis not in ("verbs", "expanded") or not scope.allowed:
+        return []
+    found: list[str] = []
+    for sentence in _SENT_SPLIT.split((scope.goal or "").lower()):
+        for sub in _CLAUSE_SPLIT.split(sentence):
+            toks = _WORD_RE.findall(sub)
+            if not toks or toks[0] in _QUESTION or (len(toks) > 1 and toks[0] in _MODAL_Q and toks[1] in _MODAL_SUBJ):
+                continue
+            ignored: set[int] = set()
+            for i, t in enumerate(toks):
+                if t in _NEG:
+                    ignored.update({i + 1, i + 2})
+            for i in range(len(toks)):
+                hit = _lookup(toks, i, ignored)
+                if hit is not None:
+                    if hit[0] in _ACTION_PHRASES and _GRANTS[hit[0]] & scope.allowed:
+                        found.append(_ACTION_PHRASES[hit[0]])
+                    break  # only the clause's lead verb says what it asks for
+    return list(dict.fromkeys(found))
+
+
+_NUMBER_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+_REPEAT_RE = re.compile(r"\b(?:(twice)|(thrice)|(\d{1,2}|two|three|four|five|six|seven|eight|nine|ten)\s+times)\b")
+
+
+def call_targets(tool: str, args: dict[str, Any] | None = None) -> tuple[str, ...]:
+    """What a call ACTS ON, as normalised phrases: a click/key tool's target argument (`label`,
+    `target`, `key` ...), else its string arguments, else -- a tool with no string argument -- the
+    words of its own domain ("volume" for system.volume.up). Two calls with the same tool and the same
+    targets do the same thing, whatever else they pass (`app=`, `kind=`)."""
+    a = args or {}
+    rule = _resolve(tool)
+    keys = rule.target_keys if isinstance(rule, ActionRule) and rule.target_keys else tuple(a)
+    vals = [" ".join(_WORD_RE.findall(str(a[k]).lower())) for k in keys if isinstance(a.get(k), str)]
+    vals = [v for v in vals if len(v) >= 2]
+    if vals:
+        return tuple(dict.fromkeys(vals))
+    return tuple(sorted(_domain_words(tool)))
+
+
+def requested_repeats(goal: str, tool: str, args: dict[str, Any] | None = None) -> int | None:
+    """How many times the user's OWN goal asks for this action: N (2..10) when one clause of it carries
+    a count ("twice", "two times", "3 times") AND names what this call acts on ("click the Add item
+    button twice" -> 2 for a click on "Add item"); None when the request states no count for it. Pure,
+    from the goal text alone."""
+    targets = call_targets(tool, args)
+    if not targets:
+        return None
+    for sentence in _SENT_SPLIT.split((goal or "").lower()):
+        for clause in _CLAUSE_SPLIT.split(sentence):
+            m = _REPEAT_RE.search(clause)
+            if not m:
+                continue
+            n = 2 if m.group(1) else 3 if m.group(2) else _NUMBER_WORDS.get(m.group(3)) or int(m.group(3))
+            if not 2 <= n <= 10:
+                continue
+            words = " ".join(_WORD_RE.findall(clause))
+            if any(re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", words) for t in targets):
+                return n
+    return None
 
 
 # -- Phase 21.0: explicit scope expansion ("yes, fix it") ------------------------------

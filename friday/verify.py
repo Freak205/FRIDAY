@@ -43,6 +43,11 @@ from friday.log import get
 log = get(__name__)
 
 
+# What a reply says when a state change could not be read back. One wording for `plan.run` and for the
+# direct route, so neither can sound more certain than the other.
+UNCONFIRMED_NOTE = "I couldn't verify that it actually took effect, so treat it as unconfirmed."
+
+
 class VerifyStatus(str, Enum):
     VERIFIED = "verified"      # every check positively passed
     FAILED = "failed"          # at least one check contradicts the intended state
@@ -753,6 +758,41 @@ def _fs_delete(args, data, before):
     return [path_absent(str(path), name="path is gone")]
 
 
+def _fs_restore(args, data, before):
+    path = data.get("path") or args.get("path")
+    if not path:
+        return [Check("restored", None, detail="the restored path was not reported")]
+    return [path_exists(str(path), kind="dir" if data.get("kind") == "dir" else "file", name="restored path exists")]
+
+
+def _fs_cleanup(args, data, before):
+    from friday import recovery
+
+    ids = [i for i in (data.get("deleted") or []) if recovery.is_token(i)]
+    if not ids:
+        return [Check("recovery copies removed", None, detail="nothing was reported deleted")]
+    base = recovery.root()
+    still = [i for i in ids if (base / i).exists()]
+    return [Check(
+        "deleted recovery copies are gone", not still,
+        detail=f"{len(ids) - len(still)} of {len(ids)} gone" + (f"; still present: {still[:3]}" if still else ""),
+    )]
+
+
+def _fs_migrate(args, data, before):
+    from friday import recovery
+
+    ids = [i for i in (data.get("copied") or []) if recovery.is_token(i)]
+    if not ids:
+        return [Check("migrated copies present", None, detail="nothing was reported copied")]
+    base = recovery.root()
+    missing = [i for i in ids if not (base / i / "meta.json").is_file()]
+    return [Check(
+        "migrated copies are in the current store", not missing,
+        detail=f"{len(ids) - len(missing)} of {len(ids)} present" + (f"; missing: {missing[:3]}" if missing else ""),
+    )]
+
+
 def _fs_mkdir(args, data, before):
     path = data.get("path") or args.get("path")
     if not path:
@@ -791,6 +831,10 @@ def _register_real() -> None:
     register("files.move", Verifier(_fs_move, settle_s=0.3))
     register("files.delete", Verifier(_fs_delete, settle_s=0.3))
     register("files.mkdir", Verifier(_fs_mkdir, settle_s=0.3))
+    register("files.restore", Verifier(_fs_restore, settle_s=0.3))
+    register("files.recover", Verifier(_fs_restore, settle_s=0.3))
+    register("files.recovery_cleanup", Verifier(_fs_cleanup, settle_s=0.2))
+    register("files.recovery_migrate", Verifier(_fs_migrate, settle_s=0.2))
 
 
 _register_real()

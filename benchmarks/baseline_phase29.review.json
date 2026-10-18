@@ -1,0 +1,10 @@
+{
+ "fs_sort_by_type#3": {
+  "category": "planner/reasoning",
+  "reason": "moved only a.txt/b.txt, never data.csv, then reported the folders organised (false success): premature completion, not a tool defect"
+ },
+ "ui_focus#3": {
+  "category": "environment/harness",
+  "reason": "apps.focus reported success but the foreground was another window 0.5 s later; the user was using the machine (a concurrent screen.active_window read in this same run returned the user's own browser), so foreground theft cannot be ruled out"
+ }
+}

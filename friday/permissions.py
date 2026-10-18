@@ -238,9 +238,16 @@ class Executor:
             skill.name, args, actor=actor, status="success" if result.ok else "failed",
         )
 
-        if skill.undo is not None:
+        # Phase 32.0: an inverse is recorded only for a call that actually SUCCEEDED. Before, a
+        # failed call (copy of a missing file, mkdir of an existing folder, write onto a folder)
+        # still journaled "delete <destination>", so a later undo deleted something this call never
+        # created. A skill whose inverse depends on what happened returns it as `result.undo`
+        # (which snapshot of the overwritten file); otherwise its static `undo=` is used.
+        if result.ok:
             try:
-                inverse = skill.undo(**args)
+                inverse = result.undo
+                if not inverse and skill.undo is not None:
+                    inverse = skill.undo(**args)
                 if inverse:
                     audit.register_undo(audit_id, skill.name, inverse)
             except Exception:

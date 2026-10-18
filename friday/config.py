@@ -28,6 +28,15 @@ class BrainConfig(BaseModel):
     match_threshold: float = 0.62
     clarify_threshold: float = 0.45
     embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Phase 30.0: the direct-route safety gate (friday/directroute.py). A single-skill route whose
+    # arguments do not faithfully account for the request (a dropped operand, a whole sentence as an
+    # argument, a second instruction, a compound request, an ambiguous skill) is handed to the planner
+    # instead of being executed. Off = the pre-Phase-30 behaviour exactly.
+    direct_route_guard: bool = True
+    # Phase 34: friday/recoveryroute.py -- a few exact sentences ("show my recovery snapshots", "restore
+    # snapshot <id>", "clean up expired recovery snapshots", "migrate old recovery snapshots") reach the
+    # operator-only recovery skills through the normal Executor path. Off = console/CLI `recovery ...` only.
+    recovery_routing: bool = True
 
 
 class PermissionsConfig(BaseModel):
@@ -40,6 +49,37 @@ class PermissionsConfig(BaseModel):
     # window is in front -- exactly when the GUI's own STOP button is out of reach). Blank
     # disables it. Registered with RegisterHotKey, like the other hotkeys.
     stop_hotkey: str = "ctrl+alt+x"
+
+
+class StorageConfig(BaseModel):
+    # Phase 35: where the runtime database (audit log, goals, episodes, memory, undo journal) lives.
+    # Empty = the per-user local application-data folder (%LOCALAPPDATA%\FRIDAY\friday.db, which
+    # OneDrive does not sync). An explicit path wins. Pointing it back into the repository folder
+    # works but puts personal data where a cloud drive may sync it.
+    db_path: str = ""
+
+
+class FilesConfig(BaseModel):
+    # Phase 32.0: before files.write/copy/move overwrites a file, and before files.delete removes
+    # one, a verified copy is kept in the recovery store so the undo journal can really restore it.
+    # A file larger than this is NOT overwritten or deleted by those skills (fail closed: no
+    # recoverable copy means no mutation) -- raise the cap if you want bigger files handled.
+    max_snapshot_mb: int = 256
+    # Phase 33: where the recovery store lives. Empty = the per-user local application-data folder
+    # (%LOCALAPPDATA%\FRIDAY\snapshots, which OneDrive does not sync). An explicit path wins.
+    snapshot_dir: str = ""
+    # Retention (applied only when you ask FRIDAY to clean up recovery copies -- nothing is deleted
+    # automatically). A recovery copy is deleted only if ALL hold: no pending/unfinished/given-up
+    # undo entry refers to it, it is older than this many days (never less than 1), and it is not
+    # among the newest `snapshot_keep_newest` such copies.
+    snapshot_retention_days: int = 30
+    snapshot_keep_newest: int = 20
+    # 0 = a pending undo entry never expires (the safe default: its recovery copy is kept forever).
+    # N > 0 = a cleanup first retires pending undo entries older than N days -- they leave the undo
+    # list for good -- and only then can their copies age out. Opt in deliberately.
+    undo_window_days: int = 0
+    # At most this many recovery copies are deleted per cleanup (bounded work; run it again for more).
+    snapshot_cleanup_batch: int = 100
 
 
 class KnowledgeConfig(BaseModel):
@@ -286,6 +326,25 @@ class PlannerConfig(BaseModel):
     # the other route a final answer takes to the user -- for any run that observed
     # something; a run that observed nothing (a plain conversational reply) is untouched.
     answer_grounding_guard: bool = True
+    # Phase 31.0: tool-family discipline (friday/toolfamily.py). While a run is working on a
+    # page in FRIDAY's own controlled browser, the desktop-window tools (ui.*, input.*,
+    # screen.click_text) are not offered to the planner unless the request or the run also
+    # points at a desktop window, and a desktop-window call that would act on "whatever is in
+    # front" (no window named, a deictic one, or the browser itself) is not run -- the planner
+    # is told the browser.* call that does it instead. `max_family_rejections` bounds how many
+    # such decisions one run may burn before it stops truthfully. Off = the Phase 30 behaviour.
+    tool_family_guard: bool = True
+    max_family_rejections: int = 3
+    # Phase 31.0: an ACTION request ("click X", "bring X to the front") whose run has so far only
+    # read or observed is not finished: a `done` then is sent back to the planner, naming what
+    # was asked for, at most `max_action_nudges` times (then the planner is believed and the
+    # answer goes through the usual grounding). Never for a look-only request.
+    action_completion: bool = True
+    max_action_nudges: int = 1
+    # Phase 31.0: "click the Add item button twice" -- the repeat guard lets an identical state-
+    # changing call run as many times as the user's own words ask for (it used to block the second
+    # one), and never more than that.
+    counted_repeats: bool = True
 
 
 class IntelligenceConfig(BaseModel):
@@ -646,6 +705,8 @@ class Config(BaseModel):
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     brain: BrainConfig = Field(default_factory=BrainConfig)
     permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
+    files: FilesConfig = Field(default_factory=FilesConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     ocr: OcrConfig = Field(default_factory=OcrConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)

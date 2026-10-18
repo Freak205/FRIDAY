@@ -3338,3 +3338,316 @@ Use read-only requests unless a test says otherwise. Start the GUI (`START.bat`)
 3. **STOP is missing during a goal, or stuck after it ended.**
 4. **The hotkey does nothing**: check the FRIDAY log (friday.log) for "could not register" (another app owns Ctrl+Alt+X) and
    change `permissions.stop_hotkey` in `config.yaml`.
+
+---
+
+# FRIDAY — Phase 31.0 manual validation checklist
+
+Not yet run by a human. The automated suite (`scripts/smoke_tool_family.py`) drives a headless browser against a
+local test page with a scripted planner, and the benchmark (`scripts/agent_benchmark.py`) also runs the browser
+headless. Neither has watched FRIDAY's real, visible browser window or a person's desktop while the real planner
+works. Use pages and apps where nothing you do matters.
+
+## Test 1 — a click on a web page goes through FRIDAY's browser
+
+1. Close FRIDAY's browser window if it is open. Type: "Open https://example.com in the browser, click the link on
+   the page, and tell me the title of the page it opens."
+2. While it works, keep another application (for example Notepad) in front of the FRIDAY window.
+
+- [ ] FRIDAY's own browser window opens the page and follows the link
+- [ ] Nothing is clicked or typed in the application you had in front; the mouse pointer does not jump to it
+- [ ] The reply names the new page (the click step says "The browser moved to a new page")
+
+## Test 2 — typing into a page's search box
+
+1. Type: "Open https://duckduckgo.com in the browser, type weather into the search box and press Enter."
+
+- [ ] "weather" appears in the page's search box, not in whatever window you have focused
+- [ ] The results page loads in FRIDAY's browser
+
+## Test 3 — desktop requests are unchanged
+
+1. Open Notepad (an empty, unsaved document). Type: "In the Notepad window, type hello from friday."
+
+- [ ] The text appears in Notepad (desktop tools still work when no web page is involved)
+
+## Test 4 — "bring it to the front" is done, not just looked at
+
+1. Open Notepad and cover it with another window. Type: "Bring the Notepad window to the front."
+
+- [ ] Notepad comes to the front
+- [ ] FRIDAY does not report success while Notepad is still covered
+
+## Test 5 — "twice" means twice
+
+1. Open Calculator. Type: "In the Calculator window, click the Seven button twice."
+
+- [ ] The display shows 77 (not 7, not 777)
+
+## Test 6 — right-click is understood
+
+1. Open File Explorer on any folder. Type: "Right-click the Documents folder in the File Explorer window." Close the
+   menu with Esc afterwards.
+
+- [ ] A context menu opens on that item; FRIDAY does not answer that right-clicking is "not supported"
+
+## If something goes wrong
+
+1. **Something was clicked or typed outside FRIDAY's browser during Tests 1-2**: note the time and run
+   `python run.py audit`; the step that did it is listed with its arguments.
+2. **FRIDAY says a page click failed although the page changed**: note the page and the exact reply.
+3. To compare with the old behaviour, set `planner.tool_family_guard: false` (and/or `action_completion`,
+   `counted_repeats`) in `config.yaml`.
+
+---
+
+# FRIDAY — Phase 32.0 manual validation checklist (file safety and recovery)
+
+Automated tests (`scripts/smoke_file_safety.py`) use temp folders only. These steps check the same behaviour on your real
+machine, **using a scratch folder you create for the purpose** (for example `C:\Users\<you>\Desktop\friday_scratch`).
+Do not point any of these at files you care about. Recovery copies are kept under `%LOCALAPPDATA%\FRIDAY\snapshots\` (Phase 33; Phase 32 used `data\snapshots\` inside the FRIDAY folder).
+
+## Test 1 - overwrite then undo restores the original
+
+1. Create `friday_scratch\a.txt` containing the words "original text" (use Notepad).
+2. Type: "Write 'replaced' to friday_scratch\a.txt" (use the full path). Approve the confirmation.
+3. Open `a.txt`: it says "replaced". Type: "undo".
+
+- [ ] The confirmation for the overwrite appeared before anything changed
+- [ ] After "undo" (approve if asked) `a.txt` says "original text" again - it was not deleted
+- [ ] The file's "Date modified" in Explorer is the original date, not now
+
+## Test 2 - delete is recoverable
+
+1. Create `friday_scratch\b.txt`. Type: "Delete friday_scratch\b.txt" (full path). Approve.
+2. Look in `%LOCALAPPDATA%\FRIDAY\snapshots\` (Phase 33; earlier `data\snapshots\`): there is a new folder holding `blob` and `meta.json`.
+3. Type: "undo".
+
+- [ ] The delete asked for confirmation, and FRIDAY said a recoverable copy is kept
+- [ ] After "undo" `b.txt` is back with its content
+- [ ] The Recycle Bin is not involved (FRIDAY uses its own store; nothing is expected there)
+
+## Test 3 - move onto an existing file
+
+1. Create `friday_scratch\s.txt` ("source") and `friday_scratch\d.txt` ("destination original").
+2. Type: "Move friday_scratch\s.txt to friday_scratch\d.txt" (full paths). It must ask first. Approve.
+3. Type: "undo".
+
+- [ ] `d.txt` holds "source" after the move and `s.txt` is gone
+- [ ] After "undo" BOTH files are back: `s.txt` = "source", `d.txt` = "destination original"
+
+## Test 4 - things that must be refused
+
+1. Type: "Move friday_scratch\s.txt to friday_scratch\nosuchfolder\" (a folder that does not exist).
+2. Type: "Copy friday_scratch\s.txt to friday_scratch\s.txt".
+
+- [ ] Neither creates anything or loses anything; FRIDAY says why
+- [ ] Typing "undo" afterwards does not delete a file you did not just change (a failed command no longer leaves an undo entry)
+
+## Test 5 - a declined undo is not "done"
+
+1. Overwrite a scratch file as in Test 1, then type "undo" and **decline** the confirmation.
+
+- [ ] FRIDAY does not say it reversed anything; the file still has the new content
+- [ ] Typing "undo" again and approving restores it
+
+## If something goes wrong
+
+1. A file is missing: look in `%LOCALAPPDATA%\FRIDAY\snapshots\` - every overwritten or deleted file is there as `blob`, and `meta.json`
+   says where it came from. Copy it back by hand if undo cannot.
+2. Nothing in the store is deleted by FRIDAY unless you run `python run.py recovery cleanup` and approve it (Phase 33).
+3. Recovery copies of your files are stored unencrypted on disk (by default under `%LOCALAPPDATA%\FRIDAY\snapshots`, outside
+   OneDrive since Phase 33; Phase 32 kept them inside the FRIDAY folder, which OneDrive may sync); remove sensitive ones when
+   you are done.
+4. Known limitation: Windows has no atomic compare-and-replace. If another program writes to the destination in the instant
+   between FRIDAY's last check and the replace, that newest write can be overwritten with no recovery copy of it (an approved
+   overwrite is checked immediately before, so the window is small but not zero; a program holding the file open can still
+   write). If a delete says it "could not safely delete" a file and names a recovery id, the file is in the store marked
+   unverified; check it by hand, FRIDAY does not resolve that for you.
+
+---
+
+# FRIDAY — Phase 33.0 manual validation checklist (recovery store: location, listing, restore, cleanup)
+
+Automated tests (`scripts/smoke_snapshot_retention.py`) use temp folders only. These steps check the same behaviour on your
+machine, **using a scratch folder you create for the purpose** (for example `C:\Users\<you>\Desktop\friday_scratch`). Do not
+point any of them at files you care about. Recovery copies now live in `%LOCALAPPDATA%\FRIDAY\snapshots`
+(type that into the Explorer address bar). Nothing is deleted from it unless you ask for a cleanup and approve it.
+
+## Test 1 - the store is outside the repository and OneDrive
+
+1. Overwrite a scratch file (as in Phase 32 Test 1), approving the confirmation.
+2. Open `%LOCALAPPDATA%\FRIDAY\snapshots` and the repository's `data\snapshots` folder.
+
+- [ ] A new folder (named like `20261018T101010-0123456789ab`, holding `blob` and `meta.json`) is in `%LOCALAPPDATA%\FRIDAY\snapshots`
+- [ ] The repository's `data\snapshots` did not get a new folder
+- [ ] `python run.py recovery list` does not warn about OneDrive
+
+## Test 2 - list what FRIDAY has kept
+
+1. Run `python run.py recovery list` (or type `recovery list` in the console). These commands are not available by speaking or free-typing to the planner.
+
+- [ ] Each line has an id, what happened (delete / overwrite), the file's path (your user folder shown as `~`), size, time and status
+- [ ] No file content and no hash is shown anywhere
+- [ ] Nothing in the store or your files changed by listing
+
+## Test 3 - bring a deleted file back by id
+
+1. Delete a scratch file ("delete friday_scratch\b.txt", approve). Run `python run.py recovery list`, copy the id of that line.
+2. Run `python run.py recovery recover <id>` (or type `recovery recover <id>` in the console) and approve.
+
+- [ ] The confirmation names the file it will restore, before anything happens
+- [ ] The file is back with the same content and "Date modified"
+- [ ] saying "undo" removes it again (it goes back into the store; nothing is lost)
+
+## Test 4 - recovering over a file that exists
+
+1. Delete a scratch file, then create a NEW file at the same path with different content.
+2. Run `recovery recover <id>` and approve (it must ask, as a higher-risk confirmation).
+
+- [ ] The recovered content replaces the new file
+- [ ] "undo" brings the new file's content back (it was kept first)
+- [ ] Declining the confirmation leaves the new file untouched
+
+## Test 5 - cleanup only removes what is safe
+
+1. Run `python run.py recovery cleanup` and read the question; answer `n`.
+2. Run it again and answer `y`.
+
+- [ ] The question says how many copies, how many MB, and that deletion is permanent
+- [ ] Answering `n` deletes nothing
+- [ ] With only recent copies it says there is nothing to clean up (copies are kept for 30 days by default)
+- [ ] A copy that a pending "undo" still needs is not deleted: after cleanup, "undo" still restores your most recent overwrite
+
+## Test 6 - migrating the old folder (only if `data\snapshots` has folders from Phase 32)
+
+1. Run `python run.py recovery migrate` and approve.
+
+- [ ] The copies appear in `%LOCALAPPDATA%\FRIDAY\snapshots`; the old `data\snapshots` is unchanged
+- [ ] It tells you to delete the old folder yourself; "undo" of an old entry still works either way
+
+## If something goes wrong
+
+1. A file is missing: `%LOCALAPPDATA%\FRIDAY\snapshots\<id>\blob` is the exact bytes; `meta.json` says where it came from. Copy it back by hand.
+2. To keep copies somewhere else, set `files.snapshot_dir` in `config.yaml`. Do not put it inside OneDrive: the copies are unencrypted.
+3. `cleanup.jsonl` in the store lists every copy a cleanup ever removed (id, size, age - no names or content).
+
+
+---
+
+# FRIDAY — Phase 34.0 manual validation checklist (recovery commands in plain sentences)
+
+Use the same scratch folder as Phase 33 and files you do not care about. Type these into the console (`python run.py console`) or the GUI. Nothing here should change a file until you approve a confirmation.
+
+## Test 1 - listing is read-only
+1. Say "show my recovery snapshots", then "what files can FRIDAY recover?".
+
+- [ ] Both show the same list as `recovery list` (ids, what happened, size, status)
+- [ ] No confirmation was asked and no file or recovery copy changed
+
+## Test 2 - restore by exact id
+1. Delete a scratch file, list the recovery snapshots, copy that file's id.
+2. Say "restore snapshot <id>" and approve.
+
+- [ ] The confirmation names the file it will restore, before anything happens
+- [ ] The file is back; declining instead of approving leaves everything as it was
+
+## Test 3 - it never guesses
+1. Say "restore that file", then "restore snapshot 1", then "restore snapshot " plus the id with its last character changed.
+
+- [ ] Each time you get the list of recovery copies and a request for the exact id; nothing is restored and no confirmation appears
+
+## Test 4 - cleanup and migrate keep asking
+1. Say "clean up expired recovery snapshots" and answer no. Say "delete all recovery snapshots".
+2. If `data\snapshots` has old folders: say "migrate old recovery snapshots" and answer no.
+
+- [ ] Cleanup shows how many copies and that deletion is permanent, then waits for your answer; "no" deletes nothing
+- [ ] "delete all recovery snapshots" is explained, not executed
+- [ ] Migrate asks before copying anything; it never runs as a side effect of listing or restoring
+
+## Test 5 - ordinary requests are not hijacked
+1. Say "clean up my downloads folder", "take a snapshot of my screen", "how do recovery snapshots work".
+
+- [ ] None of them lists, restores, cleans or migrates recovery copies
+
+
+---
+
+# FRIDAY — Phase 35.0 manual validation checklist (database location and audit privacy)
+
+Close FRIDAY before step 1 of Test 1. Use scratch files you do not care about.
+
+## Test 1 - the database moved and nothing was lost
+1. Run `python run.py db status`.
+2. Start FRIDAY (console or GUI), say "what did you just do" or open `python run.py audit`, then close it.
+
+- [ ] "active" is `%LOCALAPPDATA%\FRIDAY\friday.db`, not in a OneDrive folder, with the same row counts as "old" (or more after use)
+- [ ] The old `data\friday.db` is still there, unchanged (FRIDAY never deletes it)
+- [ ] Your past requests / memories / corrections are still available
+
+## Test 2 - what the audit keeps
+1. Say "write the text hello-secret-123 into a file called privacy-test.txt in my scratch folder" and approve.
+2. Say "open notepad", then `python run.py audit`.
+
+- [ ] The file was created with the right content
+- [ ] The audit line for the write shows the file path and "[omitted: N chars]", never "hello-secret-123"
+- [ ] The audit line for "open notepad" still shows the app name and that it succeeded
+
+## Test 3 - restart and a second location
+1. Close and restart FRIDAY twice.
+2. (Optional) set `storage.db_path` in config.yaml to a scratch path, start FRIDAY, then remove the setting.
+
+- [ ] No error on restart; no second migration; the data is the same
+- [ ] With the override FRIDAY starts on a new database at that path and your original is untouched
+
+## Test 4 - the old copy (your decision)
+1. Run `python run.py db scan` to see COUNTS of message / typed-text / code values still in the history.
+2. When you are satisfied the new database is complete, delete `data\friday.db` (and `-wal`/`-shm`) yourself.
+
+- [ ] The scan lists counts only (no message text)
+- [ ] After deleting the old file FRIDAY still starts and shows its history
+
+## Test 5 - tests cannot touch your data
+1. Note `python run.py db status`, run any `python scripts\smoke_*.py` you like, run `db status` again.
+
+- [ ] Row counts and sizes of the active database are identical before and after
+
+# Phase 36 - scrubbing historical audit and episode content (do these yourself; the scrub of your real data has NOT been run)
+
+Nothing below happens automatically. Close FRIDAY first (the scrub refuses while anything has the database open).
+
+## Test 1 - preview changes nothing
+1. `python run.py db scrub` (no options). It previews BOTH databases separately: active (`%LOCALAPPDATA%\FRIDAY\friday.db`) and the old `data\friday.db`.
+2. Note the file sizes and modified times of the two `.db` files before and after (the `-shm` file may be refreshed by the read-only open; the `.db` must not change).
+
+- [ ] The output has counts per table / field / action, "unchanged" counts and a confirmation code
+- [ ] No message text, memory text, code, command line or URL query appears anywhere in the output
+- [ ] The `.db` files are byte-for-byte the same afterwards
+
+## Test 2 - scrub the ACTIVE database (your decision)
+1. `python run.py db scrub --target active` and read the preview.
+2. `python run.py db scrub --target active --apply --confirm <code from the preview>`
+3. It prints the backup path (default `%LOCALAPPDATA%\FRIDAY-backups\scrub-<time>-active-<id>\friday.db.bak`) and "restore rehearsal: passed".
+4. `python run.py db scan` for the active database: the content counts for messages / typed text / code / memory text / URL queries should be 0.
+5. Start FRIDAY, ask for "show my recent actions" or open the history; confirm it still works.
+
+- [ ] A repeat of step 2 refuses ("nothing to scrub")
+- [ ] FRIDAY starts and the audit history, goals and memory are all still there
+- [ ] The backup folder exists, is outside OneDrive, `friday.db.bak` is read-only and `manifest.json` holds counts and hashes only
+
+## Test 3 - prove the backup restores (without touching anything)
+1. `python run.py db verify-backup --backup <path to friday.db.bak>`
+2. `python run.py db restore --backup <that file> --to %TEMP%\friday-restore-check.db` and compare `python run.py db status` row counts (the restored file is a copy; delete it yourself afterwards).
+
+- [ ] verify-backup reports integrity OK and a passed restore rehearsal
+- [ ] restore refuses to overwrite an existing file
+
+## Test 4 - the old OneDrive copy (read before deciding)
+The old `data\friday.db` is in a synced folder. Scrubbing it needs `--target legacy --apply --confirm <code> --allow-synced`, and does NOT remove the copies OneDrive keeps in its version history / recycle bin or on other devices. Deleting the file (and its `-wal`/`-shm`) and emptying the OneDrive recycle bin is usually the better remedy; scrub it only if you must keep it.
+
+- [ ] I chose: delete + purge / scrub the legacy copy / leave it for now
+
+## Test 5 - retiring the backup
+The backup keeps everything that was scrubbed. When you are certain you do not need to roll back, delete the whole `scrub-...` folder yourself (clear its read-only flag first) - FRIDAY never deletes it.
+
+- [ ] Backup retired deliberately (or kept knowingly)

@@ -71,4 +71,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import iso_env  # noqa: E402  (Phase 35: throwaway database + recovery store)
+
+    with iso_env.isolated_runtime():
+        main()

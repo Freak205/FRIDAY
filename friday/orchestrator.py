@@ -28,6 +28,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from friday import auditview
 from friday.bus import BUS
 from friday.decision import (
     Decision,
@@ -194,6 +195,60 @@ async def _executor_runner(tool: str, args: dict[str, Any], actor: str) -> Skill
     return await EXECUTOR.run(tool, args, actor=actor)
 
 
+async def run_verified(
+    tool: str, args: dict[str, Any], *, actor: str, runner: Callable[..., Awaitable[SkillResult]] | None = None,
+) -> SkillResult:
+    """Phase 30.0: run ONE tool the way a plan step runs it -- through the Executor, with the same
+    post-condition read-back -- for the direct (single-skill) route, which used to report whatever
+    the tool said. Nothing here is new machinery: it asks the Orchestrator's own `_verify_step`
+    whether this call changes state, reads the baseline with `verify.capture_before`, runs the
+    call, and lets `_attach_verification` read the real state back and judge it.
+
+    * VERIFIED: the result is returned as the tool gave it.
+    * FAILED: the tool's success is overridden (`ok=False`, "It did not take effect -- ...", the
+      tool's own words kept for context), exactly as for a planned step.
+    * UNVERIFIED / PARTIAL: `ok` is left alone (nothing is known to have gone wrong) and the reply
+      says so (`verify.UNCONFIRMED_NOTE`), exactly as `plan.run` words it.
+    * A read-only call, a refused or declined call, or a call that failed on its own is returned
+      untouched: there is nothing to verify.
+
+    Executor errors propagate unchanged (PermissionError_, KeyError, ...): this adds no way to
+    swallow a refusal. `runner` defaults to the real `EXECUTOR.run`."""
+    from friday import verify
+    from friday.config import CFG
+    from friday.registry import REGISTRY
+
+    run = runner or _executor_runner_for(actor)
+    orch = Orchestrator(actor=actor, verify=True)
+    step = PlanStep(tool, dict(args or {}))
+    skill = REGISTRY.get(tool)
+    orch._tiers = {tool: skill.tier} if skill is not None else {}
+    verifying = orch._verify_step(step)
+    before: dict[str, Any] = {}
+    if verifying:
+        before = await verify.capture_before(tool, step.args, timeout_s=CFG.planner.verify_timeout_s)
+
+    result = await run(tool, dict(args or {}))
+    if not (verifying and result.ok):
+        return result
+
+    obs = Observation(step, True, result.speech, dict(result.data or {}))
+    await orch._attach_verification(obs, before)
+    if obs.verification is None:
+        return result
+    speech = obs.speech
+    if obs.verification.status in (verify.VerifyStatus.UNVERIFIED, verify.VerifyStatus.PARTIAL):
+        speech = f"{speech} {verify.UNCONFIRMED_NOTE}".strip()
+    return SkillResult(speech=speech, ok=obs.ok, data=obs.data)
+
+
+def _executor_runner_for(actor: str) -> Callable[..., Awaitable[SkillResult]]:
+    async def _run(tool: str, args: dict[str, Any]) -> SkillResult:
+        return await _executor_runner(tool, args, actor)
+
+    return _run
+
+
 def _format_params(skill: Any) -> str:
     """Phase 20.0: required args first, optional after, so the planner can see at a
     glance what it MUST supply and that nothing else exists. Built straight from
@@ -231,7 +286,7 @@ def _tool_specs(names: list[str] | None) -> list[ToolSpec]:
     from friday import intent
     from friday.registry import REGISTRY
 
-    skills = REGISTRY.all()
+    skills = [s for s in REGISTRY.all() if not s.internal]
     if names is not None:
         allowed = set(names)
         skills = [s for s in skills if s.name in allowed]
@@ -288,6 +343,72 @@ def _changes_state(o: Observation, tier_of: dict[str, str]) -> bool:
     if o.error in _NO_EFFECT_ERRORS:
         return False
     return not intent.is_passive_call(o.step.tool, o.step.args, tier_hint=tier_of.get(o.step.tool, ""))
+
+
+def _attempted_action(observations: list[Observation], tier_of: dict[str, str]) -> bool:
+    """Phase 31.0: did this run TRY anything that acts -- a state-changing call that really went to
+    the executor, whatever came of it (done, failed, refused, declined)? Reads and observations do not
+    count, and neither does a call the guards stopped before it ran (`NOT_EXECUTED_ERRORS`)."""
+    from friday import intent
+
+    return any(
+        o.error not in NOT_EXECUTED_ERRORS
+        and not intent.is_passive_call(o.step.tool, o.step.args, tier_hint=tier_of.get(o.step.tool, ""))
+        for o in observations
+    )
+
+
+def _fitting_tools(scope: Any, specs: list[ToolSpec], goal: str, rejected: str, limit: int = 2) -> list[str]:
+    """Phase 31.0: after an intent rejection on an ACTION request, the offered tools that do one of the
+    kinds of action the request already authorizes and share a content word with it (most shared words
+    first) -- so "Bring the Bench Test Window to the front" points the planner at `apps.focus` ("Bring an
+    already-running window to the foreground") instead of a third click attempt. Measured in the Phase 31
+    benchmark run: the rejection said only "choose a tool that fits", and the planner retried `ui.click`
+    / `ui.right_click` on the window's title until the rejection cap. Guidance only: every named tool's
+    declared class is already in `scope.allowed`, and it is still checked like any other call. A tool
+    whose class depends on its arguments (a click) is never named; a look-only request gets nothing."""
+    import re
+
+    from friday import intent
+
+    acting = set(scope.allowed) - set(intent.PASSIVE) if scope is not None else set()
+    if not acting:
+        return []
+    goal_words = {w for w in re.findall(r"[a-z0-9]+", (goal or "").lower()) if len(w) > 2 and w not in intent._STOP}
+    ranked: list[tuple[int, str]] = []
+    for s in specs:
+        if s.name == rejected:
+            continue
+        cls = intent._resolve(s.name, s.tier)
+        if isinstance(cls, intent.ActionRule) or cls not in acting:
+            continue
+        words = set(re.findall(r"[a-z0-9]+", f"{s.name.replace('.', ' ')} {s.description}".lower()))
+        overlap = len(goal_words & words)
+        if overlap:
+            ranked.append((-overlap, s.name))
+    return [name for _, name in sorted(ranked)[:limit]]
+
+
+def _is_direct_action(goal: str) -> bool:
+    """Phase 31.0: is this a plain do-this request (`GoalMode.DIRECT_ACTION`), not an open-ended,
+    diagnostic, investigative or information-seeking one? (`discovery.classify_mode`, deterministic)."""
+    from friday.intelligence import discovery
+    from friday.intelligence.goals import GoalMode
+
+    return discovery.classify_mode(goal) is GoalMode.DIRECT_ACTION
+
+
+def _times_done(observations: list[Observation], tool: str, args: dict[str, Any]) -> int:
+    """Phase 31.0: how many times this run has SUCCESSFULLY done what `tool(args)` does -- the same tool
+    on the same target (`intent.call_targets`: a click on "Add item" whatever `app=` it named)."""
+    from friday import intent
+
+    want = intent.call_targets(tool, args)
+    return sum(
+        1 for o in observations
+        if o.ok and o.error not in _NO_EFFECT_ERRORS and o.step.tool == tool
+        and intent.call_targets(o.step.tool, o.step.args) == want
+    )
 
 
 def find_prior_attempt(
@@ -506,8 +627,14 @@ class Orchestrator:
         llm_provider: Any | None = None,
         tool_specs: list[ToolSpec] | None = None,
         verify: bool | None = None,
+        live_browser: Callable[[], Awaitable[tuple[str, str] | None]] | None = None,
     ) -> None:
         self.tools = tools  # None = any registered skill is fair game
+        # Phase 31.0: where the tool-family check (friday.toolfamily) learns which page FRIDAY's own
+        # controlled browser has open. None = automatic: the real browser module's state, but only
+        # when tools run through the real executor (a fake test runner never looks at this machine's
+        # browser -- the same rule as `verify`). Tests pass their own provider.
+        self.live_browser = live_browser
         # Phase 22.0: read the real state back after a state-changing step
         # (friday.verify). None = automatic: on when the tools run through the real
         # executor (`CFG.planner.postcondition_verify` is the master switch), off for an
@@ -683,6 +810,15 @@ class Orchestrator:
         # alone — so the next turn structurally cannot repeat it. The guard itself
         # stays authoritative: a tool named anyway is still blocked by it.
         avoid: tuple[str, str] | None = None
+        # Phase 31.0: tool-family discipline, action completion and counted repeats all read the
+        # USER'S OWN words -- never a wrapped discovery/expansion prompt (`goal` may be one).
+        from friday import toolfamily
+
+        user_goal = coverage_goal or (scope.goal if scope is not None else "") or goal
+        family_guard = CFG.planner.tool_family_guard
+        family_rejections = 0
+        action_nudges = 0
+        pending_action_hint = ""
 
         SubgoalStatus = None
         if subgoals:
@@ -846,11 +982,20 @@ class Orchestrator:
                 # single-turn: consumed now whether or not this turn already has a fresher hint
                 turn_coverage_hint = turn_coverage_hint or pending_coverage_hint
                 pending_coverage_hint = ""
+            turn_action_hint, pending_action_hint = pending_action_hint, ""
+
+            # Phase 31.0: is this run working on a page in FRIDAY's own browser? Then the desktop-window
+            # tools are not even shown (prompt + JSON-Schema enum) unless the request or the run also
+            # points at a desktop window; `toolfamily.check_call` below stays the authority either way.
+            browser_ctx = await self._browser_context(user_goal, observations) if family_guard else None
+            hide_desktop = toolfamily.hide_desktop_ui(browser_ctx, user_goal, observations)
 
             turn_specs, turn_avoid = prompt_specs, avoid
+            if hide_desktop:
+                turn_specs = [s for s in turn_specs if not toolfamily.is_desktop_ui(s.name)] or turn_specs
             if avoid is not None:
-                narrowed = [s for s in prompt_specs if s.name != avoid[0]]
-                turn_specs = narrowed or prompt_specs
+                narrowed = [s for s in turn_specs if s.name != avoid[0]]
+                turn_specs = narrowed or turn_specs
             avoid = None
             try:
                 outcome = await self._plan_decision(
@@ -859,6 +1004,10 @@ class Orchestrator:
                     evidence_hint=evidence_hint, cancel_check=cancel_check,
                     prompt_specs=turn_specs, scope=scope, avoid=turn_avoid,
                     coverage_hint=turn_coverage_hint,
+                    family_note=(
+                        toolfamily.prompt_line(hide_desktop, browser_ctx.source) if browser_ctx is not None else ""
+                    ),
+                    action_hint=turn_action_hint,
                 )
             except llm.ProviderUnavailable as exc:
                 return OrchestratorResult(goal, observations, False, str(exc), "planning_failed", subgoal_idx)
@@ -935,6 +1084,33 @@ class Orchestrator:
                         )
                         log.info("coverage nudge #%d: unmet=%s", coverage_nudges, cov.unmet())
                         continue
+                wanted = (
+                    intent.requested_actions(scope)
+                    if scope is not None and CFG.planner.action_completion and real
+                    and not _attempted_action(real, tier_of) and _is_direct_action(user_goal)
+                    else []
+                )
+                if wanted:
+                    # Phase 31.0: the user directly asked FRIDAY to DO something ("bring X to the front",
+                    # "click Y"), steps ran, and every one of them only read or observed -- nothing that
+                    # acts was even tried. That `done` is premature. An action that was tried and failed,
+                    # refused or declined is a real outcome and never lands here; nor does a look-only
+                    # request, an open-ended one ("make this better" may rightly end in "nothing to
+                    # change"), or a `done` with nothing run at all (Phase 19 already reports that one as
+                    # unverified).
+                    if action_nudges < max(0, CFG.planner.max_action_nudges):
+                        # First: send it back (bounded), naming what was asked for.
+                        action_nudges += 1
+                        steps_left += 1  # nothing ran for this turn
+                        pending_action_hint = " / ".join(wanted)
+                        await BUS.publish(
+                            "orchestrator.action_nudge", goal=goal, wanted=wanted, nudges=action_nudges,
+                        )
+                        log.info("action nudge #%d: wanted=%s", action_nudges, wanted)
+                        continue
+                    unfinished = await self._unfinished_action(goal, observations, wanted, subgoals, subgoal_idx)
+                    if unfinished is not None:
+                        return unfinished
                 # Phase 24.5: the summary the planner wrote is grounded against the real
                 # observations before it becomes the answer (`coverage_goal` is the user's
                 # own words even when `goal` is a wrapped discovery/expansion prompt).
@@ -978,11 +1154,13 @@ class Orchestrator:
                         tool=tool_name, args=tool_args,
                         subgoal=subgoals[subgoal_idx].description if subgoals else "",
                     )
+                    fits = _fitting_tools(scope, prompt_specs, user_goal, tool_name) if CFG.planner.action_completion else []
                     observations.append(Observation(
                         step, False, verdict.reason, error="intent_mismatch",
                         data={
                             "status": "intent_mismatch", "tool": tool_name, "args": tool_args,
                             "action_class": verdict.action.value, "allowed": scope.describe(),
+                            **({"fits": fits} if fits else {}),
                         },
                     ))
                     await BUS.publish(
@@ -1015,7 +1193,110 @@ class Orchestrator:
                     avoid = (tool_name, "intent_mismatch")
                     continue
 
+            if browser_ctx is not None:
+                # Phase 31.0: tool-family discipline (friday.toolfamily). The request is about a page in
+                # FRIDAY's own controlled browser; a desktop-window call that would act on "whatever is
+                # in front" -- no window named, a deictic one, the browser itself -- cannot reach that
+                # page (and would bypass browser.click's consequential-click confirmation). It is not
+                # run: the planner is told the browser call that does it. Same shape as an intent
+                # rejection (never executed, never evidence, step refunded, bounded); a call naming a
+                # real desktop window is not affected.
+                fam = toolfamily.check_call(browser_ctx, tool_name, tool_args)
+                if not fam.ok:
+                    family_rejections += 1
+                    repeated_rejection = call_key in rejected_keys
+                    rejected_keys.add(call_key)
+                    step = PlanStep(
+                        tool=tool_name, args=tool_args,
+                        subgoal=subgoals[subgoal_idx].description if subgoals else "",
+                    )
+                    observations.append(Observation(
+                        step, False, fam.reason, error="intent_mismatch",
+                        data={
+                            "status": "tool_family", "tool": tool_name, "args": tool_args,
+                            "action_class": intent.classify_call(
+                                tool_name, tool_args, tier_hint=tier_of.get(tool_name, ""),
+                            ).value,
+                            "allowed": scope.describe() if scope is not None else "",
+                            "suggestion": fam.suggestion,
+                        },
+                    ))
+                    await BUS.publish(
+                        "orchestrator.tool_family", goal=goal, tool=tool_name, args=tool_args,
+                        suggestion=fam.suggestion, rejections=family_rejections, repeated=repeated_rejection,
+                    )
+                    log.warning(
+                        "tool family #%d: %s(%s) -> %s", family_rejections, tool_name,
+                        auditview.sanitize_args(tool_name, tool_args), fam.suggestion,
+                    )
+                    if repeated_rejection:
+                        repeat_streak += 1
+                    if family_rejections >= max(1, CFG.planner.max_family_rejections) or repeat_streak >= 2:
+                        if subgoals:
+                            subgoals[subgoal_idx].status = SubgoalStatus.FAILED
+                        tried = ", ".join(dict.fromkeys(
+                            o.step.tool for o in observations if (o.data or {}).get("status") == "tool_family"
+                        ))
+                        await BUS.publish(
+                            "orchestrator.done", goal=goal, ok=False, stopped="intent_mismatch", actor=self.actor,
+                        )
+                        return OrchestratorResult(
+                            goal, observations, False,
+                            f"I stopped: I kept choosing desktop-window tools ({tried}) for a page that is open "
+                            "in my own browser, where they can't reach it, so I didn't run them."
+                            f"{_found_so_far(observations)}",
+                            "intent_mismatch", subgoal_idx,
+                        )
+                    steps_left += 1  # a rejected decision consumed no real step
+                    avoid = (tool_name, "tool_family")
+                    continue
+
             prior = find_prior_attempt(observations, tool_name, tool_args, tier_of)
+            if CFG.planner.counted_repeats and not intent.is_passive_call(
+                tool_name, tool_args, tier_hint=tier_of.get(tool_name, ""),
+            ):
+                # Phase 31.0: the user's own words say how many times ("click the Add item button
+                # twice"). An identical state-changing call right after the last one is then not a
+                # redundant repeat -- the Phase 5 guard used to block the second click, and the planner
+                # reported the request done after one -- and once it has succeeded that many times it
+                # is not run again.
+                quota = intent.requested_repeats(user_goal, tool_name, tool_args)
+                if quota is not None:
+                    times = _times_done(observations, tool_name, tool_args)
+                    if times >= quota:
+                        repeat_streak += 1
+                        step = PlanStep(
+                            tool=tool_name, args=tool_args,
+                            subgoal=subgoals[subgoal_idx].description if subgoals else "",
+                        )
+                        observations.append(Observation(
+                            step, False,
+                            f"ALREADY_DONE: '{tool_name}' on this target has already run successfully {times} "
+                            f"time(s) -- the number of times the request asked for -- so it was not run again. "
+                            "If that completes the request, reply done.",
+                            error="repeated_call",
+                            data={
+                                "status": "count_reached", "tool": tool_name, "args": tool_args,
+                                "times": times, "requested": quota,
+                            },
+                        ))
+                        await BUS.publish("orchestrator.observation", tool=tool_name, ms=0, blocked=True)
+                        if repeat_streak >= 2:
+                            if subgoals:
+                                subgoals[subgoal_idx].status = SubgoalStatus.FAILED
+                            await BUS.publish(
+                                "orchestrator.done", goal=goal, ok=False, stopped="repeated_action", actor=self.actor,
+                            )
+                            return OrchestratorResult(
+                                goal, observations, False,
+                                "Stopped: the plan kept repeating the same action instead of finishing."
+                                + _found_so_far(observations),
+                                "repeated_action", subgoal_idx,
+                            )
+                        avoid = (tool_name, "count_reached")
+                        continue
+                    if prior is not None:
+                        prior = None  # asked for again by the user's own count: not a redundant repeat
             if prior is not None and continuation:
                 # Phase 21.0: the user's own words ask for MORE ("read more", "next
                 # page", "continue"). An identical read is then not a redundant one —
@@ -1137,6 +1418,44 @@ class Orchestrator:
             goal, observations, False,
             f"Reached the {self.max_steps}-step limit without finishing.", "step_limit", subgoal_idx,
         )
+
+    async def _unfinished_action(
+        self, goal: str, observations: list[Observation], wanted: list[str],
+        subgoals: list[Subgoal] | None, subgoal_idx: int,
+    ) -> OrchestratorResult | None:
+        """Phase 31.0: the planner said `done` again after the bounded action nudge, and still nothing that
+        acts was even tried. The request was NOT done, whatever its summary claims (measured in the Phase
+        31 benchmark run: "a.txt and b.txt are in the 'Text' folder" after a file search alone). The run
+        ends truthfully, with what the steps really found -- never the unsupported claim."""
+        if subgoals:
+            from friday.intelligence.goals import SubgoalStatus
+
+            subgoals[subgoal_idx].status = SubgoalStatus.FAILED
+        await BUS.publish("orchestrator.action_unfinished", goal=goal, wanted=wanted)
+        await BUS.publish("orchestrator.done", goal=goal, ok=False, stopped="failure", actor=self.actor)
+        return OrchestratorResult(
+            goal, observations, False,
+            f"I haven't done that: you asked me to {' / '.join(wanted)}, but nothing that does it ran — "
+            f"my steps only read or looked.{_found_so_far(observations)}",
+            "failure", subgoal_idx,
+        )
+
+    async def _browser_context(self, goal: str, observations: list[Observation]):
+        """Phase 31.0: is this run working on a page in FRIDAY's controlled browser
+        (`friday.toolfamily.browser_context`)? Reads this run's observations and the page the browser
+        has open; never opens, navigates or reads a page."""
+        from friday import toolfamily
+
+        provider = self.live_browser
+        if provider is None and self.runner is _executor_runner:
+            provider = toolfamily.live_page
+        live = None
+        if provider is not None:
+            try:
+                live = await provider()
+            except Exception:
+                log.debug("orchestrator: live browser state unavailable", exc_info=True)
+        return toolfamily.browser_context(goal, observations, live)
 
     async def _cancelled_result(
         self, goal: str, observations: list[Observation], subgoal_idx: int,
@@ -1306,11 +1625,25 @@ class Orchestrator:
     def _history_line(i: int, o: Observation, excerpt: str = "") -> str:
         from friday.intelligence import evaluator
 
+        if o.error == "intent_mismatch" and (o.data or {}).get("status") == "tool_family":
+            # Phase 31.0: rejected for acting on the wrong FAMILY of target, not for exceeding the scope.
+            return (
+                f"{i+1}. called {o.step.tool}({o.step.args}) -> REJECTED, NOT RUN (wrong tool family): the page "
+                f"belongs in FRIDAY's own browser, which {o.step.tool} cannot reach. Use "
+                f"{o.data.get('suggestion') or 'the browser tools'}."
+            )
+        if o.error == "repeated_call" and (o.data or {}).get("status") == "count_reached":
+            return (
+                f"{i+1}. called {o.step.tool}({o.step.args}) -> NOT RUN: already done {o.data.get('times', '?')} "
+                f"time(s), as many as the request asked for. Reply done if that completes it."
+            )
         if o.error == "intent_mismatch":
+            fits = (o.data or {}).get("fits") or []
             return (
                 f"{i+1}. called {o.step.tool}({o.step.args}) -> REJECTED, NOT RUN (intent_mismatch): "
                 f"that is a {o.data.get('action_class', 'different kind of')} action but the request only "
-                f"covers {o.data.get('allowed', 'reading')}. Choose a tool that fits, or reply done."
+                f"covers {o.data.get('allowed', 'reading')}. Choose a tool that fits"
+                + (f" (for this request: {', '.join(fits)})" if fits else "") + ", or reply done."
             )
         if o.error == "repeated_call":
             return (
@@ -1382,6 +1715,8 @@ class Orchestrator:
         compact_tools: bool = False,
         coverage_hint: str = "",
         data_chars: int | None = None,
+        family_note: str = "",
+        action_hint: str = "",
     ) -> tuple[str, str]:
         """(system, prompt) for one planning turn. Extracted unchanged from the
         former `_decide_next` (Phase 19.0) so the repair path and the live
@@ -1468,10 +1803,20 @@ class Orchestrator:
             )
         if scope is not None:
             system += " " + scope.prompt_line()
+        if family_note:
+            # Phase 31.0: the run is working on a page in FRIDAY's own browser (friday.toolfamily).
+            system += " " + family_note
         if coverage_hint:
             system += (
                 " The request has more than one part and these parts still have no result: "
                 f"{coverage_hint}. Do not reply done yet — call a tool for what is missing."
+            )
+        if action_hint:
+            # Phase 31.0: a premature `done` on an action request (see `run_goal`).
+            system += (
+                f" The request asks you to {action_hint}, but nothing that does that has run yet: the steps "
+                "so far only read or observed, if anything. Do not reply done yet — call the tool that does it; "
+                "reply done only if a step above already shows it is done, is not needed, or cannot be done."
             )
         if avoid is not None:
             tool, why = avoid
@@ -1480,6 +1825,16 @@ class Orchestrator:
                     f" Your last call to '{tool}' was blocked because you already have its result (the step "
                     'marked ALREADY_TRIED). It is no longer offered this turn. If the results above already '
                     'answer the goal, reply with action "done" and summarize them; otherwise call a different tool.'
+                )
+            elif why == "tool_family":
+                system += (
+                    f" '{tool}' was not run: the page belongs in FRIDAY's own browser, which it cannot reach, and it "
+                    "is no longer offered this turn. Use the browser tool named in that step."
+                )
+            elif why == "count_reached":
+                system += (
+                    f" Your last call to '{tool}' was not run: it has already been done as many times as the "
+                    "request asked for, and is no longer offered this turn. If the request is complete, reply done."
                 )
             else:
                 system += (
@@ -1704,6 +2059,8 @@ class Orchestrator:
         scope: GoalScope | None = None,
         avoid: tuple[str, str] | None = None,
         coverage_hint: str = "",
+        family_note: str = "",
+        action_hint: str = "",
     ) -> DecisionOutcome:
         """One planning turn: ask the model, PARSE its reply, VALIDATE it
         against the existing decision contract and this run's tool catalog,
@@ -1739,6 +2096,7 @@ class Orchestrator:
             goal, shown, observations, context=context, subgoals=subgoals,
             current_index=current_index, discovery_mode=discovery_mode, evidence_hint=evidence_hint,
             scope=scope, avoid=avoid, coverage_hint=coverage_hint,
+            family_note=family_note, action_hint=action_hint,
         )
         fmt = self._response_format(shown, discovery_mode)
         outcome = DecisionOutcome(budget=budget_info)
@@ -2122,6 +2480,7 @@ def _answer_subgoal_ready(subgoals: list[Subgoal], idx: int, observations: list[
     from one of them, and nothing among that evidence may currently contradict itself
     (test F) — `friday.intelligence.discovery.has_contradiction`, the same check
     `assess_sufficiency` already uses."""
+    from friday import intent
     from friday.intelligence import discovery
     from friday.intelligence.goals import SubgoalStatus
 
@@ -2134,4 +2493,22 @@ def _answer_subgoal_ready(subgoals: list[Subgoal], idx: int, observations: list[
     ]
     if not prior_evidence or discovery.has_contradiction(prior_evidence):
         return False
-    return discovery.subgoal_step_satisfied(goal, prior_evidence)
+    if not discovery.subgoal_step_satisfied(goal, prior_evidence):
+        return False
+    # Phase 31.0: evidence made ONLY of open / navigate / focus results ("Opened Bench Store.") that is not
+    # about what the answer subgoal asks for is not something to answer from -- getting somewhere tells you
+    # nothing about what is there. Found by the Phase 31 benchmark run: "Open <url> in the browser and tell
+    # me the support hotline number" was split into [open the page, tell me the number]; `browser.open`
+    # alone satisfied the first subgoal, so the answer was composed right there -- an honest "the evidence
+    # does not provide the number", but the run stopped when the page had simply not been READ yet. Only
+    # that narrow case is held back: any read / observation / state change among the evidence ("Deleted
+    # report.csv" answers "did it work"), or an open whose result mentions what is asked, keeps the Phase 23
+    # behaviour. When it is not ready the planner simply continues (the pre-Phase-23 path), so this can
+    # only cost a step, never a wrong answer.
+    if all(
+        intent.classify_call(o.step.tool, o.step.args) in intent.LIGHT for o in prior_evidence
+    ):
+        keywords = discovery._clause_keywords(subgoals[idx].description)  # noqa: SLF001
+        if keywords and not any(discovery._clause_relevant(keywords, o, with_data=True) for o in prior_evidence):  # noqa: SLF001
+            return False
+    return True

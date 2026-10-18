@@ -96,7 +96,22 @@ async def main_async() -> int:
         check("re-storing an already-redacted value adds no second marker", twice.count("[redacted]") <= 1, twice)
         check("re-storing an already-redacted value is unchanged", twice == once, f"{once!r} -> {twice!r}")
 
-    return finish("Phase 25 — memory secret redaction", time.perf_counter() - t0, min_assertions=13, min_scenarios=5)
+        scenario("F: a weakly-similar memory that shares no content word does not answer an unrelated question")
+        from friday.skills import memory as memory_skill
+
+        check("0.57 'blood type' vs 'my sister's name is priya' is refused",
+              not memory_skill.grounded_hit("what's my blood type", "my sister's name is priya", 0.57))
+        check("0.61 'favorite color' vs 'i prefer dark mode in every app' is refused",
+              not memory_skill.grounded_hit("what's my favorite color", "i prefer dark mode in every app", 0.61))
+        check("a weak hit that shares a content word is kept",
+              memory_skill.grounded_hit("what theme do i prefer", "i prefer dark mode in every app", 0.57))
+        check("a solid similarity is believed without a shared word",
+              memory_skill.grounded_hit("what is my sibling called", "my sister's name is priya", 0.71))
+        blood = await SESSION.handle("what is my blood type", actor="text")
+        check("an untold personal fact is declined, not answered with an unrelated memory",
+              not blood.ok and "priya" not in blood.speech.lower() and "chennai" not in blood.speech.lower(), blood.speech)
+
+    return finish("Phase 25 — memory secret redaction", time.perf_counter() - t0, min_assertions=18, min_scenarios=6)
 
 
 def main() -> int:
@@ -104,4 +119,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import iso_env  # noqa: E402  (Phase 35: throwaway database + recovery store)
+
+    with iso_env.isolated_runtime():
+        sys.exit(main())

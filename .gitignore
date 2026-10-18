@@ -29,3 +29,15 @@ Thumbs.db
 # Editors
 .vscode/
 .idea/
+
+# Benchmark runs (Phase 29+): only the reproducible JSON baselines are kept. Logs, interim
+# runs and scratch outputs embed machine-specific paths and are not committed.
+benchmarks/*.log
+benchmarks/*interim*
+benchmarks/mine.json
+benchmarks/new.json
+benchmarks/*.tmp
+
+# Database scrub backups / disposable restore copies (they hold plaintext history)
+FRIDAY-backups/
+*.db.bak

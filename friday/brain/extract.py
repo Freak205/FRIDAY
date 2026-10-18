@@ -55,6 +55,7 @@ _TRAILING = re.compile(
 _NEGATIVE = re.compile(r"\b(un|not|off|disable|stop)\b", re.IGNORECASE)
 
 _PATHISH = re.compile(r"""["']?((?:[a-zA-Z]:[\\/]|\.{0,2}[\\/~])[^"'\s]*)["']?""")
+_URL = re.compile(r"""\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s"'<>]+""")
 
 _EXT = re.compile(
     r"\b(pdf|docx?|xlsx?|pptx?|txt|md|csv|json|png|jpe?g|gif|mp4|mp3|zip|py|js|ts|html?)\b",
@@ -342,7 +343,10 @@ def _extract_one(param: Param, text: str, skill: Skill) -> Any | None:
 
     # --- explicit paths ---------------------------------------------------
     if name in ("path", "file", "folder", "directory"):
-        m = _PATHISH.search(text)
+        # Phase 30.0: a URL is not a path. Measured (Phase 29 benchmark): "http://127.0.0.1:5000/account"
+        # matched _PATHISH at its "p:/" (and again at "//"), and a destructive skill was handed
+        # "p:\127.0.0.1:5000\account" as its target.
+        m = _PATHISH.search(_URL.sub(" ", text))
         if m:
             return str(Path(m.group(1)).expanduser())
         return None
@@ -362,7 +366,9 @@ def _extract_one(param: Param, text: str, skill: Skill) -> Any | None:
             r"\b(called|named|about|titled|for me|file|files|document|documents)\b",
             "", obj, flags=re.I,
         ).strip()
-        obj = _EXT.sub("", obj).strip()
+        # Phase 36 audit: drop a bare extension word ("pdf files") but never the extension of a file NAME --
+        # "forget budget.md" must keep "budget.md" or the path operand is lost (and the direct route refused).
+        obj = re.sub(r"(?<!\.)" + _EXT.pattern, "", obj, flags=re.IGNORECASE).strip()
         obj = _DETERMINERS.sub("", obj).strip()
         obj = re.sub(r"\s+", " ", obj)
         return obj or None
@@ -403,6 +409,43 @@ def _extract_one(param: Param, text: str, skill: Skill) -> Any | None:
     return None
 
 
+def parses_own_input(skill_name: str) -> bool:
+    """True when the extractor hands this parameter the (lightly stripped) utterance ON PURPOSE,
+    because the skill parses the phrasing itself ("every day at 8am tell me my battery",
+    "remember that my sister's name is priya", "what's 12 plus 30"). For these a value that
+    covers most of the sentence is correct, not a sign the router failed to isolate an
+    argument. Keep in step with the matching branches of `_extract_one` above."""
+    if skill_name.startswith(("schedule.", "routine.", "project.", "memory.")):
+        return True
+    if skill_name == "knowledge.forget":  # strips its own "forget the document" lead (_FORGET_LEAD)
+        return True
+    if skill_name in ("notes.add", "math.calculate", "timer.set", "plan.run", "whatsapp.compose", "weather.now"):
+        return True
+    return False
+
+
+_PROBE = (
+    "restart open C:\\probe\\a.txt about probe 5 every day at 8am message probe saying hello in probe city"
+)
+_FILLABLE: dict[tuple[str, str], bool] = {}
+
+
+def can_fill(skill: Skill, param: Param) -> bool:
+    """Whether `extract` has ANY strategy that can produce this parameter from words. A required
+    parameter that it can never produce (files.copy's `src`/`dst`, ui.click's `label`) makes
+    "Which src?" a limitation of the router, not an omission by the user -- the caller must not
+    ask a question the utterance already answered. Answered by running the real extractor on a
+    sentence containing every kind of value it knows how to read, so this cannot drift from it."""
+    key = (skill.name, param.name)
+    if key not in _FILLABLE:
+        try:
+            value = _extract_one(param, _PROBE, skill)
+        except Exception:  # a strategy that raises is not one that fills
+            value = None
+        _FILLABLE[key] = value is not None and value != ""
+    return _FILLABLE[key]
+
+
 def extract(skill: Skill, text: str) -> tuple[dict[str, Any], list[str]]:
     """Fill a skill's parameters from `text`.
 
@@ -419,5 +462,7 @@ def extract(skill: Skill, text: str) -> tuple[dict[str, Any], list[str]]:
         elif param.required:
             missing.append(param.name)
 
-    log.debug("extract %s from %r -> %s (missing=%s)", skill.name, text, args, missing)
+    from friday import auditview  # Phase 35: the log file may sit in a synced folder -- keep content out of it
+
+    log.debug("extract %s from %d chars -> %s (missing=%s)", skill.name, len(text), auditview.sanitize_args(skill.name, args), missing)
     return args, missing

@@ -428,6 +428,60 @@ async def scenario_f_end_to_end() -> None:
         check("F: the unattended ceiling is untouched (scheduler still cannot run an L2 tool)", capped)
 
 
+async def scenario_i_every_entry_path_is_stoppable() -> None:
+    scenario("I. (pre-commit audit) every plan.run entry path leaves the goal stoppable, not just a fresh goal")
+    from friday.skills import plan as plan_mod
+
+    # unit: a goal that is not "running" (resumed after a clarification / widened by "yes, fix it" / tracking
+    # failed to start) is put into the running state; one that already runs is left alone (its pending stop stays)
+    INTEL.reset()
+    INTEL.start_goal("earlier", "id0")
+    INTEL.end_goal(ok=True)
+    check("I: after a finished goal nothing is stoppable", INTEL.request_cancel() is False)
+    plan_mod._ensure_stoppable("resumed", "id1")
+    check("I: _ensure_stoppable makes the resumed goal stoppable", INTEL.goal_running and INTEL.request_cancel() is True)
+    plan_mod._ensure_stoppable("resumed", "id1")
+    check("I: ...and a second call does not clear a stop that is already armed", INTEL.is_cancel_requested() is True)
+    INTEL.end_goal(ok=False, status="cancelled")
+
+    # end to end: tracking fails to start (the same state a resumed goal used to be in) -> STOP still works
+    CFG.desktop_observer.enabled = False
+    real_create = goals_mod.create
+
+    def boom(*a, **k):
+        raise RuntimeError("tracking unavailable")
+
+    RAN.clear()
+    planner = ScriptedPlanner([call("test.stop_slow"), call("test.stop_ok", {"label": "after"}), done("finished")])
+    seen: dict = {}
+
+    async def controller():
+        for _ in range(500):
+            if RAN.get("slow"):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            return "slow-never-started"
+        seen["running"] = INTEL.goal_running
+        seen["stopped"] = await SESSION.stop(source="test")
+        return "stopped"
+
+    with store.use_temp_db():
+        goals_mod.create = boom
+        try:
+            with scripted_provider(planner):
+                ctl = asyncio.create_task(controller())
+                result = await asyncio.wait_for(EXECUTOR.run("plan.run", {"goal": "run the slow stop control step"}, actor="text"), timeout=30)
+                outcome = await ctl
+        finally:
+            goals_mod.create = real_create
+    check("I: the slow step started and the controller reached it", outcome == "stopped", outcome)
+    check("I: the goal was reported as running while its step ran", seen.get("running") is True, str(seen))
+    check("I: STOP stopped it (not 'nothing is running')",
+          result.data.get("stopped") == "cancelled" and RAN.get("ok", 0) == 0, f"{result.data.get('stopped')} {RAN}")
+    check("I: INTEL is clean afterwards", INTEL.goal_running is False and INTEL.is_cancel_requested() is False)
+
+
 async def scenario_g_daemon() -> None:
     scenario("G. the daemon's /cancel goes through the same path")
     from friday import daemon
@@ -521,6 +575,7 @@ async def main() -> int:
         await scenario_d_blocking()
         await scenario_e_session_stop()
         await scenario_f_end_to_end()
+        await scenario_i_every_entry_path_is_stoppable()
         await scenario_g_daemon()
         await scenario_h_gui()
     finally:
@@ -529,6 +584,9 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    code = asyncio.run(main())
+    import iso_env  # noqa: E402  (Phase 35: throwaway database + recovery store)
+
+    with iso_env.isolated_runtime():
+        code = asyncio.run(main())
     sys.stdout.flush()
     os._exit(code)

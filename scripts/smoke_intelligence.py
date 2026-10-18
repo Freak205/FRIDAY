@@ -200,8 +200,12 @@ async def _run() -> None:
         stopped="completed", ok=True, duration_ms=42,
     )
     stored = [e for e in episodes.recent(50) if e.id == eid][0]
-    ok = stored.plan[0]["args"]["password"] == "[redacted]" and stored.plan[0]["args"]["username"] == "alice"
-    print(f"  {'OK  ' if ok else 'MISS'} password redacted, non-secret args kept -> {stored.plan[0]['args']}")
+    # Phase 35: episode args go through friday.auditview, which fails closed -- the password is "[redacted]" and
+    # the free-text username of an unlisted skill is stored only as "[omitted: N chars]" (never the value itself).
+    ok = (stored.plan[0]["args"]["password"] == "[redacted]"
+          and stored.plan[0]["args"]["username"] == "[omitted: 5 chars]"
+          and "hunter2" not in str(stored.plan) and "alice" not in str(stored.plan))
+    print(f"  {'OK  ' if ok else 'MISS'} password redacted, free text omitted (not stored) -> {stored.plan[0]['args']}")
     overall &= ok
 
     episodes.record(
