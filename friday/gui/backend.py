@@ -37,6 +37,9 @@ class Backend:
     def __init__(self) -> None:
         self.loop = asyncio.new_event_loop()
         self.ready = threading.Event()
+        # Set when the loop thread has actually ended (not merely been asked to): see `shutdown`.
+        self.stopped = threading.Event()
+        self._shutdown_requested = False
         self.error = False
         # Real, non-fabricated boot milestones — appended to as `_boot`
         # actually completes each step, for the startup screen's checklist.
@@ -63,6 +66,12 @@ class Backend:
         self.ready.wait(timeout=120)
 
     def _run(self) -> None:
+        try:
+            self._run_loop()
+        finally:
+            self.stopped.set()
+
+    def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
         try:
             self.loop.run_until_complete(self._boot())
@@ -104,11 +113,42 @@ class Backend:
         self.ready.set()
 
     def shutdown(self) -> None:
-        """Best-effort — stop the loop so the background thread can exit."""
+        """Ask the backend to wind down; returns at once and never waits (it runs on the GUI thread).
+
+        On the loop it stops what `_boot` started -- the trigger watcher and the scheduler, as the headless daemon does --
+        and then stops the loop. A request already running is not cancelled (that would cut a step in half). Only
+        `stopped` (set when the loop thread ends) says it has finished; this call returning does not."""
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
         try:
-            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.loop.call_soon_threadsafe(lambda: self.loop.create_task(self._wind_down()))
         except Exception:
             pass
+
+    async def _wind_down(self) -> None:
+        try:
+            task = None
+            try:
+                from friday import triggers
+
+                task = getattr(triggers.WATCHER, "_task", None)
+                triggers.WATCHER.stop()
+            except Exception:
+                log.exception("trigger watcher did not stop cleanly")
+            try:
+                from friday import jobs
+
+                jobs.SCHEDULER.stop()
+            except Exception:
+                log.exception("scheduler did not stop cleanly")
+            if task is not None:
+                try:  # let the cancellation be delivered, but never wait on it for long
+                    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1.0)
+                except Exception:
+                    pass
+        finally:
+            self.loop.stop()
 
     # -- bridges used by the GUI thread ----------------------------------------
 
