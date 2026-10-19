@@ -73,6 +73,29 @@ def complete(
     c.commit()
 
 
+# Phase 48: the text of a row whose skill was still running when FRIDAY closed. `ok` stays NULL on purpose -- it did not
+# fail (it may well have succeeded) and nothing says it succeeded -- and no undo entry exists for it, because its result
+# (and so its inverse) was never seen. The words are fixed; they carry nothing from the request.
+OUTCOME_UNKNOWN = (
+    "outcome unknown: FRIDAY was closed while this was still running, so whether it finished was not recorded "
+    "(check the result yourself; nothing was registered to undo it)"
+)
+
+
+def mark_outcome_unknown(audit_id: int) -> bool:
+    """Mark a row that started (an `auto`/`confirmed` decision) and has no outcome at all as "outcome unknown".
+    True only if it changed something. It never touches a row that already has an outcome or any text, nor one that never
+    ran (denied / blocked), so it is safe to repeat; a real `complete` that arrives later simply replaces the marker."""
+    c = store.conn()
+    cur = c.execute(
+        "UPDATE audit SET error=? WHERE id=? AND ok IS NULL AND result IS NULL AND error IS NULL "
+        "AND decision IN ('auto','confirmed')",
+        (OUTCOME_UNKNOWN, audit_id),
+    )
+    c.commit()
+    return cur.rowcount > 0
+
+
 def register_undo(audit_id: int, skill: str, inverse: dict[str, Any]) -> None:
     """Record how to reverse an action. `inverse` is {"skill": ..., "args": {...}}."""
     c = store.conn()

@@ -142,6 +142,12 @@ class Executor:
 
     def __init__(self, confirm: ConfirmFn | None = None) -> None:
         self._confirm = confirm
+        # Phase 48: audit id -> skill name for every call that has started and not yet been recorded. Only read by the
+        # backend's shutdown, to mark what is still running when it must stop waiting.
+        self._in_flight: dict[int, str] = {}
+
+    def in_flight(self) -> dict[int, str]:
+        return dict(self._in_flight)
 
     def set_confirm_handler(self, fn: ConfirmFn) -> None:
         self._confirm = fn
@@ -208,6 +214,7 @@ class Executor:
         await BUS.publish("skill.start", skill=skill.name, args=args)
         started = time.perf_counter()
         actor_token = _CURRENT_ACTOR.set(actor)
+        self._in_flight[audit_id] = skill.name
         try:
             result = await skill(**args)
         except asyncio.CancelledError:
@@ -228,6 +235,7 @@ class Executor:
             _record_action(skill.name, args, actor=actor, status="error")
             raise
         finally:
+            self._in_flight.pop(audit_id, None)
             _CURRENT_ACTOR.reset(actor_token)
 
         elapsed = int((time.perf_counter() - started) * 1000)

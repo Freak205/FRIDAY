@@ -173,10 +173,25 @@ class Backend:
                 _, still = await asyncio.wait(in_flight, timeout=self.SHUTDOWN_DRAIN_S)
                 if still:
                     log.warning("shutdown: %d task(s) did not finish in time and are left as they are", len(still))
+                    self._mark_unfinished_actions()
         except Exception:
             log.exception("backend wind-down failed")
         finally:
             self.loop.stop()
+
+    def _mark_unfinished_actions(self) -> None:
+        """Phase 48: a skill still running when the drain ends cannot be waited for or stopped, and nothing will record
+        its outcome. Say so in its audit row (outcome unknown) rather than leave it looking like an unfilled row. This
+        records no result and registers no undo -- neither is known -- and does not claim a failure."""
+        try:
+            from friday import audit
+            from friday.permissions import EXECUTOR
+
+            for audit_id, name in EXECUTOR.in_flight().items():
+                if audit.mark_outcome_unknown(audit_id):
+                    log.warning("shutdown: %s (audit %d) was still running; its row is marked outcome unknown", name, audit_id)
+        except Exception:
+            log.exception("could not mark unfinished actions at shutdown")
 
     # -- bridges used by the GUI thread ----------------------------------------
 
