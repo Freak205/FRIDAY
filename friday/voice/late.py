@@ -44,7 +44,9 @@ def spoken_text(info: dict[str, Any], *, max_chars: int = 200) -> str:
     try:
         from friday import toolview
 
-        text = toolview.sanitize(text)
+        text = toolview.safe_speech(text)
+        if text == toolview.WITHHELD:
+            return ""
     except Exception:
         log.exception("late-result redaction failed; speaking nothing rather than unredacted text")
         return ""

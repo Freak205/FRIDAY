@@ -82,7 +82,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Annotated
 
-from friday import audit, auditview, steps
+from friday import audit, auditview, steps, toolview
 from friday.config import CFG
 from friday.log import get
 from friday.orchestrator import NOT_EXECUTED_ERRORS, Orchestrator
@@ -133,6 +133,14 @@ async def run(
         "the goal named by resume_goal_id; never set by the planner",
     ] = "",
 ) -> SkillResult:
+    result = await _run_plan(goal, resume_goal_id, clarification_answer, scope_expansion)
+    # Phase 57: whatever this run says -- the tools' own words or the planner's `done` summary, which can repeat what a tool's data
+    # contained -- is shown and spoken only after the credential check (fail-closed; see `toolview.safe_speech`)
+    result.speech = toolview.safe_speech(result.speech)
+    return result
+
+
+async def _run_plan(goal: str, resume_goal_id: str = "", clarification_answer: str = "", scope_expansion: str = "") -> SkillResult:
     if not CFG.planner.enabled:
         return SkillResult(speech="Multi-step planning is disabled in configuration.", ok=False)
 

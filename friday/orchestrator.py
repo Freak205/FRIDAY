@@ -2363,7 +2363,9 @@ class Orchestrator:
         # untouched, so "what's in my clipboard" still gets its raw answer read back.
         from friday import toolview
 
-        obs = Observation(step, result.ok, toolview.sanitize(result.speech) if result.speech else result.speech, result.data)
+        # Phase 57: `speech` is what the run reports back and what `data.steps[].speech` returns, so it gets the plain-sentence credential
+        # rules too (`toolview.safe_speech`, fail-closed), not only the key=value ones.
+        obs = Observation(step, result.ok, toolview.safe_speech(result.speech) if result.speech else result.speech, result.data)
         if not result.ok and result.data and result.data.get("confirmation_declined"):
             # Tagged by friday.permissions.Executor.run so this never reads as
             # an ordinary retryable failure — see

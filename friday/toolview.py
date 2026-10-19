@@ -163,6 +163,23 @@ def redact_credentials(text: str) -> str:
     return text
 
 
+WITHHELD = "[output withheld: it could not be checked for credentials]"
+
+
+def safe_speech(text: str) -> str:
+    """The form of tool or plan output that may be SHOWN OR SPOKEN to the user (Phase 57): `sanitize` with the plain-sentence
+    credential rules ("my password is X", "API key: X", "use X as the password"), which the narrower default leaves out so that
+    ordinary text a tool returns for planning stays untouched. The prose rules use their own keyword list (no bare "pass"/"auth"),
+    so sentences like "the pass is open" or "authorization is pending" come through unchanged. If the check itself fails, the
+    original is NOT returned: a fixed notice is. Idempotent; never raises."""
+    if not isinstance(text, str) or not text:
+        return text
+    try:
+        return sanitize(text, prose=True)
+    except Exception:  # noqa: BLE001 -- fail closed: unchecked text must not be spoken
+        return WITHHELD
+
+
 def sanitize(text: str, *, prose: bool = False) -> str:
     """Make a piece of tool output safe to show the planner: strip control/bidi characters,
     redact credential-shaped text, neutralise text that imitates our own protocol or tries
