@@ -21,7 +21,7 @@ from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any
 
-from friday import store
+from friday import audit, store
 from friday.brain import BRAIN
 from friday.bus import BUS
 from friday.log import get, setup
@@ -89,6 +89,10 @@ class Backend:
     async def _boot(self) -> None:
         setup()
         store.init()
+        try:  # Phase 51: label what an earlier run left open before the last system start; never retries or undoes anything
+            audit.reconcile_stale()
+        except Exception:
+            log.exception("audit reconciliation failed; continuing")
         self.stages.append("memory")
 
         REGISTRY.discover()

@@ -82,6 +82,59 @@ OUTCOME_UNKNOWN = (
 )
 
 
+# Phase 51: the text of a row that a PREVIOUS process left open and that can only belong to a process that no longer exists.
+# Distinct from OUTCOME_UNKNOWN (an orderly quit that saw the work still running): here nobody saw anything. `ok` stays NULL
+# -- it may have finished, failed or never run -- and nothing is retried, undone or registered for undo.
+INTERRUPTED = (
+    "interrupted: the process that started this ended before recording an outcome (crash, kill or restart), so whether it "
+    "finished is unknown; nothing was retried or undone"
+)
+
+
+def is_interrupted(row: dict[str, Any]) -> bool:
+    return row.get("ok") is None and row.get("error") == INTERRUPTED
+
+
+def reconcile_stale(boot_time: float | None = None, *, margin_s: float = 60.0) -> int:
+    """Mark started-but-never-recorded rows that predate the last operating-system boot as `interrupted`; returns how many.
+
+    The audit log has no owner for a row (no pid, no session), several FRIDAY processes (GUI, daemon, CLI) may share the
+    database, and only the GUI holds a lock -- so an open row is NOT evidence of a dead process, and age alone proves
+    nothing (a worker thread may legitimately run for minutes). The one fact that is: no process survives a reboot. A row
+    written before the machine last booted therefore belongs to a process that is gone. Rows from after that boot, including
+    those of a crashed process, are left `unfinished` rather than guessed at.
+
+    Only rows with a started decision (auto/confirmed) and no ok/result/error are touched, so a recorded outcome, a
+    denied/blocked row and an earlier marker are never overwritten, and running it again changes nothing. A live process
+    that (contrary to the above, e.g. after a large clock change) later completes its row simply replaces the marker.
+    No boot time (psutil missing, or a value that is not plausible) means no change."""
+    import time
+    from datetime import datetime, timedelta, timezone
+
+    if boot_time is None:
+        try:
+            import psutil
+
+            boot_time = float(psutil.boot_time())
+        except Exception:
+            log.exception("boot time unavailable; open audit rows are left as they are")
+            return 0
+    if not (0 < boot_time <= time.time()):
+        return 0
+    cutoff = (datetime.fromtimestamp(boot_time, timezone.utc) - timedelta(seconds=margin_s)).isoformat()
+    c = store.conn()
+    cur = c.execute(
+        "UPDATE audit SET error=? WHERE ok IS NULL AND result IS NULL AND error IS NULL "
+        "AND decision IN ('auto','confirmed') AND at < ?",
+        (INTERRUPTED, cutoff),
+    )
+    c.commit()
+    n = int(cur.rowcount or 0)
+    if n:
+        log.warning("audit: %d action(s) left open before the last system start are marked interrupted", n)
+    return n
+
+
 def is_outcome_unknown(row: dict[str, Any]) -> bool:
     """Phase 49: is this audit row (as `recent` returns it) one that `mark_outcome_unknown` marked, and that nothing has
     since given a real outcome? The marker must match exactly, so a genuine error that merely mentions the words is not it."""
@@ -118,6 +171,7 @@ def status_of(row: dict[str, Any]) -> str:
     - ``denied`` / ``blocked`` -- the decision; the skill never ran (``ok`` stays NULL);
     - ``succeeded`` / ``failed`` -- the skill's own verdict (``ok`` 1 / 0), exactly as recorded;
     - ``outcome_unknown`` -- it started and was still running when FRIDAY closed (the Phase 48 marker, matched exactly);
+    - ``interrupted`` -- it started in an earlier process that ended without recording it (the Phase 51 marker);
     - ``unfinished`` -- it started and nothing has been recorded for it (yet).
     A missing result is never read as success or failure."""
     decision = row.get("decision")
@@ -126,6 +180,8 @@ def status_of(row: dict[str, Any]) -> str:
     ok = row.get("ok")
     if ok is not None:
         return "succeeded" if ok else "failed"
+    if is_interrupted(row):
+        return "interrupted"
     return "outcome_unknown" if is_outcome_unknown(row) else "unfinished"
 
 

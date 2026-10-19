@@ -488,6 +488,8 @@ def _audit_table(limit: int) -> None:
         text = (r["result"] or r["error"] or "")[:50]
         if audit.is_outcome_unknown(r):  # Phase 49: neither a tick nor a cross, and not cut off mid-sentence
             ok, text = "[yellow]?[/yellow]", "outcome unknown: FRIDAY closed while it ran"
+        elif audit.is_interrupted(r):  # Phase 51
+            ok, text = "[yellow]?[/yellow]", "interrupted: ended before an outcome was recorded"
         table.add_row(
             r["at"][:19].replace("T", " "),
             r["skill"],

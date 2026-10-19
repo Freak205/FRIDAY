@@ -94,7 +94,10 @@ def recent(
         return SkillResult(speech="I haven't done anything yet.")
 
     # Phase 49: an action that was still running when FRIDAY closed is not reported as if it had finished.
-    names = [r["skill"] + (" (outcome unknown)" if audit.is_outcome_unknown(r) else "") for r in rows]
+    names = [
+        r["skill"] + (" (outcome unknown)" if audit.is_outcome_unknown(r) else " (interrupted, outcome unknown)" if audit.is_interrupted(r) else "")
+        for r in rows
+    ]
     return SkillResult(
         speech=f"Most recently: {', '.join(names[:5])}.",
         data={"actions": rows},

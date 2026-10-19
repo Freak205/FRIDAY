@@ -26,7 +26,7 @@ from friday.skills import meta  # noqa: E402
 
 SECRET = "hunter2-SECRET-body"
 COLUMNS = {"id", "at", "actor", "skill", "tier", "args", "decision", "ok", "result", "error", "duration_ms"}
-STATUSES = {"succeeded", "failed", "denied", "blocked", "unfinished", "outcome_unknown"}
+STATUSES = {"succeeded", "failed", "denied", "blocked", "unfinished", "outcome_unknown", "interrupted"}
 
 
 def add(skill: str, *, decision: str = "auto", ok: bool | None = None, result: str | None = None,
@@ -67,7 +67,7 @@ def main() -> int:
         }
         for skill_name, status in want.items():
             check(f"A-{skill_name} -> {status}", rows[skill_name].get("status") == status, str(rows[skill_name].get("status")))
-        check("A1 only the six documented values ever appear", {r.get("status") for r in rows.values()} <= STATUSES)
+        check("A1 only the documented values ever appear", {r.get("status") for r in rows.values()} <= STATUSES)
 
         scenario("B. outcome unknown versus ordinary unfinished, denied and blocked, without reading any text")
         check("B1 unknown and unfinished are told apart by `status` alone",
