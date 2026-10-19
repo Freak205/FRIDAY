@@ -508,7 +508,12 @@ def _intent_data(result: "OrchestratorResult", scope: "GoalScope | None") -> dic
         {"tool": o.step.tool, "args": auditview.sanitize_args(o.step.tool, o.step.args), "action_class": o.data.get("action_class", "")}
         for o in result.observations if o.error == "intent_mismatch"
     ]
-    return {"intent": {"scope": scope.to_dict(), "rejected": rejected}}
+    # Phase 56: `scope.goal` is the user's request verbatim; `data` goes to every client of the daemon, so a credential typed into
+    # the request must not come back out with it (found by following a secret through the real `plan.run` result)
+    shown = scope.to_dict()
+    if isinstance(shown.get("goal"), str):
+        shown["goal"] = auditview.scrub_free_text(shown["goal"])
+    return {"intent": {"scope": shown, "rejected": rejected}}
 
 
 def _invalid_decision_data(result: "OrchestratorResult") -> dict:

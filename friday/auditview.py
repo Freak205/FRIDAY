@@ -187,10 +187,17 @@ def redact_echoes(text: str, values: Any) -> str:
 
 
 def scrub_free_text(text: str | None, echoes: Any = ()) -> str | None:
-    """Episode `errors` / `context`: echoes of omitted values and URL query/fragment/userinfo, nothing else."""
+    """Episode `errors` / `context` / goal text: echoes of omitted values, URL query/fragment/userinfo and (Phase 56) credentials
+    named in plain sentences or `key: value` shape -- nothing else. Before Phase 56 this applied no credential rule at all, so a
+    secret typed into a goal or echoed in a failing tool's message was kept verbatim."""
     if not isinstance(text, str):
         return text
-    return strip_query_urls(redact_echoes(text, echoes))
+    try:
+        from friday.toolview import redact_credentials
+
+        return strip_query_urls(redact_credentials(redact_echoes(text, echoes)))
+    except Exception:  # noqa: BLE001 -- never fall back to storing the unscrubbed text
+        return "[omitted: could not be scrubbed]"
 
 
 def _marker(value: Any) -> str:

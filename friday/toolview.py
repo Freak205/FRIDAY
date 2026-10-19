@@ -55,10 +55,19 @@ _SECRET_KEY = re.compile(
     re.I,
 )
 
+# Phase 56: the words that name a credential. "api key", "client secret", "secret key", "passcode" (a space is as common in prose as
+# an underscore is in config) were not covered: `api key: X` and `my API key is X` went through unredacted.
 _KEYWORD = (
-    r"(?:pass(?:word|wd|phrase)?(?![a-z])|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|"
-    r"auth(?:orization)?(?![a-z])|credentials?)"
+    r"(?:pass(?:word|wd|phrase|code)?(?![a-z])|pwd|secret(?:[ _-]?key)?|token|api[ _-]?key|apikey|access[ _-]?key|"
+    r"private[ _-]?key|auth(?:orization)?(?![a-z])|credentials?)"
 )
+# The credential words for the plain-sentence rules: not a bare "pass" or "auth" ("the pass is open", "authorization is pending" are
+# ordinary sentences; `pass=x` / `auth: x` shapes are still caught by the key=value rules, which use _KEYWORD).
+_PROSE_KEYWORD = (
+    r"(?:pass(?:word|wd|phrase|code)(?![a-z])|pwd|secret(?:[ _-]?key)?|token|api[ _-]?key|apikey|access[ _-]?key|"
+    r"private[ _-]?key|credentials?)"
+)
+_VALUE = r"(?:\"[^\"\n]*\"|'[^'\n]*'|\S+)"  # one quoted string or one token
 
 _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S), "[redacted private key]"),
@@ -88,9 +97,26 @@ _OPAQUE = re.compile(r"\b(?=[A-Za-z0-9_-]{40,}\b)(?=[A-Za-z_-]*\d)(?=[0-9_-]*[A-
 # (`sanitize(..., prose=True)`) rather than folded into `_REDACTIONS`: "___ is/was ___" is
 # common enough in ordinary speech (session status, expiry notices) that running it over
 # every tool's speech/data by default would over-redact things that were never secrets.
+#
+# Phase 56: more explicit shapes, each replacing only the VALUE and keeping the words around it:
+#   "the password for the wifi is X"      (a "for/of/on <thing>" between the name and the verb)
+#   "password - X"                        (a dash as the separator; `:` and `=` were already covered)
+#   "set/change/reset the passphrase to X"
+#   "use X as the password"               (the value comes BEFORE its name)
+#   "password hunter2-x"                  (no connector at all: only a token that looks like a secret -- it has a digit or a symbol,
+#                                          at least 6 characters -- so "password manager", "token ring", "secret santa" stay)
+# A value that is not in one of these shapes (a bare word after "password", a secret mentioned with no marker) cannot be told from
+# ordinary prose and is NOT detected. Every rule leaves its own output unchanged when applied again.
 _PROSE_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?i)\b((?:my |our |the |his |her |their )?" + _KEYWORD + r")\s+(?:is|are|was|were)\s*:?\s+"
+    (re.compile(r"(?i)\b((?:my |our |the |his |her |their )?" + _PROSE_KEYWORD
+                + r"(?:\s+(?:for|of|on)\s+(?:the |my |our |your )?[A-Za-z0-9_.' -]{1,40}?)?)\s+(?:is|are|was|were)\s*:?\s+"
                 r"(?:\"[^\"\n]*\"|'[^'\n]*'|[^.,;!?\n]+)"), r"\1 is [redacted]"),
+    (re.compile(r"(?i)\b(" + _PROSE_KEYWORD + r"\s+[-\u2013\u2014]\s+)" + _VALUE), r"\1[redacted]"),
+    (re.compile(r"(?i)\b((?:set|change|reset|update|make)\s+(?:the |my |our |your )?" + _PROSE_KEYWORD + r"\s+to\s+)" + _VALUE), r"\1[redacted]"),
+    (re.compile(r"(?i)\b((?:use|using|set|with|enter|type)\s+)" + _VALUE
+                + r"(\s+(?:as|for)\s+(?:the |my |our |your )?" + _PROSE_KEYWORD + r"(?![A-Za-z]))"), r"\1[redacted]\2"),
+    (re.compile(r"(?i)\b(" + _PROSE_KEYWORD + r"\s+)(?!\[redacted)(?:\"[^\"\n]*\"|'[^'\n]*'|(?=\S*[\d_@#$%^&*!=+/\\-])\S{6,})"),
+     r"\1[redacted]"),
 )
 
 _INJECTION: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -125,6 +151,16 @@ def _redact_cards(text: str) -> str:
         return "[redacted number]" if 13 <= len(digits) <= 19 and _luhn(digits) else m.group(0)
 
     return _CARD.sub(repl, text)
+
+
+def redact_credentials(text: str) -> str:
+    """ONLY the credential redactions of `sanitize` (key=value shapes, headers, tokens, and the plain-sentence forms), for text that
+    must keep everything else exactly as written -- `auditview.scrub_free_text`. Idempotent."""
+    for pattern, repl in _REDACTIONS:
+        text = pattern.sub(repl, text)
+    for pattern, repl in _PROSE_REDACTIONS:
+        text = pattern.sub(repl, text)
+    return text
 
 
 def sanitize(text: str, *, prose: bool = False) -> str:

@@ -111,6 +111,8 @@ def record(
     ]
     errors = auditview.scrub_free_text("; ".join(o.speech for o in steps if not o.ok)[:500], echoes) or ""
     context = auditview.scrub_free_text(context, echoes) or ""
+    # Phase 56: the request is kept (experience retrieval matches on it) but a credential typed into it is not
+    goal_text = auditview.scrub_free_text(goal_text, echoes) or ""
 
     c = store.conn()
     cur = c.execute(
