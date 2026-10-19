@@ -457,12 +457,12 @@ def reconstruct(goal_id: str, probe: Any = None, *, stopped: str | None = None) 
     steps: list[StepRecord] = []
     seen: set[int] = set()
 
-    for p in progress.get("steps", []):
+    for p in _stored_steps(progress):
         try:
             stored = StepState(p.get("state"))
-        except ValueError:
+        except (ValueError, TypeError):
             stored = StepState.UNKNOWN
-        ids = [i for i in p.get("audit", []) if isinstance(i, int)]
+        ids = [i for i in (p.get("audit") if isinstance(p.get("audit"), list) else []) if isinstance(i, int)]
         found = [by_id[i] for i in ids if i in by_id]
         seen.update(ids)
         if found:
@@ -528,9 +528,16 @@ def refresh_goals(probe: Any = None) -> int:
     return changed
 
 
+def _stored_steps(progress: dict) -> list[dict]:
+    """The step entries of a stored progress that are usable at all: a malformed field is dropped, never trusted."""
+    raw = progress.get("steps") if isinstance(progress, dict) else None
+    return [p for p in raw if isinstance(p, dict)] if isinstance(raw, list) else []
+
+
 def _steps_view(progress: dict) -> list[tuple]:
-    return [(s.get("tool"), s.get("state"), tuple(s.get("audit", [])), bool(s.get("recovered")),
-             json.dumps(s.get("ver"), sort_keys=True)) for s in progress.get("steps", [])]
+    return [(str(s.get("tool")), str(s.get("state")), tuple(i for i in (s.get("audit") if isinstance(s.get("audit"), list) else [])
+                                                         if isinstance(i, int)),
+             bool(s.get("recovered")), json.dumps(s.get("ver"), sort_keys=True, default=str)) for s in _stored_steps(progress)]
 
 
 def settle_interrupted_goals(probe: Any = None) -> int:
@@ -577,3 +584,76 @@ def settle_interrupted_goals(probe: Any = None) -> int:
     if settled:
         log.warning("%d goal(s) left running by a process that no longer exists are marked interrupted", settled)
     return settled
+
+
+# -- the user-facing account of a past goal (Phase 55) -------------------------------------------------------------------------
+
+_HEADLINE = {
+    "complete": "It finished, and every step that changed something was confirmed.",
+    "complete_unverified": "It finished, but I couldn't confirm the result of some steps.",
+    "partial": "It did not finish.",
+    "failed": "It did not work.",
+    "unknown": "It is unfinished, and I can't tell whether part of it took effect.",
+    "running": "It is still running.",
+    "needs_input": "It is waiting on you.",
+    "stopped": "It was stopped before it finished.",
+}
+
+
+def describe_goal(probe: Any = None) -> tuple[str, dict[str, Any]]:
+    """What happened to the most recent multi-step request, as (speech, data) -- for `meta.goal_status`. READ-ONLY: it reads the goal
+    row, `reconstruct`s its steps from the stored progress and the audit log, and writes nothing, runs nothing, retries nothing.
+
+    The goal row's own status is never taken at its word: a goal recorded as succeeded is described by what its steps show, and when
+    they disagree that is said. A goal with no stored progress (every goal before Phase 54, or one that never ran a step) gets its
+    status and nothing invented. The request's own words are never shown (it is identified by its start time); steps are named by
+    tool, never by argument, result or note. Nothing here claims FRIDAY will carry on by itself."""
+    from friday import owner
+    from friday.intelligence import goals as goals_mod
+
+    probe = probe or owner.probe
+    recent = goals_mod.recent(1)
+    if not recent:
+        return "I haven't run any multi-step request yet.", {"goal": None}
+    goal = recent[0]
+    # The request's own words are NOT echoed: free text can carry a secret the audit scrubber has no key to spot ("my password is
+    # ..."), and a status answer reaches every daemon client. The request is identified by when it started.
+    wanted = f"started {str(goal.created_at)[:16].replace('T', ' ')} UTC"
+    info = {"id": goal.id, "status": goal.status.value, "started": goal.created_at, "updated": goal.updated_at}
+    status = goal.status.value
+
+    if status == "blocked":
+        return (f"Your latest multi-step request ({wanted}) is waiting for your answer to a question I asked; nothing has been done since.",
+                {"goal": info, "report": None})
+    if status in ("pending",):
+        return f"Your latest multi-step request ({wanted}) was accepted but no step is recorded for it.", {"goal": info, "report": None}
+
+    report = reconstruct(goal.id, probe)
+    has_record = report is not None and (bool(report.steps) or bool(goal.progress))
+    if report is None or not has_record:
+        said = {
+            "succeeded": "is recorded as finished", "failed": "is recorded as failed", "partial": "is recorded as only partly done",
+            "cancelled": "was stopped", "running": "is recorded as still running",
+        }.get(status, f"has the status '{status}'")
+        return (f"Your latest multi-step request ({wanted}) {said}, but no step-by-step record of it was kept, so I can't say what was done or what "
+                "is left.", {"goal": info, "report": None})
+
+    outcome = report.outcome
+    if status == "running" and outcome not in ("running", "unknown"):
+        # recorded as running, yet nothing alive is running it and no stop was recorded: it was cut off
+        headline = "It is recorded as still running, but no step of it is known to be running; it may have been cut off."
+    else:
+        headline = _HEADLINE.get(outcome, "It is unfinished.")
+    contradicts = status == "succeeded" and outcome not in ("complete", "complete_unverified")
+    parts = [f"Your latest multi-step request ({wanted}) ran {len(report.steps)} step{'s' if len(report.steps) != 1 else ''}. {headline}"]
+    if contradicts:
+        parts.append("Its record says it succeeded, but the evidence for its steps doesn't back that up.")
+    tail = report.tail()
+    generic = report.remaining == ["the rest of the request"]
+    if generic and not goal.subgoals:
+        tail = tail.replace("Not attempted: the rest of the request.", "I don't have a saved plan, so I can't say exactly what is left.")
+    if tail:
+        parts.append(tail)
+    if outcome not in ("complete", "complete_unverified"):
+        parts.append("I won't resume or retry any of it on my own.")
+    return " ".join(parts), {"goal": info, "report": report.to_dict()}

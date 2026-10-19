@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from friday import audit, undo
+from friday import audit, steps, undo
 from friday.registry import REGISTRY, SkillResult, skill
 
 
@@ -102,3 +102,23 @@ def recent(
         speech=f"Most recently: {', '.join(names[:5])}.",
         data={"actions": rows},
     )
+
+
+@skill(
+    name="meta.goal_status",
+    tier="L0",
+    action="read",
+    description="Say what happened to my last multi-step request",
+    examples=[
+        "what happened to my last request",
+        "did my task finish",
+        "where did you get to with that goal",
+        "what happened before you restarted",
+        "what is left to do on my last task",
+    ],
+)
+def goal_status() -> SkillResult:
+    """Phase 55: the durable account of the latest goal (`friday.steps.describe_goal`). Read-only: it executes, retries and
+    changes nothing, and shows no argument, result or note."""
+    speech, data = steps.describe_goal()
+    return SkillResult(speech=speech, data=data)
