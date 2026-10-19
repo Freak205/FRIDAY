@@ -112,9 +112,31 @@ def register_undo(audit_id: int, skill: str, inverse: dict[str, Any]) -> None:
     c.commit()
 
 
+def status_of(row: dict[str, Any]) -> str:
+    """Phase 50: where this row stands, as one stable word, derived from its own fields (never stored, never guessed):
+
+    - ``denied`` / ``blocked`` -- the decision; the skill never ran (``ok`` stays NULL);
+    - ``succeeded`` / ``failed`` -- the skill's own verdict (``ok`` 1 / 0), exactly as recorded;
+    - ``outcome_unknown`` -- it started and was still running when FRIDAY closed (the Phase 48 marker, matched exactly);
+    - ``unfinished`` -- it started and nothing has been recorded for it (yet).
+    A missing result is never read as success or failure."""
+    decision = row.get("decision")
+    if decision in ("denied", "blocked"):
+        return decision
+    ok = row.get("ok")
+    if ok is not None:
+        return "succeeded" if ok else "failed"
+    return "outcome_unknown" if is_outcome_unknown(row) else "unfinished"
+
+
 def recent(limit: int = 20) -> list[dict[str, Any]]:
+    """Newest first. Every column as stored, plus a derived ``status`` (see `status_of`) so a machine reader does not have
+    to parse ``error``; the daemon's ``GET /audit`` and ``meta.recent``'s ``data.actions`` return these rows."""
     c = store.conn()
     rows = c.execute(
         "SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    for row in out:
+        row["status"] = status_of(row)
+    return out
