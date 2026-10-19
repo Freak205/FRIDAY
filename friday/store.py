@@ -158,6 +158,16 @@ CREATE TABLE IF NOT EXISTS corrections (
     FOREIGN KEY (goal_id) REFERENCES goals(id)
 );
 CREATE INDEX IF NOT EXISTS idx_corrections_goal ON corrections(goal_id);
+
+-- Phase 52: one row per FRIDAY process that has started an audited action (see friday/owner.py). audit.session_id names it.
+CREATE TABLE IF NOT EXISTS runtime_sessions (
+    id          TEXT    PRIMARY KEY,   -- random per process instance
+    pid         INTEGER NOT NULL,
+    proc_start  REAL,                  -- the OS's creation time of that process (epoch s); NULL = could not be read
+    host        TEXT    NOT NULL,
+    kind        TEXT    NOT NULL,      -- gui | daemon | cli | process (not declared)
+    started_at  TEXT    NOT NULL
+);
 """
 
 
@@ -174,6 +184,13 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     # see friday.intelligence.goals.GoalContract. NULL on old rows deserializes
     # to GoalContract() defaults (Goal.from_row), fully backward compatible.
     ("goals", "goal_contract", "ALTER TABLE goals ADD COLUMN goal_contract TEXT"),
+    # Phase 52: which runtime session (friday.owner) started an action. NULL on every older row = no known owner.
+    ("audit", "session_id", "ALTER TABLE audit ADD COLUMN session_id TEXT"),
+]
+
+# Applied after the column migrations (an index on a column an old database does not have yet would fail before them).
+POST_MIGRATIONS: list[str] = [
+    "CREATE INDEX IF NOT EXISTS idx_audit_session ON audit(session_id)",
 ]
 
 
@@ -188,7 +205,16 @@ def _migrate(c: sqlite3.Connection) -> None:
                 c.execute(statement)
                 log.info("migrated: %s.%s", table, column)
             except sqlite3.Error:
+                # Another FRIDAY process opening the same database may have added the column between our check and our
+                # ALTER ("duplicate column name"): that is success, not a failure.
+                if column in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
+                    continue
                 log.exception("migration failed for %s.%s", table, column)
+    for statement in POST_MIGRATIONS:
+        try:
+            c.execute(statement)
+        except sqlite3.Error:
+            log.exception("post-migration failed: %s", statement)
     c.commit()
 
 

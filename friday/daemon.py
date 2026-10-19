@@ -46,10 +46,7 @@ async def lifespan(app: FastAPI):
     setup()
     log.info("FRIDAY %s starting", __version__)
     store.init()
-    try:  # Phase 51: see audit.reconcile_stale
-        audit.reconcile_stale()
-    except Exception:
-        log.exception("audit reconciliation failed; continuing")
+    audit.start_session("daemon")
     REGISTRY.discover()
     await asyncio.to_thread(BRAIN.warm)
 

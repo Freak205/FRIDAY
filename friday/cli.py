@@ -65,6 +65,7 @@ async def _boot(
     """Bring the brain up in-process. `automation` also starts jobs + triggers."""
     setup()
     store.init()
+    audit.start_session("cli")
     REGISTRY.discover()
     if not quiet:
         with con.status("[dim]waking up...", spinner="dots"):

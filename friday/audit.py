@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from friday import auditview, store
+from friday import auditview, owner, store
 from friday.log import get
 
 log = get(__name__)
@@ -20,6 +20,11 @@ log = get(__name__)
 _echo: dict[int, list[str]] = {}
 _echo_lock = threading.Lock()
 _ECHO_CAP = 256
+
+
+# The decisions that mean the skill was (or is about to be) started. Only these rows can be left open; a denied/blocked row
+# never ran, so it has no outcome to be missing.
+STARTED_DECISIONS = ("auto", "confirmed")
 
 
 def record(
@@ -33,13 +38,32 @@ def record(
     """Write the pre-execution row. Returns the audit id.
 
     Phase 35: `args` is stored in the field-aware form of `friday.auditview` -- what was touched and with which
-    non-content options, never the body of a file, a typed text, a message or code."""
+    non-content options, never the body of a file, a typed text, a message or code.
+
+    Phase 52: the row carries the id of the runtime session (`friday.owner`) that wrote it, and that session's own row is
+    written in the SAME transaction, so a row never exists without a recorded owner. For a started action (auto/confirmed)
+    a session that cannot be recorded raises `owner.OwnerError` here -- before the skill is called, so nothing has
+    happened -- rather than running work nobody could later account for. A denied/blocked row never ran; failing to
+    record its owner is logged and the row is still written, without one."""
     c = store.conn()
-    cur = c.execute(
-        "INSERT INTO audit (at, actor, skill, tier, args, decision) VALUES (?,?,?,?,?,?)",
-        (store.now(), actor, skill, tier, store.dumps(auditview.sanitize_args(skill, args)), decision),
-    )
-    c.commit()
+    started = decision in STARTED_DECISIONS
+    session_id: str | None = None
+    try:
+        session_id = owner.ensure_session(c)
+    except Exception as exc:  # noqa: BLE001
+        c.rollback()
+        if started:
+            raise owner.OwnerError(f"could not record which FRIDAY session starts {skill}: {exc}") from exc
+        log.warning("owner of a %s row could not be recorded; writing it without one", decision, exc_info=True)
+    try:
+        cur = c.execute(
+            "INSERT INTO audit (at, actor, skill, tier, args, decision, session_id) VALUES (?,?,?,?,?,?,?)",
+            (store.now(), actor, skill, tier, store.dumps(auditview.sanitize_args(skill, args)), decision, session_id),
+        )
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
     audit_id = int(cur.lastrowid)
     values = auditview.content_values(skill, args)
     if values:
@@ -82,7 +106,7 @@ OUTCOME_UNKNOWN = (
 )
 
 
-# Phase 51: the text of a row that a PREVIOUS process left open and that can only belong to a process that no longer exists.
+# Phase 51/52: the text of a row that a PREVIOUS process left open and whose owning process (`friday.owner`) is provably gone.
 # Distinct from OUTCOME_UNKNOWN (an orderly quit that saw the work still running): here nobody saw anything. `ok` stays NULL
 # -- it may have finished, failed or never run -- and nothing is retried, undone or registered for undo.
 INTERRUPTED = (
@@ -95,44 +119,58 @@ def is_interrupted(row: dict[str, Any]) -> bool:
     return row.get("ok") is None and row.get("error") == INTERRUPTED
 
 
-def reconcile_stale(boot_time: float | None = None, *, margin_s: float = 60.0) -> int:
-    """Mark started-but-never-recorded rows that predate the last operating-system boot as `interrupted`; returns how many.
+def reconcile_orphans(probe: owner.Probe | None = None) -> int:
+    """Phase 52: mark started-but-never-recorded rows whose owning process is PROVABLY gone as `interrupted`; returns how many.
 
-    The audit log has no owner for a row (no pid, no session), several FRIDAY processes (GUI, daemon, CLI) may share the
-    database, and only the GUI holds a lock -- so an open row is NOT evidence of a dead process, and age alone proves
-    nothing (a worker thread may legitimately run for minutes). The one fact that is: no process survives a reboot. A row
-    written before the machine last booted therefore belongs to a process that is gone. Rows from after that boot, including
-    those of a crashed process, are left `unfinished` rather than guessed at.
+    Only a row that names an owner (`session_id`) is considered, and only when `owner.probe` says that owner is DEAD (no such
+    process, or the pid now belongs to a process created at a different time). ALIVE -- another FRIDAY process doing real
+    work, however long it takes -- and UNKNOWN (another host, no recorded creation time, a process that cannot be inspected,
+    any error) leave the row exactly as it is, and so does a row with no owner at all (everything written before this
+    phase): neither age nor the boot time is evidence, so nothing is inferred. This process's own session is never touched.
 
-    Only rows with a started decision (auto/confirmed) and no ok/result/error are touched, so a recorded outcome, a
-    denied/blocked row and an earlier marker are never overwritten, and running it again changes nothing. A live process
-    that (contrary to the above, e.g. after a large clock change) later completes its row simply replaces the marker.
-    No boot time (psutil missing, or a value that is not plausible) means no change."""
-    import time
-    from datetime import datetime, timedelta, timezone
-
-    if boot_time is None:
-        try:
-            import psutil
-
-            boot_time = float(psutil.boot_time())
-        except Exception:
-            log.exception("boot time unavailable; open audit rows are left as they are")
-            return 0
-    if not (0 < boot_time <= time.time()):
-        return 0
-    cutoff = (datetime.fromtimestamp(boot_time, timezone.utc) - timedelta(seconds=margin_s)).isoformat()
+    A dead owner proves the process ended, not what became of the work: ``ok`` stays NULL, no result is invented, and
+    nothing is retried, undone or registered for undo. The update names the row's unresolved state in its WHERE clause, so it is
+    one atomic decision against whatever another connection has written: a real outcome that landed first is never
+    replaced, a denied/blocked row and the Phase 48 shutdown marker never match, repeating it changes nothing, and several
+    processes reconciling at once mark each row once. (A later real `complete` still replaces the marker.)"""
+    probe = probe or owner.probe
     c = store.conn()
-    cur = c.execute(
-        "UPDATE audit SET error=? WHERE ok IS NULL AND result IS NULL AND error IS NULL "
-        "AND decision IN ('auto','confirmed') AND at < ?",
-        (INTERRUPTED, cutoff),
-    )
-    c.commit()
-    n = int(cur.rowcount or 0)
-    if n:
-        log.warning("audit: %d action(s) left open before the last system start are marked interrupted", n)
-    return n
+    unresolved = "ok IS NULL AND result IS NULL AND error IS NULL AND decision IN ('auto','confirmed')"
+    candidates = c.execute(
+        "SELECT id, pid, proc_start, host FROM runtime_sessions WHERE id != ? AND id IN "
+        f"(SELECT session_id FROM audit WHERE session_id IS NOT NULL AND {unresolved})",
+        (owner.identity().id,),
+    ).fetchall()
+    c.rollback()  # end the read transaction before probing; the update below is its own short one
+    marked = 0
+    for s in candidates:
+        try:
+            verdict = probe(s["pid"], s["proc_start"], s["host"])
+        except Exception:  # noqa: BLE001
+            log.warning("liveness probe failed for session %s; leaving its rows", s["id"], exc_info=True)
+            continue
+        if verdict != owner.DEAD:
+            continue
+        cur = c.execute(f"UPDATE audit SET error=? WHERE session_id=? AND {unresolved}", (INTERRUPTED, s["id"]))
+        c.commit()
+        marked += int(cur.rowcount or 0)
+    if marked:
+        log.warning("audit: %d action(s) started by a FRIDAY process that no longer exists are marked interrupted", marked)
+    return marked
+
+
+def start_session(kind: str) -> None:
+    """Startup hook shared by the GUI backend, the daemon and the CLI: record this process as a FRIDAY session, then
+    reconcile what dead processes left open. Neither step may stop a start -- but if the session cannot be recorded, every
+    audited action then refuses to start (see `record`), so the failure is loud where it matters, not silent here."""
+    try:
+        owner.register(kind)
+    except Exception:
+        log.exception("this process could not be recorded as a FRIDAY session; audited actions will be refused until it can")
+    try:
+        reconcile_orphans()
+    except Exception:
+        log.exception("audit reconciliation failed; continuing")
 
 
 def is_outcome_unknown(row: dict[str, Any]) -> bool:
@@ -171,7 +209,7 @@ def status_of(row: dict[str, Any]) -> str:
     - ``denied`` / ``blocked`` -- the decision; the skill never ran (``ok`` stays NULL);
     - ``succeeded`` / ``failed`` -- the skill's own verdict (``ok`` 1 / 0), exactly as recorded;
     - ``outcome_unknown`` -- it started and was still running when FRIDAY closed (the Phase 48 marker, matched exactly);
-    - ``interrupted`` -- it started in an earlier process that ended without recording it (the Phase 51 marker);
+    - ``interrupted`` -- it started in an earlier process that ended without recording it (the Phase 51/52 marker);
     - ``unfinished`` -- it started and nothing has been recorded for it (yet).
     A missing result is never read as success or failure."""
     decision = row.get("decision")

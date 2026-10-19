@@ -89,10 +89,7 @@ class Backend:
     async def _boot(self) -> None:
         setup()
         store.init()
-        try:  # Phase 51: label what an earlier run left open before the last system start; never retries or undoes anything
-            audit.reconcile_stale()
-        except Exception:
-            log.exception("audit reconciliation failed; continuing")
+        audit.start_session("gui")
         self.stages.append("memory")
 
         REGISTRY.discover()
