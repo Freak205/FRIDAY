@@ -250,6 +250,19 @@ def section_b() -> None:
     check("NEVER dropped: this run's evidence block", EVIDENCE.split("\n")[0] in p2)
     check("NEVER dropped: every tool NAME", all(f"- {s.name} " in p2 for s in specs))
     check("NEVER dropped: every tool's argument names", all((s.params.split(" (")[0].replace("REQUIRED ", "").split(";")[0] in p2) for s in specs if s.params))
+    by_name = {ln.split(" ")[1]: ln for ln in p2.splitlines() if ln.startswith("- ") and len(ln.split(" ")) > 1}
+    sk = {sk_.name: sk_ for sk_ in REGISTRY.all()}
+    check("NEVER dropped (Phase 58): every argument NAME of every tool, required and optional, in its compact line",
+          all(p_.name in by_name[s_.name] for s_ in specs for p_ in sk[s_.name].params), "a compact line lost an argument name")
+    check("...and the REQUIRED / optional split survives: required ones listed under REQUIRED, optional ones after 'optional'",
+          all(("REQUIRED" in by_name[s_.name]) == any(p_.required for p_ in sk[s_.name].params)
+              and ("optional" in by_name[s_.name]) == any(not p_.required for p_ in sk[s_.name].params) for s_ in specs))
+    check("...each required argument keeps its one-line description (what a valid call needs)",
+          all(p_.description in by_name[s_.name] for s_ in specs for p_ in sk[s_.name].params if p_.required and p_.description))
+    check("...a non-text argument keeps its type", all(f"{p_.name}:{getattr(p_.type, '__name__', '')}" in by_name[s_.name]
+                                                      for s_ in specs for p_ in sk[s_.name].params if getattr(p_.type, "__name__", "str") != "str"))
+    check("NEVER dropped (Phase 58): the system prompt -- every standing safety / confirmation / uncertainty instruction -- is untouched by shrinking",
+          s2 == sysp, "shrinking changed the system prompt")
     check("NEVER dropped: the newest step", "12. called files.read" in p2)
     check("...older steps are summarized exactly when a history step was taken", any(s.startswith("history") for s in i2["shrunk"]) == ("earlier steps omitted" in p2))
     check("ambient experience was the thing cut", "SUCCEEDED before: 'fix startup issue 29'" not in p2)

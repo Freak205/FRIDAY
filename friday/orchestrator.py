@@ -117,10 +117,14 @@ class ToolSpec:
     # bounded repair prompt for an invalid-arguments reply (`_plan_decision`).
     action: str = ""
     example: str = ""
+    # Phase 58: the argument list for the budget fallback (`_format_params(compact=True)`): same REQUIRED / optional split and the
+    # same argument names, without optional arguments' types-and-defaults boilerplate. "" = use `params` as is.
+    compact_params: str = ""
 
     def line(self, compact: bool = False) -> str:
         tag = f"[{self.tier} {self.action}] " if self.tier and self.action else (f"[{self.tier}] " if self.tier else "")
-        args = f" | args: {self.params}" if self.params else " | args: none"
+        shown = (self.compact_params or self.params) if compact else self.params
+        args = f" | args: {shown}" if shown else " | args: none"
         if compact:
             # Phase 21.0 budget fallback: keep the name, tag and argument names
             # (what a valid call needs); drop the prose description.
@@ -252,15 +256,26 @@ def _executor_runner_for(actor: str) -> Callable[..., Awaitable[SkillResult]]:
     return _run
 
 
-def _format_params(skill: Any) -> str:
+def _format_params(skill: Any, *, compact: bool = False) -> str:
     """Phase 20.0: required args first, optional after, so the planner can see at a
     glance what it MUST supply and that nothing else exists. Built straight from
-    the skill's registered `Param`s — the registry is the only schema."""
+    the skill's registered `Param`s — the registry is the only schema.
+
+    `compact` (Phase 58, the last-resort budget form): the same split and names; a required argument keeps its one-line description
+    (what a valid call needs), a type is shown only when it is not text (`limit:int`), and an optional argument is just its name -- its
+    default is not needed to supply a value, and the "(str, default '')" boilerplate was a quarter of the fallback catalog."""
     if not skill.params:
         return ""
     req, opt = [], []
     for p in skill.params:
         tname = getattr(p.type, "__name__", str(p.type))
+        if compact:
+            label = p.name + ("" if tname == "str" else f":{tname}")
+            if p.required:
+                req.append(label + (f" ({p.description})" if p.description else ""))
+            else:
+                opt.append(label)
+            continue
         if p.required:
             req.append(f"{p.name} ({tname}" + (f" — {p.description}" if p.description else "") + ")")
         else:
@@ -296,6 +311,7 @@ def _tool_specs(names: list[str] | None) -> list[ToolSpec]:
     return [
         ToolSpec(
             name=s.name, description=s.description, tier=s.tier, params=_format_params(s),
+            compact_params=_format_params(s, compact=True),
             action=intent.action_label(s.name, tier_hint=s.tier), example=_example_args(s),
         )
         for s in skills
