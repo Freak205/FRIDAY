@@ -80,8 +80,8 @@ def main() -> int:
               all(rows[n]["ok"] is None for n in ("t.unknown", "t.unfinished", "t.denied", "t.blocked")))
 
         scenario("C. nothing existing changed")
-        check("C1 every original column is present with its original value (status, and from Phase 52 the owning session_id, are the only additions)",
-              all(COLUMNS <= set(r) and set(r) - COLUMNS == {"status", "session_id"} for r in rows.values()))
+        check("C1 every original column is present with its original value (status, and from Phase 52/53 the owning session_id and goal_id, are the only additions)",
+              all(COLUMNS <= set(r) and set(r) - COLUMNS == {"status", "session_id", "goal_id"} for r in rows.values()))
         check("C2 the unknown row still carries the Phase 48 marker in `error`, unchanged",
               rows["t.unknown"]["error"] == audit.OUTCOME_UNKNOWN and rows["t.unknown"]["ok"] is None)
         check("C3 the status was not written to the database (derived on read)",

@@ -7,7 +7,10 @@ arguments, on whose instruction, and whether you approved it.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import threading
+from collections.abc import Iterator
 from typing import Any
 
 from friday import auditview, owner, store
@@ -20,6 +23,20 @@ log = get(__name__)
 _echo: dict[int, list[str]] = {}
 _echo_lock = threading.Lock()
 _ECHO_CAP = 256
+
+
+# Phase 53: the multi-step goal (goals.id) the calls made inside `goal_scope` belong to. Read by `record`, so every audited
+# step of a goal names it without any skill or the Executor having to pass it around.
+_CURRENT_GOAL: contextvars.ContextVar[str | None] = contextvars.ContextVar("_CURRENT_GOAL", default=None)
+
+
+@contextlib.contextmanager
+def goal_scope(goal_id: str | None) -> Iterator[None]:
+    token = _CURRENT_GOAL.set(goal_id or None)
+    try:
+        yield
+    finally:
+        _CURRENT_GOAL.reset(token)
 
 
 # The decisions that mean the skill was (or is about to be) started. Only these rows can be left open; a denied/blocked row
@@ -57,8 +74,9 @@ def record(
         log.warning("owner of a %s row could not be recorded; writing it without one", decision, exc_info=True)
     try:
         cur = c.execute(
-            "INSERT INTO audit (at, actor, skill, tier, args, decision, session_id) VALUES (?,?,?,?,?,?,?)",
-            (store.now(), actor, skill, tier, store.dumps(auditview.sanitize_args(skill, args)), decision, session_id),
+            "INSERT INTO audit (at, actor, skill, tier, args, decision, session_id, goal_id) VALUES (?,?,?,?,?,?,?,?)",
+            (store.now(), actor, skill, tier, store.dumps(auditview.sanitize_args(skill, args)), decision, session_id,
+             _CURRENT_GOAL.get()),
         )
         c.commit()
     except Exception:
@@ -103,6 +121,17 @@ def complete(
 OUTCOME_UNKNOWN = (
     "outcome unknown: FRIDAY was closed while this was still running, so whether it finished was not recorded "
     "(check the result yourself; nothing was registered to undo it)"
+)
+
+
+# Phase 53: the text of a row whose skill runs in a worker thread and was abandoned (step timeout, cancelled run) while the
+# thread was still going. Python cannot stop that thread, so the side effect may well happen -- recording the row as a
+# failure (what Phase 28 did) was a claim nobody could back. Same status (`outcome_unknown`) and the same rule: `ok` stays NULL,
+# nothing is retried or registered for undo; unlike OUTCOME_UNKNOWN the process is still here, so when the thread ends its real
+# outcome is written over this marker (`Executor.run`).
+OUTCOME_UNKNOWN_DETACHED = (
+    "outcome unknown: this step was abandoned while it was still running (it ran out of time or the run was cancelled) "
+    "and cannot be interrupted, so whether it took effect is not known yet; it was not retried"
 )
 
 
@@ -171,15 +200,21 @@ def start_session(kind: str) -> None:
         reconcile_orphans()
     except Exception:
         log.exception("audit reconciliation failed; continuing")
+    try:  # Phase 53: a goal no process is running any more must not stay "running"; nothing is resumed or retried
+        from friday import steps
+
+        steps.settle_interrupted_goals()
+    except Exception:
+        log.exception("goal settlement failed; continuing")
 
 
 def is_outcome_unknown(row: dict[str, Any]) -> bool:
     """Phase 49: is this audit row (as `recent` returns it) one that `mark_outcome_unknown` marked, and that nothing has
     since given a real outcome? The marker must match exactly, so a genuine error that merely mentions the words is not it."""
-    return row.get("ok") is None and row.get("error") == OUTCOME_UNKNOWN
+    return row.get("ok") is None and row.get("error") in (OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_DETACHED)
 
 
-def mark_outcome_unknown(audit_id: int) -> bool:
+def mark_outcome_unknown(audit_id: int, *, detached: bool = False) -> bool:
     """Mark a row that started (an `auto`/`confirmed` decision) and has no outcome at all as "outcome unknown".
     True only if it changed something. It never touches a row that already has an outcome or any text, nor one that never
     ran (denied / blocked), so it is safe to repeat; a real `complete` that arrives later simply replaces the marker."""
@@ -187,7 +222,7 @@ def mark_outcome_unknown(audit_id: int) -> bool:
     cur = c.execute(
         "UPDATE audit SET error=? WHERE id=? AND ok IS NULL AND result IS NULL AND error IS NULL "
         "AND decision IN ('auto','confirmed')",
-        (OUTCOME_UNKNOWN, audit_id),
+        (OUTCOME_UNKNOWN_DETACHED if detached else OUTCOME_UNKNOWN, audit_id),
     )
     c.commit()
     return cur.rowcount > 0

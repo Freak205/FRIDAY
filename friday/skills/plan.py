@@ -82,6 +82,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Annotated
 
+from friday import audit, steps
 from friday.config import CFG
 from friday.log import get
 from friday.orchestrator import NOT_EXECUTED_ERRORS, Orchestrator
@@ -280,23 +281,30 @@ async def run(
     from friday.intelligence.state import INTEL
 
     try:
-        result = await asyncio.wait_for(
-            orch.run_goal(
-                goal, model=CFG.planner.model, context=context,
-                max_replans=CFG.planner.max_replans, subgoals=subgoals,
-                cancel_check=INTEL.is_cancel_requested, observations_out=observations,
-                action_scope=action_scope,
-                # Phase 21.0: goal coverage is judged against the user's own words (an
-                # expansion's planner goal is a composed sentence, not a request).
-                coverage_goal="" if expanded else goal,
-            ),
-            timeout=CFG.planner.total_timeout_s,
-        )
+        with audit.goal_scope(goal_id):  # Phase 53: every audited step of this run names the goal
+            result = await asyncio.wait_for(
+                orch.run_goal(
+                    goal, model=CFG.planner.model, context=context,
+                    max_replans=CFG.planner.max_replans, subgoals=subgoals,
+                    cancel_check=INTEL.is_cancel_requested, observations_out=observations,
+                    action_scope=action_scope,
+                    # Phase 21.0: goal coverage is judged against the user's own words (an
+                    # expansion's planner goal is a composed sentence, not a request).
+                    coverage_goal="" if expanded else goal,
+                ),
+                timeout=CFG.planner.total_timeout_s,
+            )
     except asyncio.TimeoutError:
         duration_ms = int((time.perf_counter() - started) * 1000)
         if subgoals:
             _save_subgoals(goal_id, subgoals)
-        _finish_goal(goal_id, goal, context, observations, "timeout", ok=False, duration_ms=duration_ms, contract=contract)
+        # Phase 53: the step in flight when the whole run was cut off has no Observation; the audit log has it.
+        in_flight = _unknown_from_audit(goal_id)
+        report = steps.build_report(observations, stopped="timeout", subgoals=subgoals, extra_unknown=in_flight)
+        _finish_goal(
+            goal_id, goal, context, observations, "timeout", ok=False, duration_ms=duration_ms, contract=contract,
+            report=report,
+        )
         completed = [o for o in observations if o.ok]
         if completed:
             speech = (
@@ -306,12 +314,15 @@ async def run(
             )
         else:
             speech = f"That plan didn't finish within {CFG.planner.total_timeout_s:.0f} seconds."
+        if report.needs_account:
+            speech = f"{speech} {report.tail()}"
         return SkillResult(
             speech=speech,
             ok=False,
             data={
                 "stopped": "timeout",
                 "goal_id": goal_id,
+                "report": report.to_dict(),
                 "steps": [
                     {
                         "tool": o.step.tool, "args": o.step.args, "ok": o.ok,
@@ -365,6 +376,7 @@ async def run(
             data={
                 "stopped": result.stopped,
                 "goal_id": goal_id,
+                "report": steps.build_report(result.observations, stopped=result.stopped, subgoals=subgoals).to_dict(),
                 "steps": [
                     {
                         "tool": o.step.tool, "args": o.step.args, "ok": o.ok,
@@ -379,9 +391,14 @@ async def run(
     # Phase 22.0: what reading the real state back said about this run's state-changing
     # steps (friday.verify). "not_applicable" for a run that changed nothing.
     gv = result.verification if CFG.planner.postcondition_verify else None
+    # Phase 53: where each executed step stands. A run the planner called "completed" while a step it needed failed (and no
+    # later step of that kind made it good) is not complete, whatever the planner's summary says; a step that timed out is
+    # unknown, not failed; what never ran is said so.
+    report = steps.build_report(result.observations, stopped=result.stopped, subgoals=subgoals)
+    unresolved = result.stopped == "completed" and report.needs_account
     _finish_goal(
-        goal_id, goal, context, result.observations, result.stopped, ok=result.ok, duration_ms=duration_ms,
-        contract=contract, verification=gv,
+        goal_id, goal, context, result.observations, result.stopped, ok=result.ok and not unresolved,
+        duration_ms=duration_ms, contract=contract, verification=gv, report=report,
     )
 
     # Phase 19.0: a "completed" run backed by NO real observation is the
@@ -408,7 +425,13 @@ async def run(
     elif gv is not None and gv.status in ("unverified", "partial") and result.stopped == "completed":
         # Spoken text stays short — the per-tool reasons are in data["verification"].
         speech = f"{speech} {UNCONFIRMED_NOTE}".strip()
-    verified = not unverified and (gv is None or gv.verified_ok)
+    if unresolved:
+        # the planner's own "done" summary is a claim the evidence does not support: replace it, don't decorate it
+        ok = False
+        speech = f"I didn't finish all of that. {report.tail()}"
+    elif report.needs_account and result.stopped != "cancelled":
+        speech = f"{speech} {report.tail()}".strip()
+    verified = not unverified and not report.needs_account and (gv is None or gv.verified_ok)
 
     return SkillResult(
         speech=speech,
@@ -417,6 +440,7 @@ async def run(
             "stopped": result.stopped,
             "goal_id": goal_id,
             "verified": verified,
+            "report": report.to_dict(),
             **({"verification": gv.to_dict()} if gv is not None and gv.status != "not_applicable" else {}),
             "steps": [
                 {
@@ -735,14 +759,15 @@ async def _run_discovery(
             "or change anything yet. Once you have enough evidence, respond done with a summary "
             "of what you found and what remains unknown."
         )
-        result = await asyncio.wait_for(
-            discovery_orch.run_goal(
-                prompt, model=CFG.planner.model, context=context,
-                cancel_check=INTEL.is_cancel_requested, discovery_mode=True,
-                coverage_goal=goal,
-            ),
-            timeout=CFG.planner.max_discovery_time_s,
-        )
+        with audit.goal_scope(goal_id):
+            result = await asyncio.wait_for(
+                discovery_orch.run_goal(
+                    prompt, model=CFG.planner.model, context=context,
+                    cancel_check=INTEL.is_cancel_requested, discovery_mode=True,
+                    coverage_goal=goal,
+                ),
+                timeout=CFG.planner.max_discovery_time_s,
+            )
     except Exception:
         log.exception("plan.run: discovery phase failed (non-fatal, falling back to direct execution)")
         return context, contract, None
@@ -950,9 +975,20 @@ def _append_experience(goal: str, context: str) -> str:
         return context
 
 
+def _unknown_from_audit(goal_id: str | None) -> list[str]:
+    """Tools of this goal's steps whose audit row says the outcome is unknown (abandoned while running)."""
+    if not goal_id:
+        return []
+    try:
+        return [s.tool for s in steps.ledger_for_goal(goal_id) if s.state is steps.StepState.UNKNOWN]
+    except Exception:
+        log.exception("plan.run: could not read the goal's steps from the audit log (non-fatal)")
+        return []
+
+
 def _finish_goal(
     goal_id: str | None, goal: str, context: str, observations, stopped: str, *,
-    ok: bool, duration_ms: int, contract: "GoalContract | None" = None, verification=None,
+    ok: bool, duration_ms: int, contract: "GoalContract | None" = None, verification=None, report=None,
 ) -> None:
     try:
         from friday.intelligence import episodes, evaluator
@@ -981,7 +1017,10 @@ def _finish_goal(
         )
 
         if goal_id is not None:
-            if stopped == "cancelled":
+            if stopped == "completed" and report is not None and report.needs_account:
+                # Phase 53: the planner said done, but a needed step failed / is unknown / waits on the user
+                status = goals_mod.GoalStatus.PARTIAL
+            elif stopped == "cancelled":
                 # Phase 16.0: a cooperative mid-plan cancel (see
                 # Orchestrator.run_goal's `cancel_check`) is not a failure —
                 # give it the dedicated GoalStatus it already has rather
@@ -1005,8 +1044,11 @@ def _finish_goal(
             goals_mod.update_status(
                 goal_id, status,
                 failure_reason=(
-                    "completed, but the result could not be verified: " + "; ".join(verification.unverified)[:300]
-                    if unconfirmed else "" if evaluation.goal_complete else evaluation.reason
+                    "completed, but not everything finished: " + report.tail()[:400]
+                    if stopped == "completed" and report is not None and report.needs_account
+                    else "completed, but the result could not be verified: " + "; ".join(verification.unverified)[:300]
+                    if unconfirmed else "" if evaluation.goal_complete
+                    else (evaluation.reason + (" " + report.tail() if report is not None and report.needs_account else ""))[:600]
                 ),
                 current_step=len(observations),
             )

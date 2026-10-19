@@ -1119,9 +1119,16 @@ class Orchestrator:
                     if decision.summary else _summarize(observations, coverage_goal or goal)
                 )
                 if subgoals:
-                    for sg in subgoals:
-                        if sg.status in (SubgoalStatus.PENDING, SubgoalStatus.ACTIVE):
-                            sg.status = SubgoalStatus.SUCCEEDED
+                    # Phase 53: a bare `done` used to mark EVERY open subgoal succeeded -- found by a goal whose write step
+                    # failed and whose last stage never ran: the saved breakdown said all three stages succeeded. When
+                    # the executed steps show a failure nothing made good, an unknown outcome or a step waiting on the
+                    # user (`friday.steps`), the open subgoals are left open: they were not achieved.
+                    from friday import steps as _steps
+
+                    if not _steps.build_report(observations, stopped="completed").needs_account:
+                        for sg in subgoals:
+                            if sg.status in (SubgoalStatus.PENDING, SubgoalStatus.ACTIVE):
+                                sg.status = SubgoalStatus.SUCCEEDED
                 await BUS.publish("orchestrator.done", goal=goal, ok=True, stopped="completed", actor=self.actor)
                 return OrchestratorResult(goal, observations, True, summary, "completed", subgoal_idx)
 
@@ -2295,7 +2302,18 @@ class Orchestrator:
                     )
                     return obs, "cancelled"
         except asyncio.TimeoutError:
-            obs = Observation(step, False, f"'{step.tool}' timed out.", error="timeout")
+            # Phase 53: a step that can change state and ran out of time was ABANDONED, not undone -- a tool in a worker
+            # thread cannot be stopped, so it may still take effect (its audit row says "outcome unknown", and records the
+            # real outcome if the thread ends). "Timed out" alone read as "it did not happen". The run stops here either way
+            # (a timeout is never replanned or retried).
+            if self._changes_state(step):
+                obs = Observation(
+                    step, False,
+                    f"'{step.tool}' didn't finish in time, so I can't tell whether it took effect; I did not try it again.",
+                    {"status": "unknown_outcome", "tool": step.tool}, error="timeout",
+                )
+            else:
+                obs = Observation(step, False, f"'{step.tool}' timed out.", error="timeout")
             return obs, "timeout"
         except asyncio.CancelledError:
             raise
@@ -2332,6 +2350,12 @@ class Orchestrator:
         return obs, (None if obs.ok else "failure")
 
     # -- post-condition verification (Phase 22.0) --------------------------------------
+
+    def _changes_state(self, step: PlanStep) -> bool:
+        """Can this call change anything (an unknown tool is assumed to)? Independent of whether verification is on."""
+        from friday import intent
+
+        return not intent.is_passive_call(step.tool, step.args, tier_hint=self._tiers.get(step.tool, ""))
 
     def _verify_step(self, step: PlanStep) -> bool:
         """Should this step be verified? Only a state-changing call, and only when

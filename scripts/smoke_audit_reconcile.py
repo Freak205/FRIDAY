@@ -577,7 +577,7 @@ def main() -> int:
         cols = {r[1] for r in store.conn().execute("PRAGMA table_info(audit)")}
         check("N1 four connections opening the old database at once all succeed", not errors, repr(errors))
         check("N2 the owner column and the sessions table now exist, plus an index",
-              "session_id" in cols and store.conn().execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0] == 0
+              {"session_id", "goal_id"} <= cols and store.conn().execute("SELECT COUNT(*) FROM runtime_sessions").fetchone()[0] == 0
               and store.conn().execute("SELECT COUNT(*) FROM sqlite_master WHERE name='idx_audit_session'").fetchone()[0] == 1)
         legacy_rows = audit.recent(10)
         check("N3 the old rows are unchanged, have no owner, and keep their statuses",

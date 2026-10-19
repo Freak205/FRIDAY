@@ -17,6 +17,8 @@ can be tested in isolation and can't accidentally bypass the guard.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextvars
 import importlib
 import inspect
 import pkgutil
@@ -29,6 +31,23 @@ from friday.log import get
 log = get(__name__)
 
 Tier = Literal["L0", "L1", "L2", "L3"]
+
+
+class Detach:
+    """Phase 53: lets the caller of a worker-thread skill learn what became of the thread after the caller stopped waiting.
+
+    A plain-function skill runs in a thread Python cannot stop. If the await is cancelled (a step timeout, a cancelled run) the
+    thread carries on and its side effect may still happen. The Executor puts one of these in `DETACH` before calling the skill;
+    `Skill.__call__` sets `started` when the thread really begins the work, and -- if the await is cancelled after that -- hands
+    `on_done` the finished future, whenever it finishes, so the real outcome can still be recorded. A thread that never
+    started (cancelled while queued) did nothing and leaves `started` False."""
+
+    def __init__(self, on_done: Callable[[concurrent.futures.Future], None]) -> None:
+        self.on_done = on_done
+        self.started = False
+
+
+DETACH: contextvars.ContextVar[Detach | None] = contextvars.ContextVar("DETACH", default=None)
 
 
 @dataclass(slots=True)
@@ -119,8 +138,33 @@ class Skill:
             value = await self.fn(**kwargs)
         else:
             # Skills are mostly blocking Win32 calls; keep the loop responsive.
-            value = await asyncio.to_thread(lambda: self.fn(**kwargs))
+            value = await self._in_thread(kwargs)
         return SkillResult.coerce(value)
+
+    async def _in_thread(self, kwargs: dict[str, Any]) -> Any:
+        """`asyncio.to_thread`, except that a cancelled await can still be told how the thread ended (see `Detach`)."""
+        loop = asyncio.get_running_loop()
+        cf: concurrent.futures.Future = concurrent.futures.Future()
+        ctx = contextvars.copy_context()
+        detach = DETACH.get()
+
+        def work() -> None:
+            if not cf.set_running_or_notify_cancel():  # cancelled while queued: nothing ran
+                return
+            if detach is not None:
+                detach.started = True
+            try:
+                cf.set_result(ctx.run(lambda: self.fn(**kwargs)))
+            except BaseException as exc:  # noqa: BLE001 -- handed to the awaiting side, as to_thread does
+                cf.set_exception(exc)
+
+        loop.run_in_executor(None, work)
+        try:
+            return await asyncio.wrap_future(cf, loop=loop)
+        except asyncio.CancelledError:
+            if detach is not None and detach.started:
+                cf.add_done_callback(detach.on_done)  # runs at once if it has already finished
+            raise
 
     def preview(self, **kwargs: Any) -> str:
         """Human-readable description of what calling this would do."""

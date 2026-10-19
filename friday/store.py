@@ -186,11 +186,14 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("goals", "goal_contract", "ALTER TABLE goals ADD COLUMN goal_contract TEXT"),
     # Phase 52: which runtime session (friday.owner) started an action. NULL on every older row = no known owner.
     ("audit", "session_id", "ALTER TABLE audit ADD COLUMN session_id TEXT"),
+    # Phase 53: which multi-step goal (goals.id) an action ran for. NULL = a direct, single-skill call or an older row.
+    ("audit", "goal_id", "ALTER TABLE audit ADD COLUMN goal_id TEXT"),
 ]
 
 # Applied after the column migrations (an index on a column an old database does not have yet would fail before them).
 POST_MIGRATIONS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_audit_session ON audit(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_goal ON audit(goal_id)",
 ]
 
 

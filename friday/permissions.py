@@ -24,7 +24,7 @@ from friday import audit
 from friday.bus import BUS
 from friday.config import CFG
 from friday.log import get
-from friday.registry import REGISTRY, Skill, SkillResult
+from friday.registry import DETACH, REGISTRY, Detach, Skill, SkillResult
 
 log = get(__name__)
 
@@ -53,6 +53,26 @@ def current_actor() -> str:
 
 class PermissionError_(Exception):
     """Raised when a call is refused by policy."""
+
+
+def _record_late_outcome(audit_id: int, skill_name: str, fut: Any, started: float) -> None:
+    """Phase 53: the worker thread of an abandoned step has now ended (`registry.Detach`): write its real outcome over the
+    "outcome unknown" marker of its audit row. Runs in that thread, once. Records the outcome only -- no undo entry is
+    registered (the run that would have reported the result is long gone, and an inverse nobody was told about is a surprise),
+    nothing is retried, and a row that has meanwhile been given any other text is still just overwritten with the truth."""
+    try:
+        if fut.cancelled():
+            return
+        elapsed = int((time.perf_counter() - started) * 1000)
+        exc = fut.exception()
+        if exc is not None:
+            audit.complete(audit_id, ok=False, error=str(exc), duration_ms=elapsed)
+        else:
+            result = SkillResult.coerce(fut.result())
+            audit.complete(audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed)
+        log.info("late outcome recorded for %s (audit %d)", skill_name, audit_id)
+    except Exception:
+        log.exception("could not record the late outcome of %s (audit %d)", skill_name, audit_id)
 
 
 def _record_action(skill_name: str, args: dict[str, Any], *, actor: str, status: str) -> None:
@@ -215,16 +235,26 @@ class Executor:
         started = time.perf_counter()
         actor_token = _CURRENT_ACTOR.set(actor)
         self._in_flight[audit_id] = skill.name
+        detach = Detach(lambda fut: _record_late_outcome(audit_id, skill.name, fut, started))
+        detach_token = DETACH.set(detach)
         try:
             result = await skill(**args)
         except asyncio.CancelledError:
             # Phase 28.0: the step was interrupted by a stop request (or the run's own timeout).
             # Close the audit row honestly -- started, not known to have finished -- instead of
             # leaving it open-ended, and let the cancellation keep propagating.
+            #
+            # Phase 53: a worker-thread skill cannot be interrupted -- it is abandoned, not stopped, and its side effect
+            # may still happen. Recording that as a failure (`ok=False`) was a claim nobody could back (found by driving
+            # a step timeout through plan.run: the audit said "failed" while the skill went on to finish). Its row is
+            # "outcome unknown" instead, and when the thread ends its real outcome replaces the marker.
             elapsed = int((time.perf_counter() - started) * 1000)
-            audit.complete(
-                audit_id, ok=False, error="interrupted before it finished (cancelled)", duration_ms=elapsed,
-            )
+            if detach.started:
+                audit.mark_outcome_unknown(audit_id, detached=True)
+            else:
+                audit.complete(
+                    audit_id, ok=False, error="interrupted before it finished (cancelled)", duration_ms=elapsed,
+                )
             _record_action(skill.name, args, actor=actor, status="cancelled")
             raise
         except Exception as exc:
@@ -236,6 +266,7 @@ class Executor:
             raise
         finally:
             self._in_flight.pop(audit_id, None)
+            DETACH.reset(detach_token)
             _CURRENT_ACTOR.reset(actor_token)
 
         elapsed = int((time.perf_counter() - started) * 1000)
