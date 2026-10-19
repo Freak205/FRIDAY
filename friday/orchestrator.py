@@ -28,7 +28,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
-from friday import auditview
+from friday import audit, auditview
 from friday.bus import BUS
 from friday.decision import (
     Decision,
@@ -160,6 +160,9 @@ class Observation:
     # state-changing / verification is off / it never executed. A FAILED verification also
     # turns `ok` False with error="postcondition_failed" (the tool said yes, the world says no).
     verification: Any = None
+    # Phase 54: the audit rows this step's call created (empty for a call that never reached the Executor, or a fake runner),
+    # so a step's recorded outcome can be found again after a restart. References only; the audit row holds the redacted data.
+    audit_ids: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -674,7 +677,7 @@ class Orchestrator:
         await BUS.publish("orchestrator.start", goal=goal, steps=len(steps), actor=self.actor)
 
         for step in steps:
-            obs, stop = await self._run_step(step, cancel_check=cancel_check)
+            obs, stop = await self._run_step_tracked(step, cancel_check=cancel_check)
             if obs.error != "cancelled_before_start":
                 observations.append(obs)
             if stop == "cancelled":
@@ -698,8 +701,13 @@ class Orchestrator:
         discovery_mode: bool = False,
         action_scope: GoalScope | None = None,
         coverage_goal: str | None = None,
+        checkpoint: Callable[[list[Observation]], None] | None = None,
     ) -> OrchestratorResult:
         """Ask a local LLM which tool to call next, one bounded step at a time.
+
+        `checkpoint` (Phase 54), when given, is called with the observations so far after every executed step has been
+        recorded -- so a caller can persist progress while the run is still going, not only when it ends. It must not raise
+        into the run: an exception is logged and ignored.
 
         `context` is an optional, already-bounded ambient snippet (e.g. a
         desktop-observer summary — see friday.skills.plan) shown to the
@@ -1390,10 +1398,15 @@ class Orchestrator:
                 subgoal=subgoals[subgoal_idx].description if subgoals else "",
                 expected_outcome=decision.expected_outcome,
             )
-            obs, stop = await self._run_step(step, cancel_check=cancel_check)
+            obs, stop = await self._run_step_tracked(step, cancel_check=cancel_check)
             if obs.error != "cancelled_before_start":
                 obs.fingerprint = fingerprint
                 observations.append(obs)
+                if checkpoint is not None:
+                    try:
+                        checkpoint(observations)
+                    except Exception:
+                        log.exception("orchestrator: checkpoint failed (ignored)")
             if stop == "cancelled" or (cancel_check is not None and cancel_check()):
                 # Phase 28.0: a stop request that landed while the step ran (or that cut it
                 # off) ends the goal HERE -- before the step is evaluated, replanned around
@@ -2255,6 +2268,17 @@ class Orchestrator:
         except asyncio.CancelledError:
             task.cancel()  # the whole run was cancelled/timed out: never leave the step running behind it
             raise
+
+    async def _run_step_tracked(
+        self, step: PlanStep, cancel_check: Callable[[], bool] | None = None,
+    ) -> tuple[Observation, StopReason | None]:
+        """`_run_step`, plus the audit ids the call recorded (Phase 54), read from the goal scope the caller runs in."""
+        ids = audit.scope_ids()
+        mark = len(ids) if ids is not None else 0
+        obs, stop = await self._run_step(step, cancel_check=cancel_check)
+        if ids is not None:
+            obs.audit_ids = list(ids[mark:])
+        return obs, stop
 
     async def _run_step(
         self, step: PlanStep, cancel_check: Callable[[], bool] | None = None,

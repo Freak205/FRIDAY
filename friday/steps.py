@@ -1,28 +1,35 @@
-"""Phase 53 -- where a multi-step goal actually stands, step by step, from evidence FRIDAY already holds.
+"""Where a multi-step goal actually stands, step by step -- live (Phase 53) and after a restart (Phase 54).
 
-A goal's run used to end in ONE flat string (every step's own words, or the planner's `done` summary) and one boolean. It could
-not say that step 2 failed while step 3 -- which the planner chose anyway -- succeeded; that step 4 was abandoned and may still
-happen; that step 5 never ran. Found by driving real `plan.run` goals: a failed write followed by a "send it" step ended as
-``ok=True``, "Created the folder, wrote the file and sent it." This module gives every executed step one honest state and builds the
-report from them. It stores nothing of its own: live runs read their `Observation`s, and a goal that no process is running any more
-is read back from the audit rows (`audit.goal_id`, owned by a session -- Phase 52), the one source of truth for what was started.
-
-Step states (what the user hears as Completed / Verified / Failed / Unknown / Not attempted / Needs input):
+A goal's run used to end in ONE flat string and one boolean. Every executed step now has one state, and the account of the goal is
+built from them:
 
   verified      the tool succeeded AND reading the real state back confirmed it (`friday.verify`)
   completed     the tool reported success; nothing was read back (a read, or an effect that cannot be checked)
   failed        the tool reported failure, or the read-back contradicted its success
-  unknown       the step started, was abandoned (timeout / stop) and may still take effect -- never retried, never "failed"
+  running       the step's audit row is open and its owning process is demonstrably alive (only ever seen after a restart)
+  unknown       the step started, was abandoned or cut off, and may still take effect -- never retried, never "failed"
   needs_input   the step did not run because it waits on the user (a declined or unavailable confirmation)
   not_attempted never ran (a subgoal the run stopped before)
 
-A failed step is *recovered* only if a LATER step of the same tool, or of the same kind of action (open->open), succeeded: that is
-the Phase 11.2 "fail once, adapt, finish" case. Anything else leaves the goal partial, and steps that ran after it are marked as such
-rather than vouched for -- FRIDAY cannot know which later step depended on which, only that something it needed did not happen.
+Persistence (Phase 54). `goals.progress` holds, per step, ONLY references and verdicts: order, tool name, state, the audit row ids
+that recorded it, the verification verdict with its check names, and the recovery flag -- never an argument, a result or a read-back
+value. What was touched and what happened live in the audit row (redacted when written, owned by a session -- Phase 52), the single
+source of truth for outcomes. `reconstruct` therefore never trusts a stored success on its own: it re-reads each step's audit row and
+keeps the stored state only if the row still agrees. A stored success with no row, or a row that disagrees, becomes *unknown*; a
+stored `verified` stays verified only while its verdict is stored AND the row says succeeded; a step that was in flight when the
+process died is found from the audit log even if it was never checkpointed. Nothing here executes, retries or undoes anything.
+
+Recovery. A failed READ is recovered by any later successful read of the same tool or kind (it changed nothing, and a different read
+can supply the information). A failed state change counts as *recovered* only if a LATER successful step pursued the same objective: the same tool on the same
+target (a retry), or another tool of the same kind of action on the same, non-empty target. A success against a different file, page
+or name proves nothing about the one that failed and leaves the goal partial. A call with nothing but content to identify it only
+matches an identical call. Decided live, when the arguments are at hand, and stored as a flag.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -32,12 +39,14 @@ from friday.log import get
 log = get(__name__)
 
 _NOTE_CHARS = 90
+_PROGRESS_VERSION = 1
 
 
 class StepState(str, Enum):
     VERIFIED = "verified"
     COMPLETED = "completed"
     FAILED = "failed"
+    RUNNING = "running"
     UNKNOWN = "unknown"
     NEEDS_INPUT = "needs_input"
     NOT_ATTEMPTED = "not_attempted"
@@ -51,9 +60,11 @@ class StepRecord:
     n: int
     tool: str
     state: StepState
-    note: str = ""              # the step's own (already redacted) words, short; empty for a success
+    note: str = ""              # the step's own (already redacted) words, short; empty for a success. Never persisted.
     recovered: bool = False     # a failed step a later step made good
     after_failure: bool = False  # a success that ran after an unrecovered failure: not vouched for
+    audit: list[int] = field(default_factory=list)   # audit rows that recorded this step
+    ver: dict[str, Any] | None = None                # {"status": ..., "checks": [[name, passed], ...]}: verdict, no values
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,10 +76,11 @@ class StepRecord:
 
 @dataclass(slots=True)
 class GoalReport:
-    outcome: str                 # complete | complete_unverified | partial | failed | unknown | needs_input | stopped
+    outcome: str     # complete | complete_unverified | partial | failed | unknown | needs_input | stopped | running
     steps: list[StepRecord] = field(default_factory=list)
     remaining: list[str] = field(default_factory=list)   # subgoals / parts of the request that never ran
     next_action: str = ""
+    notes: list[str] = field(default_factory=list)       # what could not be established (reconstruction only)
 
     @property
     def needs_account(self) -> bool:
@@ -81,6 +93,7 @@ class GoalReport:
             "steps": [s.to_dict() for s in self.steps],
             **({"remaining": self.remaining} if self.remaining else {}),
             **({"next": self.next_action} if self.next_action else {}),
+            **({"notes": self.notes} if self.notes else {}),
         }
 
     def tail(self) -> str:
@@ -104,6 +117,9 @@ class GoalReport:
         late = names(_OK_STATES, lambda s: s.after_failure)
         if late:
             parts.append(f"Ran after that failure, so I can't vouch for it: {late}.")
+        running = names((StepState.RUNNING,))
+        if running:
+            parts.append(f"Still running: {running}.")
         unknown = names((StepState.UNKNOWN,))
         if unknown:
             parts.append(f"Outcome unknown: {unknown}.")
@@ -114,6 +130,8 @@ class GoalReport:
             parts.append("Not attempted: " + "; ".join(self.remaining[:3]) + ".")
         if self.next_action:
             parts.append(self.next_action)
+        if self.notes:
+            parts.append("Limits of this account: " + "; ".join(self.notes[:3]) + ".")
         return " ".join(parts)
 
 
@@ -169,6 +187,59 @@ def classify(obs: Any) -> StepState | None:
     return StepState.FAILED
 
 
+# -- recovery: did a later success pursue the SAME objective? -------------------------------------------------------------------
+
+def _norm(mode: str, value: str) -> str:
+    v = " ".join(value.split())
+    if mode == "path":
+        return os.path.normcase(os.path.normpath(v))
+    return v.lower()
+
+
+def objective(tool: str, args: dict[str, Any] | None) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """What a call is aimed at, from the arguments that identify objects (`auditview.POLICY`: names, paths, URLs, short requests --
+    not bodies of content). ("target", pairs) when the call can be identified that way; ("raw", ...) when it cannot (an unclassified
+    tool, or a call with nothing but content), so only an identical call matches."""
+    from friday import auditview
+
+    args = args or {}
+    modes = auditview.POLICY.get(tool)
+    if modes is None:
+        return ("raw", (("args", json.dumps(args, sort_keys=True, default=str)),))
+    ident = tuple(sorted(
+        (k, _norm(modes[k], v)) for k, v in args.items()
+        if isinstance(v, str) and modes.get(k) in (auditview.KEEP, auditview.PATH, auditview.URL, auditview.INTENT, auditview.ARGV0)
+    ))
+    has_content = any(
+        isinstance(v, (str, list, dict)) and modes.get(k, auditview.OMIT) == auditview.OMIT for k, v in args.items()
+    )
+    if has_content and not ident:
+        return ("raw", (("args", json.dumps(args, sort_keys=True, default=str)),))
+    return ("target", ident)
+
+
+def same_objective(failed_tool: str, failed_args: dict, later_tool: str, later_args: dict) -> bool:
+    if not _changes_state(failed_tool, failed_args):
+        # A failed READ left the world as it was; any later read of the same tool or kind can supply what it was after
+        # (a rephrased search, the same file by another route). The strict test below is for failures of state changes.
+        return failed_tool == later_tool or _action_kind(failed_tool) == _action_kind(later_tool)
+    a, b = objective(failed_tool, failed_args), objective(later_tool, later_args)
+    if failed_tool == later_tool:
+        return a == b
+    # another tool: only the same kind of action on the same, non-empty target (e.g. write -> append on one file)
+    return (
+        a[0] == "target" == b[0] and bool(a[1]) and {v for _, v in a[1]} == {v for _, v in b[1]}
+        and _action_kind(failed_tool) == _action_kind(later_tool)
+    )
+
+
+def _verdict(obs: Any) -> dict[str, Any] | None:
+    v = getattr(obs, "verification", None)
+    if v is None:
+        return None
+    return {"status": v.status.value, "checks": [[c.name, c.passed] for c in v.checks]}
+
+
 def build_report(
     observations: list[Any], *, stopped: str, subgoals: list[Any] | None = None, extra_unknown: list[str] | None = None,
 ) -> GoalReport:
@@ -176,43 +247,61 @@ def build_report(
     supplies what was never reached; `extra_unknown` names steps known only from the audit log (one that was in flight when the
     whole run was cut off, so no Observation exists for it)."""
     steps: list[StepRecord] = []
+    calls: list[tuple[str, dict]] = []
     for o in observations:
         state = classify(o)
         if state is None:
             continue
         note = "" if state in _OK_STATES else _note(o.speech)
-        steps.append(StepRecord(len(steps) + 1, o.step.tool, state, note))
+        steps.append(StepRecord(
+            len(steps) + 1, o.step.tool, state, note, audit=list(getattr(o, "audit_ids", []) or []), ver=_verdict(o),
+        ))
+        calls.append((o.step.tool, dict(o.step.args or {})))
     for tool in extra_unknown or []:
         steps.append(StepRecord(len(steps) + 1, tool, StepState.UNKNOWN))
+        calls.append((tool, {}))
 
-    # recovery: a failure made good by a later success of the same tool or the same kind of action
-    first_unrecovered: int | None = None
     for i, s in enumerate(steps):
         if s.state is not StepState.FAILED:
             continue
-        later = [t for t in steps[i + 1:] if t.state in _OK_STATES]
-        if any(t.tool == s.tool or _action_kind(t.tool) == _action_kind(s.tool) for t in later):
-            s.recovered = True
-        elif first_unrecovered is None:
-            first_unrecovered = i
+        for j in range(i + 1, len(steps)):
+            t = steps[j]
+            if t.state in _OK_STATES and same_objective(s.tool, calls[i][1], t.tool, calls[j][1]):
+                s.recovered = True
+                break
+    return _finalize(steps, stopped, _remaining_of(subgoals))
+
+
+def _remaining_of(subgoals: list[Any] | None) -> list[str]:
+    remaining: list[str] = []
+    for sg in subgoals or []:
+        status = getattr(getattr(sg, "status", None), "value", getattr(sg, "status", ""))
+        if status == "pending":  # never started; a failed or active one was attempted and is in `steps`
+            remaining.append(_note(getattr(sg, "description", "")))
+    return remaining
+
+
+def _finalize(steps: list[StepRecord], stopped: str, remaining: list[str], notes: list[str] | None = None) -> GoalReport:
+    """The outcome, the flags on later steps and the next safe action, from step states alone (shared by a live run and a
+    reconstruction, so both say the same thing about the same steps)."""
+    first_unrecovered = next((i for i, s in enumerate(steps) if s.state is StepState.FAILED and not s.recovered), None)
+    for s in steps:
+        s.after_failure = False
     if first_unrecovered is not None:
         for t in steps[first_unrecovered + 1:]:
             if t.state in _OK_STATES and _changes_state(t.tool, None):
                 t.after_failure = True
 
-    remaining: list[str] = []
-    for sg in subgoals or []:
-        status = getattr(getattr(sg, "status", None), "value", "")
-        if status == "pending":  # never started; a failed or active one was attempted and is in `steps`
-            remaining.append(_note(getattr(sg, "description", "")))
-
     unrecovered = [s for s in steps if s.state is StepState.FAILED and not s.recovered]
     ok_steps = [s for s in steps if s.state in _OK_STATES]
     unknown = [s for s in steps if s.state is StepState.UNKNOWN]
     waiting = [s for s in steps if s.state is StepState.NEEDS_INPUT]
+    running = [s for s in steps if s.state is StepState.RUNNING]
 
     if unknown:
         outcome = "unknown"
+    elif running:
+        outcome = "running"
     elif waiting:
         outcome = "needs_input"
     elif stopped == "cancelled":
@@ -238,10 +327,40 @@ def build_report(
         next_action = "I can try the failed step again if you ask."
     if outcome in ("partial", "unknown", "needs_input", "failed") and stopped not in ("completed", "cancelled") and not remaining:
         remaining = ["the rest of the request"]
-    return GoalReport(outcome, steps, remaining, next_action)
+    return GoalReport(outcome, steps, remaining, next_action, list(notes or []))
 
 
-# -- the durable view: what the audit log says a goal did ---------------------------------------------------------------------
+# -- persistence --------------------------------------------------------------------------------------------------------------
+
+def progress_of(report: GoalReport, stopped: str) -> dict[str, Any]:
+    """What is stored for a goal: references and verdicts only (see the module docstring). No note, argument or result."""
+    return {
+        "v": _PROGRESS_VERSION,
+        "stopped": stopped,
+        "steps": [
+            {
+                "n": s.n, "tool": s.tool, "state": s.state.value, "audit": list(s.audit),
+                **({"ver": s.ver} if s.ver else {}),
+                **({"recovered": True} if s.recovered else {}),
+            }
+            for s in report.steps
+        ],
+    }
+
+
+def save_progress(goal_id: str | None, report: GoalReport, stopped: str) -> None:
+    """Checkpoint a goal's progress (best-effort: never allowed to break the run). Replaces, never appends."""
+    if not goal_id:
+        return
+    try:
+        from friday.intelligence import goals as goals_mod
+
+        goals_mod.set_progress(goal_id, progress_of(report, stopped))
+    except Exception:
+        log.exception("could not checkpoint goal progress (non-fatal)")
+
+
+# -- the durable view: what the audit log and the stored progress say a goal did ---------------------------------------------
 
 _AUDIT_STATE = {
     "succeeded": StepState.COMPLETED,
@@ -250,33 +369,177 @@ _AUDIT_STATE = {
     "denied": StepState.NEEDS_INPUT,
     "outcome_unknown": StepState.UNKNOWN,
     "interrupted": StepState.UNKNOWN,
-    "unfinished": StepState.UNKNOWN,
 }
 
 
-def ledger_for_goal(goal_id: str) -> list[StepRecord]:
-    """The steps a goal started, in order, from the audit log (never from memory): which it recorded, which failed, and which
-    have no recorded outcome. `unfinished` is reported as unknown: nothing says it finished. The goal's own `plan.run` row is
-    not a step."""
+def _audit_rows(goal_id: str) -> list[dict[str, Any]]:
     from friday import audit, store
 
     rows = store.conn().execute(
-        "SELECT * FROM audit WHERE goal_id=? AND skill != 'plan.run' ORDER BY id", (goal_id,)
+        "SELECT a.*, s.pid AS s_pid, s.proc_start AS s_start, s.host AS s_host FROM audit a "
+        "LEFT JOIN runtime_sessions s ON s.id = a.session_id WHERE a.goal_id=? AND a.skill != 'plan.run' ORDER BY a.id",
+        (goal_id,),
     ).fetchall()
-    out: list[StepRecord] = []
+    out = []
     for r in rows:
-        row = dict(r)
-        state = _AUDIT_STATE.get(audit.status_of(row), StepState.UNKNOWN)
-        out.append(StepRecord(len(out) + 1, row["skill"], state))
+        d = dict(r)
+        d["status"] = audit.status_of(d)
+        out.append(d)
     return out
+
+
+def _row_state(row: dict[str, Any], probe: Any) -> StepState:
+    """The state an audit row alone supports. An open row is `running` only if its owner is demonstrably alive."""
+    from friday import owner
+
+    state = _AUDIT_STATE.get(row["status"])
+    if state is not None:
+        return state
+    if row.get("session_id") and row.get("s_pid") is not None:  # unfinished
+        try:
+            if probe(row["s_pid"], row["s_start"], row["s_host"]) == owner.ALIVE:
+                return StepState.RUNNING
+        except Exception:  # noqa: BLE001
+            pass
+    return StepState.UNKNOWN
+
+
+def ledger_for_goal(goal_id: str, probe: Any = None) -> list[StepRecord]:
+    """The steps a goal started, in order, from the audit log alone: which succeeded, which failed, which have no recorded outcome
+    (`running` only when the owner is demonstrably alive, otherwise unknown). The goal's own `plan.run` row is not a step."""
+    from friday import owner
+
+    probe = probe or owner.probe
+    return [StepRecord(i + 1, r["skill"], _row_state(r, probe), audit=[r["id"]]) for i, r in enumerate(_audit_rows(goal_id))]
+
+
+def _merge(stored: StepState, row_state: StepState | None, ver: dict | None) -> tuple[StepState, str]:
+    """Reconcile a stored state with what its audit row says now. The row decides what happened; the stored state can only
+    confirm it, or supply what the row cannot (`verified`). Disagreement is never resolved in favour of success."""
+    if row_state is None:                      # references a row that is gone
+        if stored in _OK_STATES:
+            return StepState.UNKNOWN, "its audit record is no longer available, so a stored success cannot be confirmed"
+        return stored, ""
+    if row_state in _OK_STATES:                # row: succeeded
+        if stored in (StepState.COMPLETED, StepState.VERIFIED, StepState.UNKNOWN, StepState.RUNNING):
+            if stored is StepState.VERIFIED:
+                ok = bool(ver) and ver.get("status") == "verified" and all(c[1] is True for c in ver.get("checks", []))
+                return (StepState.VERIFIED, "") if ok else (StepState.COMPLETED, "its verification evidence is no longer available")
+            return StepState.COMPLETED, ""
+        return StepState.UNKNOWN, "the stored outcome and the audit record disagree"
+    if row_state is StepState.FAILED:
+        if stored in (StepState.FAILED, StepState.UNKNOWN, StepState.RUNNING):
+            return StepState.FAILED, ""
+        return StepState.UNKNOWN, "the stored outcome and the audit record disagree"
+    if row_state is StepState.NEEDS_INPUT:
+        if stored is StepState.NEEDS_INPUT:
+            return StepState.NEEDS_INPUT, ""
+        return StepState.UNKNOWN, "the stored outcome and the audit record disagree"
+    return row_state, ""                       # row: running / unknown
+
+
+def reconstruct(goal_id: str, probe: Any = None, *, stopped: str | None = None) -> GoalReport | None:
+    """Rebuild a goal's step account from what is stored, WITHOUT running anything: the checkpointed progress (if any), every audit
+    row of the goal (the source of truth for outcomes, including a step that was in flight and never checkpointed), the saved
+    subgoal statuses (what never started) and Phase 52 ownership (is an open row's process alive?). Read-only and idempotent.
+    None if the goal does not exist."""
+    from friday import owner
+    from friday.intelligence import goals as goals_mod
+
+    probe = probe or owner.probe
+    goal = goals_mod.get(goal_id)
+    if goal is None:
+        return None
+    rows = _audit_rows(goal_id)
+    by_id = {r["id"]: r for r in rows}
+    progress = goal.progress if isinstance(goal.progress, dict) else {}
+    notes: list[str] = []
+    steps: list[StepRecord] = []
+    seen: set[int] = set()
+
+    for p in progress.get("steps", []):
+        try:
+            stored = StepState(p.get("state"))
+        except ValueError:
+            stored = StepState.UNKNOWN
+        ids = [i for i in p.get("audit", []) if isinstance(i, int)]
+        found = [by_id[i] for i in ids if i in by_id]
+        seen.update(ids)
+        if found:
+            row_state: StepState | None = _row_state(found[-1], probe)
+        elif ids:
+            row_state = None
+        else:                                  # never reached the Executor: nothing to contradict the stored state
+            row_state = stored if stored in (StepState.FAILED, StepState.NEEDS_INPUT, StepState.NOT_ATTEMPTED) else None
+        state, why = _merge(stored, row_state, p.get("ver"))
+        if not ids and stored in _OK_STATES:
+            state, why = StepState.UNKNOWN, "no audit record was ever linked to a stored success"
+        if why:
+            notes.append(f"step {p.get('n')} ('{p.get('tool')}'): {why}")
+        note = ""
+        if state is StepState.FAILED and found:
+            note = _note(found[-1].get("error") or found[-1].get("result") or "")
+        steps.append(StepRecord(
+            len(steps) + 1, str(p.get("tool", "?")), state, note, recovered=bool(p.get("recovered")) and state is StepState.FAILED,
+            audit=ids, ver=p.get("ver") if state is StepState.VERIFIED else None,
+        ))
+    for r in rows:                             # started but never checkpointed (the process died around it)
+        if r["id"] in seen:
+            continue
+        steps.append(StepRecord(len(steps) + 1, r["skill"], _row_state(r, probe), audit=[r["id"]]))
+        notes.append(f"step {len(steps)} ('{r['skill']}') was found only in the audit log")
+    if not progress and rows:
+        notes = ["no step progress was checkpointed; this account comes from the audit log alone"]
+
+    stop = stopped if stopped is not None else str(progress.get("stopped") or "")
+    remaining = _remaining_of(goal.subgoals)
+    if not remaining and goal.status.value in ("running", "partial", "failed") and stop != "completed" and (steps or progress):
+        remaining = ["the rest of the request"]
+    return _finalize(steps, stop or "interrupted", remaining, notes)
+
+
+def refresh_goals(probe: Any = None) -> int:
+    """Bring the stored progress of partial / failed goals up to date with the audit log: a step recorded as unknown whose real
+    outcome has since landed (an abandoned thread that finished) becomes that outcome; a stored success whose record has gone
+    becomes unknown. Rewrites `progress` only when it actually differs, so running it again changes nothing and history never
+    grows. Status and reason are left to the run that wrote them. Returns how many goals changed."""
+    from friday import owner, store
+    from friday.intelligence import goals as goals_mod
+
+    probe = probe or owner.probe
+    c = store.conn()
+    changed = 0
+    ids = [r["id"] for r in c.execute(
+        "SELECT id FROM goals WHERE status IN (?,?) AND progress IS NOT NULL",
+        (goals_mod.GoalStatus.PARTIAL.value, goals_mod.GoalStatus.FAILED.value),
+    ).fetchall()]
+    for gid in ids:
+        goal = goals_mod.get(gid)
+        report = reconstruct(gid, probe)
+        if goal is None or report is None:
+            continue
+        stored = goal.progress or {}
+        fresh = progress_of(report, str(stored.get("stopped") or ""))
+        if _steps_view(fresh) != _steps_view(stored):
+            goals_mod.set_progress(gid, fresh)
+            changed += 1
+    if changed:
+        log.info("%d goal(s) had their stored step progress brought up to date from the audit log", changed)
+    return changed
+
+
+def _steps_view(progress: dict) -> list[tuple]:
+    return [(s.get("tool"), s.get("state"), tuple(s.get("audit", [])), bool(s.get("recovered")),
+             json.dumps(s.get("ver"), sort_keys=True)) for s in progress.get("steps", [])]
 
 
 def settle_interrupted_goals(probe: Any = None) -> int:
     """A goal still marked `running` whose steps were started by a process that provably no longer exists was cut off: nothing
-    is running it. Mark it `partial` (some step recorded a success) or `failed`, with the step account as the reason, so a later
-    "what happened with that?" is answered from evidence instead of a goal that looks alive forever. Nothing is resumed, retried
-    or undone. A goal with no recorded step has no known owner and is left alone; so is one whose last step's owner is alive or
-    cannot be checked. The update repeats `status='running'`, so a goal that finished meanwhile is never overwritten."""
+    is running it. Rebuild its account (`reconstruct`) and mark it `partial` (some step succeeded) or `failed`, with that account as
+    the reason and the rebuilt progress stored, so a later "what happened with that?" is answered from evidence instead of a goal
+    that looks alive forever. Nothing is resumed, retried or undone. A goal with no recorded step has no known owner and is left
+    alone; so is one whose last step's owner is alive or cannot be checked. The update repeats `status='running'`, so a goal that
+    finished meanwhile is never overwritten, and a settled goal is never settled twice."""
     from friday import owner, store
     from friday.intelligence import goals as goals_mod
 
@@ -297,18 +560,17 @@ def settle_interrupted_goals(probe: Any = None) -> int:
             continue
         if verdict != owner.DEAD:
             continue
-        steps = ledger_for_goal(gid)
-        report = GoalReport(
-            "unknown" if any(s.state is StepState.UNKNOWN for s in steps) else "partial", steps,
-            ["the rest of the request"],
-        )
-        did = sum(1 for s in steps if s.state in _OK_STATES)
+        report = reconstruct(gid, probe, stopped="interrupted")
+        if report is None:
+            continue
+        did = sum(1 for s in report.steps if s.state in _OK_STATES)
         status = goals_mod.GoalStatus.PARTIAL if did else goals_mod.GoalStatus.FAILED
         reason = ("interrupted: the process running this goal ended before it finished; nothing was retried or resumed. "
                   + report.tail())[:600]
         cur = c.execute(
-            "UPDATE goals SET status=?, updated_at=?, failure_reason=?, current_step=? WHERE id=? AND status=?",
-            (status.value, store.now(), reason, len(steps), gid, goals_mod.GoalStatus.RUNNING.value),
+            "UPDATE goals SET status=?, updated_at=?, failure_reason=?, current_step=?, progress=? WHERE id=? AND status=?",
+            (status.value, store.now(), reason, len(report.steps),
+             json.dumps(progress_of(report, "interrupted"), sort_keys=True), gid, goals_mod.GoalStatus.RUNNING.value),
         )
         c.commit()
         settled += int(cur.rowcount or 0)

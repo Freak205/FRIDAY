@@ -188,6 +188,9 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("audit", "session_id", "ALTER TABLE audit ADD COLUMN session_id TEXT"),
     # Phase 53: which multi-step goal (goals.id) an action ran for. NULL = a direct, single-skill call or an older row.
     ("audit", "goal_id", "ALTER TABLE audit ADD COLUMN goal_id TEXT"),
+    # Phase 54: the checkpointed step progress of a goal (friday.steps): states, audit-row references, verification
+    # verdicts. JSON; NULL = none recorded (every older goal). Holds no arguments, results or content.
+    ("goals", "progress", "ALTER TABLE goals ADD COLUMN progress TEXT"),
 ]
 
 # Applied after the column migrations (an index on a column an old database does not have yet would fail before them).

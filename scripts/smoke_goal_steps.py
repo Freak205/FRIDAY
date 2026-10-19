@@ -33,7 +33,7 @@ import iso_env  # noqa: E402
 import phase21_common as H  # noqa: E402
 from phase21_common import ScriptedPlanner, call, check, done, finish, scenario, scripted_provider  # noqa: E402
 
-from friday import audit, owner, steps, store, verify  # noqa: E402
+from friday import audit, auditview, owner, steps, store, verify  # noqa: E402
 from friday.config import CFG  # noqa: E402
 from friday.intelligence import goals as goals_mod  # noqa: E402
 from friday.intelligence.state import INTEL  # noqa: E402
@@ -104,6 +104,8 @@ def stopper() -> SkillResult:
     return SkillResult(speech="Did the second thing.")
 
 
+for _t in ("test.g_mkdir", "test.g_write", "test.g_send", "test.g_slow"):
+    auditview.POLICY[_t] = {"name": auditview.KEEP, "text": auditview.OMIT}
 for _tool in ("test.g_mkdir", "test.g_write", "test.g_send"):
     verify.register(_tool, verify.Verifier(lambda a, d, b: [verify.Check("fixture effect", True, "it ran", "it ran")]))
 
@@ -246,11 +248,17 @@ def section_a() -> None:
     REGISTRY.get("test.g_write").fn = flaky  # type: ignore[misc]
     WORLD.clear()
     try:
-        r = run_plan(GOAL, [call("test.g_mkdir"), call("test.g_write", {"name": "a"}), call("test.g_write", {"name": "b"}),
+        r = run_plan(GOAL, [call("test.g_mkdir"), call("test.g_write", {"name": "a"}), call("test.g_write", {"name": "a", "text": "retry"}),
                             call("test.g_send"), done("Created, wrote and sent it.")])
-        check("A'4 a failure a later step of the same tool made good is reported as recovered (Phase 11.2 behaviour kept)",
+        check("A'4 a failure made good by a later success of the same tool on the SAME target is recovered (Phase 11.2 retry kept)",
               r.ok and r.data["report"]["outcome"] in ("complete", "complete_unverified")
               and r.data["report"]["steps"][1].get("recovered") is True, str(r.data["report"]) + r.speech)
+        first["n"] = 0
+        r = run_plan(GOAL, [call("test.g_mkdir"), call("test.g_write", {"name": "a"}), call("test.g_write", {"name": "b"}),
+                            call("test.g_send"), done("Created, wrote and sent it.")])
+        check("A'5 (Phase 54) a success against a DIFFERENT target does not make the failed one good: partial, not ok",
+              r.ok is False and r.data["report"]["outcome"] == "partial"
+              and not r.data["report"]["steps"][1].get("recovered") and "Failed: 'test.g_write'" in r.speech, str(r.data["report"]) + r.speech)
     finally:
         REGISTRY.get("test.g_write").fn = real_write  # type: ignore[misc]
     WORLD.clear()

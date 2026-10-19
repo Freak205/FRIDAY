@@ -257,6 +257,8 @@ class Goal:
     # goal classified DIRECT_ACTION (the common case) or persisted before
     # this phase (old rows have no `goal_contract` column value).
     contract: GoalContract = field(default_factory=GoalContract)
+    # Phase 54: the checkpointed step progress (`friday.steps.progress_of`); {} = none recorded.
+    progress: dict = field(default_factory=dict)
 
     @staticmethod
     def from_row(row) -> "Goal":
@@ -265,6 +267,11 @@ class Goal:
         current_subgoal_index = row["current_subgoal_index"] if "current_subgoal_index" in row.keys() else 0
         raw_contract = row["goal_contract"] if "goal_contract" in row.keys() else None
         contract = GoalContract.from_dict(json.loads(raw_contract)) if raw_contract else GoalContract()
+        raw_progress = row["progress"] if "progress" in row.keys() else None
+        try:
+            progress = json.loads(raw_progress) if raw_progress else {}
+        except ValueError:
+            progress = {}
         return Goal(
             id=row["id"],
             created_at=row["created_at"],
@@ -279,6 +286,7 @@ class Goal:
             subgoals=subgoals,
             current_subgoal_index=current_subgoal_index or 0,
             contract=contract,
+            progress=progress if isinstance(progress, dict) else {},
         )
 
     # -- bounded subgoal accessors (Phase 11.2) ------------------------------
@@ -383,6 +391,19 @@ def set_contract(goal_id: str | None, contract: GoalContract) -> None:
     c.execute(
         "UPDATE goals SET goal_contract=?, updated_at=? WHERE id=?",
         (json.dumps(contract.to_dict(), ensure_ascii=False), store.now(), goal_id),
+    )
+    c.commit()
+
+
+def set_progress(goal_id: str | None, progress: dict) -> None:
+    """Persist the step progress of a goal (Phase 54), replacing what was there -- never appending, so repeating it with the same
+    progress changes nothing. Best-effort by the same convention as `set_subgoals`."""
+    if not goal_id:
+        return
+    c = store.conn()
+    c.execute(
+        "UPDATE goals SET progress=?, updated_at=? WHERE id=?",
+        (json.dumps(progress, ensure_ascii=False, sort_keys=True), store.now(), goal_id),
     )
     c.commit()
 

@@ -526,7 +526,8 @@ async def section_g_false_success() -> None:
     reset()
     planner = ScriptedPlanner([call("test.dp_read"), done("Service is running.")])
     with scripted_provider(planner):
-        r = await EXECUTOR.run("plan.run", {"goal": "open the quarterly numbers for me"}, actor="text")
+        # a READ request: "open ..." is a direct action since Phase 31, so a read-only run is (rightly) not a completion
+        r = await EXECUTOR.run("plan.run", {"goal": "read the quarterly numbers for me"}, actor="text")
     check("positive control: an evidence-backed completion is verified=True with no caveat in the speech",
           r.data.get("verified") is True and "unverified" not in r.speech.lower(), "PASS", f"{r.data.get('verified')} {r.speech}")
 

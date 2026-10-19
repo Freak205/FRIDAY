@@ -28,15 +28,25 @@ _ECHO_CAP = 256
 # Phase 53: the multi-step goal (goals.id) the calls made inside `goal_scope` belong to. Read by `record`, so every audited
 # step of a goal names it without any skill or the Executor having to pass it around.
 _CURRENT_GOAL: contextvars.ContextVar[str | None] = contextvars.ContextVar("_CURRENT_GOAL", default=None)
+# Phase 54: the audit ids written inside the current `goal_scope`, in order (a step reads the ones its own call created).
+_SCOPE_IDS: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar("_SCOPE_IDS", default=None)
 
 
 @contextlib.contextmanager
-def goal_scope(goal_id: str | None) -> Iterator[None]:
+def goal_scope(goal_id: str | None) -> Iterator[list[int]]:
+    ids: list[int] = []
     token = _CURRENT_GOAL.set(goal_id or None)
+    ids_token = _SCOPE_IDS.set(ids)
     try:
-        yield
+        yield ids
     finally:
+        _SCOPE_IDS.reset(ids_token)
         _CURRENT_GOAL.reset(token)
+
+
+def scope_ids() -> list[int] | None:
+    """The live list of audit ids recorded in the current goal scope, or None outside one."""
+    return _SCOPE_IDS.get()
 
 
 # The decisions that mean the skill was (or is about to be) started. Only these rows can be left open; a denied/blocked row
@@ -83,6 +93,9 @@ def record(
         c.rollback()
         raise
     audit_id = int(cur.lastrowid)
+    scope = _SCOPE_IDS.get()
+    if scope is not None:
+        scope.append(audit_id)
     values = auditview.content_values(skill, args)
     if values:
         with _echo_lock:
@@ -204,6 +217,7 @@ def start_session(kind: str) -> None:
         from friday import steps
 
         steps.settle_interrupted_goals()
+        steps.refresh_goals()
     except Exception:
         log.exception("goal settlement failed; continuing")
 

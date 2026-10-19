@@ -82,7 +82,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Annotated
 
-from friday import audit, steps
+from friday import audit, auditview, steps
 from friday.config import CFG
 from friday.log import get
 from friday.orchestrator import NOT_EXECUTED_ERRORS, Orchestrator
@@ -291,6 +291,7 @@ async def run(
                     # Phase 21.0: goal coverage is judged against the user's own words (an
                     # expansion's planner goal is a composed sentence, not a request).
                     coverage_goal="" if expanded else goal,
+                    checkpoint=_checkpointer(goal_id, subgoals),
                 ),
                 timeout=CFG.planner.total_timeout_s,
             )
@@ -301,6 +302,7 @@ async def run(
         # Phase 53: the step in flight when the whole run was cut off has no Observation; the audit log has it.
         in_flight = _unknown_from_audit(goal_id)
         report = steps.build_report(observations, stopped="timeout", subgoals=subgoals, extra_unknown=in_flight)
+        steps.save_progress(goal_id, report, "timeout")
         _finish_goal(
             goal_id, goal, context, observations, "timeout", ok=False, duration_ms=duration_ms, contract=contract,
             report=report,
@@ -324,10 +326,7 @@ async def run(
                 "goal_id": goal_id,
                 "report": report.to_dict(),
                 "steps": [
-                    {
-                        "tool": o.step.tool, "args": o.step.args, "ok": o.ok,
-                        "speech": o.speech, "error": o.error,
-                    }
+                    _public_step(o)
                     for o in observations
                 ],
             },
@@ -346,6 +345,7 @@ async def run(
         _save_subgoals(goal_id, subgoals, current_index=result.subgoal_index)
 
     if result.stopped == "planning_failed":
+        steps.save_progress(goal_id, steps.build_report(result.observations, stopped=result.stopped, subgoals=subgoals), result.stopped)
         _finish_goal(goal_id, goal, context, result.observations, result.stopped, ok=False, duration_ms=duration_ms, contract=contract)
         # Phase 15.0: found on the real machine, not by inspection — a small
         # local model can stall on a LATER decision (e.g. the final "done")
@@ -378,10 +378,7 @@ async def run(
                 "goal_id": goal_id,
                 "report": steps.build_report(result.observations, stopped=result.stopped, subgoals=subgoals).to_dict(),
                 "steps": [
-                    {
-                        "tool": o.step.tool, "args": o.step.args, "ok": o.ok,
-                        "speech": o.speech, "error": o.error,
-                    }
+                    _public_step(o)
                     for o in result.observations
                 ],
                 **_invalid_decision_data(result),
@@ -396,6 +393,7 @@ async def run(
     # unknown, not failed; what never ran is said so.
     report = steps.build_report(result.observations, stopped=result.stopped, subgoals=subgoals)
     unresolved = result.stopped == "completed" and report.needs_account
+    steps.save_progress(goal_id, report, result.stopped)
     _finish_goal(
         goal_id, goal, context, result.observations, result.stopped, ok=result.ok and not unresolved,
         duration_ms=duration_ms, contract=contract, verification=gv, report=report,
@@ -443,11 +441,7 @@ async def run(
             "report": report.to_dict(),
             **({"verification": gv.to_dict()} if gv is not None and gv.status != "not_applicable" else {}),
             "steps": [
-                {
-                    "tool": o.step.tool, "args": o.step.args, "ok": o.ok,
-                    "speech": o.speech, "error": o.error,
-                    **({"verification": o.verification.status.value} if o.verification is not None else {}),
-                }
+                _public_step(o, with_verification=True)
                 for o in result.observations
             ],
             **_invalid_decision_data(result),
@@ -511,7 +505,7 @@ def _intent_data(result: "OrchestratorResult", scope: "GoalScope | None") -> dic
     if scope is None:
         return {}
     rejected = [
-        {"tool": o.step.tool, "args": o.step.args, "action_class": o.data.get("action_class", "")}
+        {"tool": o.step.tool, "args": auditview.sanitize_args(o.step.tool, o.step.args), "action_class": o.data.get("action_class", "")}
         for o in result.observations if o.error == "intent_mismatch"
     ]
     return {"intent": {"scope": scope.to_dict(), "rejected": rejected}}
@@ -877,7 +871,7 @@ def _finish_discovery_only(
                 for o in result.observations
             ],
             "steps": [
-                {"tool": o.step.tool, "args": o.step.args, "ok": o.ok, "speech": o.speech, "error": o.error}
+                _public_step(o)
                 for o in result.observations
             ],
             **_invalid_decision_data(result),
@@ -975,12 +969,35 @@ def _append_experience(goal: str, context: str) -> str:
         return context
 
 
+def _public_step(o, *, with_verification: bool = False) -> dict:
+    """One executed step as `data.steps` exposes it. The arguments are the redacted form the audit log keeps (what was touched,
+    never a body of content): `data` goes to every client of the daemon, and the raw arguments of a step can be the text of a
+    message or a file. Everything else is as before."""
+    return {
+        "tool": o.step.tool, "args": auditview.sanitize_args(o.step.tool, o.step.args), "ok": o.ok,
+        "speech": o.speech, "error": o.error,
+        **({"verification": o.verification.status.value} if with_verification and o.verification is not None else {}),
+    }
+
+
+def _checkpointer(goal_id: str | None, subgoals):
+    """The per-step checkpoint `run_goal` calls: the goal's step progress and subgoal statuses as of now (Phase 54), so a restart
+    finds them. Best-effort."""
+    def checkpoint(observations) -> None:
+        steps.save_progress(goal_id, steps.build_report(observations, stopped="running", subgoals=subgoals), "running")
+        if subgoals:
+            _save_subgoals(goal_id, subgoals)
+
+    return checkpoint
+
+
 def _unknown_from_audit(goal_id: str | None) -> list[str]:
-    """Tools of this goal's steps whose audit row says the outcome is unknown (abandoned while running)."""
+    """Tools of this goal's steps with no recorded outcome (abandoned while running, or still going): the whole run was cut off, so
+    either way they may still take effect."""
     if not goal_id:
         return []
     try:
-        return [s.tool for s in steps.ledger_for_goal(goal_id) if s.state is steps.StepState.UNKNOWN]
+        return [s.tool for s in steps.ledger_for_goal(goal_id) if s.state in (steps.StepState.UNKNOWN, steps.StepState.RUNNING)]
     except Exception:
         log.exception("plan.run: could not read the goal's steps from the audit log (non-fatal)")
         return []
