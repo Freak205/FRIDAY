@@ -890,15 +890,41 @@ def check_alignment(
     return Alignment(False, cls, "mismatch", reason)
 
 
+def _never_aligned(scope: GoalScope, tool: str, tier: str) -> bool:
+    """Phase 59: is EVERY valid call of `tool` certain to be rejected by `check_alignment` for this scope? Only the one rule that can
+    reject a whole tool at once: a tool whose single class is a TARGETED one the goal allows ("turn the volume down" allows a
+    system change) is still refused unless the goal is about the tool's own domain (`_target_relevant`). With no text-valued parameter
+    (nothing a call could carry that names the goal's subject) that test reduces to the tool's domain words against the goal's words,
+    so the answer is the same for every call -- system.lock, system.shutdown-style tools and the brightness / wifi toggles for a volume
+    goal. Anything else (a click/key rule tool, a tool that takes text, an unknown domain, a passive tool, a class the goal only
+    supports) is NOT decided here: False means "not certain", never "allowed"."""
+    from friday.registry import REGISTRY
+
+    res = _resolve(tool, tier)
+    if isinstance(res, ActionRule) or res in PASSIVE or res not in _TARGETED_CLASSES or res not in scope.allowed:
+        return False
+    sk = REGISTRY.get(tool)
+    if sk is None or _known_domain(tool) is None:
+        return False
+    if any(getattr(p.type, "__name__", "") not in ("int", "float", "bool") for p in sk.params):
+        return False  # a text (or untyped) argument could name the goal's subject
+    return not (_words(scope.goal) & _domain_words(tool))
+
+
 def offered_for(scope: GoalScope | None, names_and_tiers: Iterable[tuple[str, str]]) -> set[str]:
     """Tool names worth showing the planner for this scope: any tool with at least one
-    possible action class the scope could authorize. A pure prompt-shaping aid — the
-    per-call `check_alignment` remains the authority."""
-    names = [n for n, _ in names_and_tiers]
+    possible action class the scope could authorize, less (Phase 59) a tool every one of
+    whose valid calls `check_alignment` is certain to refuse (`_never_aligned`). A pure
+    prompt-shaping aid -- the per-call `check_alignment` remains the authority, and what it
+    would allow is never hidden. No scope = every tool."""
+    names_and_tiers = list(names_and_tiers)
     if scope is None:
-        return set(names)
+        return {n for n, _ in names_and_tiers}
     reachable = PASSIVE | scope.allowed | scope.supporting
-    return {n for n, tier in names_and_tiers if possible_classes(n, tier_hint=tier) & reachable}
+    return {
+        n for n, tier in names_and_tiers
+        if possible_classes(n, tier_hint=tier) & reachable and not _never_aligned(scope, n, tier)
+    }
 
 
 # -- normalized call identity, for the repeat guard --------------------------------------
