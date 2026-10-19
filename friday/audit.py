@@ -82,6 +82,12 @@ OUTCOME_UNKNOWN = (
 )
 
 
+def is_outcome_unknown(row: dict[str, Any]) -> bool:
+    """Phase 49: is this audit row (as `recent` returns it) one that `mark_outcome_unknown` marked, and that nothing has
+    since given a real outcome? The marker must match exactly, so a genuine error that merely mentions the words is not it."""
+    return row.get("ok") is None and row.get("error") == OUTCOME_UNKNOWN
+
+
 def mark_outcome_unknown(audit_id: int) -> bool:
     """Mark a row that started (an `auto`/`confirmed` decision) and has no outcome at all as "outcome unknown".
     True only if it changed something. It never touches a row that already has an outcome or any text, nor one that never

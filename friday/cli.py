@@ -485,13 +485,16 @@ def _audit_table(limit: int) -> None:
 
     for r in reversed(rows):
         ok = "" if r["ok"] is None else ("[green]✓[/green]" if r["ok"] else "[red]✗[/red]")
+        text = (r["result"] or r["error"] or "")[:50]
+        if audit.is_outcome_unknown(r):  # Phase 49: neither a tick nor a cross, and not cut off mid-sentence
+            ok, text = "[yellow]?[/yellow]", "outcome unknown: FRIDAY closed while it ran"
         table.add_row(
             r["at"][:19].replace("T", " "),
             r["skill"],
             r["actor"],
             r["decision"],
             ok,
-            (r["result"] or r["error"] or "")[:50],
+            text,
         )
     con.print()
     con.print(table)
