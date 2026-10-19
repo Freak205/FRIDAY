@@ -120,23 +120,34 @@ def _mic_activate() -> None:
 
 
 def _quit(app: QApplication, backend: Backend, hub: GuiStateHub, window: MainWindow, tray: Any) -> None:
+    """Tray-Quit handler. The steps are independent, so each is attempted even if an earlier one raised (a Qt slot
+    that raises is only printed: without this, one failure left the lock held, the backend running and the app open).
+    A failure is logged with its step name; it does not claim anything stopped. Order is unchanged; `app.quit()` is last."""
     log.info("shutting down FRIDAY GUI")
-    window.shutdown()
-    if _conversation_loop is not None:
-        _conversation_loop.stop()
-    if CFG.voice.enabled:
-        try:
-            from friday.voice.capture import shutdown_mic_streams
 
-            shutdown_mic_streams()
+    def _stop_mic() -> None:
+        from friday.voice.capture import shutdown_mic_streams
+
+        shutdown_mic_streams()
+
+    steps: list[tuple[str, Any]] = [("window", window.shutdown)]
+    if _conversation_loop is not None:
+        steps.append(("voice loop", _conversation_loop.stop))
+    if CFG.voice.enabled:
+        steps.append(("mic streams", _stop_mic))
+    steps += [
+        ("hotkeys", HOTKEYS.stop),
+        ("state hub", hub.stop),
+        ("backend", backend.shutdown),
+        ("tray", tray.hide),
+        ("single-instance lock", single_instance.release),
+        ("app quit", app.quit),
+    ]
+    for name, step in steps:
+        try:
+            step()
         except Exception:
-            log.exception("mic stream shutdown failed (non-fatal)")
-    HOTKEYS.stop()
-    hub.stop()
-    backend.shutdown()
-    tray.hide()
-    single_instance.release()
-    app.quit()
+            log.exception("shutdown step failed: %s (continuing with the rest)", name)
 
 
 def run() -> None:

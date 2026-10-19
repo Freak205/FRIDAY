@@ -112,6 +112,7 @@ runs while the guard is held and is released last (also if the hook raises). (3)
 `TtsBackendError` was caught; it now runs whenever speech was attempted and any TTS error is logged, never raised. Not guaranteed:
 the busy check / acquire pair is still not atomic (a wake word can at worst be dropped or one cycle lost the race). Tests:
 `scripts/smoke_voice_late.py` (38); `smoke_voice_conversation.py` (102) and `smoke_voice_pipeline.py` (76, isolated) still pass.
+**Phase 45 (done):** `gui/app.py::_quit` ran its nine cleanup steps in a row with no guard, and a Qt slot that raises is only printed - reproduced with fakes: a failure at any step (window geometry save, voice loop, hotkeys, state hub, backend, tray, lock) skipped every later one, leaving the single-instance lock held, the backend loop running and `app.quit()` never called. The steps are now a list run in the same order, each in its own try/except that logs `shutdown step failed: <name>` with the traceback and goes on; `app.quit()` stays last. Nothing new waits, so it cannot hang; the steps were already safe to repeat. A failure is logged, not claimed as a stop - a step that returns is not proof a worker exited (`backend.shutdown` only asks the loop to stop). Test: `scripts/smoke_shutdown.py` (21; 5/21 before the fix). Not covered: a real tray Quit in a live GUI.
 Still open: the known "how do I get on the network at home"
 recall case (matcher: `network.status` 0.79 > `memory.recall` 0.69, identical at Phase 37).
 
