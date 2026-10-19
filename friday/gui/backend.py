@@ -112,12 +112,22 @@ class Backend:
         log.info("gui backend ready — %d skills", len(REGISTRY))
         self.ready.set()
 
+    # Phase 47: how long, at most, the loop keeps running after a quit so work already in flight can be recorded.
+    SHUTDOWN_DRAIN_S = 5.0
+
+    @property
+    def shutdown_requested(self) -> bool:
+        return self._shutdown_requested
+
     def shutdown(self) -> None:
         """Ask the backend to wind down; returns at once and never waits (it runs on the GUI thread).
 
         On the loop it stops what `_boot` started -- the trigger watcher and the scheduler, as the headless daemon does --
-        and then stops the loop. A request already running is not cancelled (that would cut a step in half). Only
-        `stopped` (set when the loop thread ends) says it has finished; this call returning does not."""
+        raises the existing STOP flag (a goal starts no further step), gives work already in flight up to
+        `SHUTDOWN_DRAIN_S` to finish and be recorded, and then stops the loop. A request already running is not
+        cancelled (that would cut a step in half), and a skill in a worker thread cannot be interrupted at all: if it
+        outlasts the bound it is left running with its audit row open. Only `stopped` (set when the loop thread ends)
+        says the backend has finished; this call returning does not."""
         if self._shutdown_requested:
             return
         self._shutdown_requested = True
@@ -147,6 +157,24 @@ class Backend:
                     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1.0)
                 except Exception:
                     pass
+            # A skill already running in a worker thread will finish its side effect whatever we do; stopping the loop
+            # now abandoned the coroutine that records it (audit outcome, undo entry). So: no new step, then wait --
+            # bounded -- for what is in flight.
+            try:
+                from friday.intelligence.state import INTEL
+
+                INTEL.request_cancel()
+            except Exception:
+                log.exception("could not raise the stop flag at shutdown")
+            me = asyncio.current_task()
+            in_flight = {t for t in asyncio.all_tasks() if t is not me and not t.done()}
+            if in_flight:
+                log.info("shutdown: waiting up to %.0fs for %d task(s) in flight", self.SHUTDOWN_DRAIN_S, len(in_flight))
+                _, still = await asyncio.wait(in_flight, timeout=self.SHUTDOWN_DRAIN_S)
+                if still:
+                    log.warning("shutdown: %d task(s) did not finish in time and are left as they are", len(still))
+        except Exception:
+            log.exception("backend wind-down failed")
         finally:
             self.loop.stop()
 
@@ -208,6 +236,8 @@ class Backend:
         """Publish how the original request really ended. Nothing is re-run and `ask` is not called: this only reads the
         finished future. A result is reported with its own `ok` (never promoted to success); an exception or a
         cancellation is reported as exactly that, and an exception also says part of the request may have run."""
+        if self._shutdown_requested:
+            return  # the application is closing: nothing is left to show it to, and nothing may be spoken after a quit
         error = cancelled = False
         if future.cancelled():
             cancelled, ok = True, False

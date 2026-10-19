@@ -119,6 +119,18 @@ def _mic_activate() -> None:
         _conversation_loop.activate_from_hotkey()
 
 
+def _await_backend_stop(backend: Any, timeout_s: float) -> bool:
+    """After the window is gone, give the backend a bounded chance to finish what it was doing (its `stopped` event is
+    set when its loop thread really ends). True only when it did; otherwise the process exits anyway."""
+    stopped = getattr(backend, "stopped", None)
+    if stopped is None:
+        return False
+    if stopped.wait(timeout_s):
+        return True
+    log.warning("backend still finishing work after %.0fs; exiting without waiting further", timeout_s)
+    return False
+
+
 def _quit(app: QApplication, backend: Backend, hub: GuiStateHub, window: MainWindow, tray: Any) -> None:
     """Tray-Quit handler. The steps are independent, so each is attempted even if an earlier one raised (a Qt slot
     that raises is only printed: without this, one failure left the lock held, the backend running and the app open).
@@ -208,3 +220,5 @@ def run() -> None:
 
     log.info("FRIDAY GUI is live — press %s for the command bar", HOTKEY)
     app.exec()
+    if backend.shutdown_requested:  # the GUI is closed; this does not hold up any window
+        _await_backend_stop(backend, backend.SHUTDOWN_DRAIN_S + 2.0)
