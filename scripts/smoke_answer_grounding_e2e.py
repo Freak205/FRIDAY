@@ -47,7 +47,7 @@ import uuid
 import phase21_common as H
 from phase21_common import ScriptedPlanner, call, check, done, scenario, scripted_provider  # noqa: E402
 
-from friday import store  # noqa: E402
+from friday import auditview, store  # noqa: E402
 from friday.config import CFG  # noqa: E402
 from friday.intelligence import goals as goals_mod  # noqa: E402
 from friday.intelligence.goals import Subgoal  # noqa: E402
@@ -170,6 +170,11 @@ def failed_closed(text: str) -> bool:
 
 
 DEL = {"path": "report.csv"}
+
+# Phase 67: a stage is credited from its OWN steps, and a retried call recovers the failed one through its classified target -- as it
+# does for every registered tool (`friday.auditview.POLICY` is how `friday.steps` knows what a call acts on). The fixture is classified
+# like `files.delete`, so "failure -> retry with force -> success" below is still a recovered stage.
+auditview.POLICY["test.e2e_delete"] = {"path": auditview.PATH}
 
 
 # ================================================================================

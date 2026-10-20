@@ -952,9 +952,7 @@ class Orchestrator:
                         # "do not investigate because you can").
                         summary = _summarize(observations, coverage_goal or goal)
                         if subgoals:
-                            for sg in subgoals:
-                                if sg.status in (SubgoalStatus.PENDING, SubgoalStatus.ACTIVE):
-                                    sg.status = SubgoalStatus.SUCCEEDED
+                            _close_stages_on_done(subgoals, observations)  # Phase 67: the evidence decides which stages
                         await BUS.publish("orchestrator.done", goal=goal, ok=True, stopped="completed", actor=self.actor)
                         return OrchestratorResult(goal, observations, True, summary, "completed", subgoal_idx)
                     turn_coverage_hint = _coverage_hint(cov_goal, observations)
@@ -995,9 +993,7 @@ class Orchestrator:
                     cov = _multi_clause_coverage(cov_goal, good)
                     if cov is None or cov.all_satisfied:
                         if subgoals:
-                            for sg in subgoals:
-                                if sg.status in (SubgoalStatus.PENDING, SubgoalStatus.ACTIVE):
-                                    sg.status = SubgoalStatus.SUCCEEDED
+                            _close_stages_on_done(subgoals, observations)  # Phase 67: the evidence decides which stages
                         await BUS.publish(
                             "orchestrator.evidence_stop", goal=goal, steps=len(observations), actor=self.actor,
                         )
@@ -1149,15 +1145,10 @@ class Orchestrator:
                 )
                 if subgoals:
                     # Phase 53: a bare `done` used to mark EVERY open subgoal succeeded -- found by a goal whose write step
-                    # failed and whose last stage never ran: the saved breakdown said all three stages succeeded. When
-                    # the executed steps show a failure nothing made good, an unknown outcome or a step waiting on the
-                    # user (`friday.steps`), the open subgoals are left open: they were not achieved.
-                    from friday import steps as _steps
-
-                    if not _steps.build_report(observations, stopped="completed").needs_account:
-                        for sg in subgoals:
-                            if sg.status in (SubgoalStatus.PENDING, SubgoalStatus.ACTIVE):
-                                sg.status = SubgoalStatus.SUCCEEDED
+                    # failed and whose last stage never ran: the saved breakdown said all three stages succeeded.
+                    # Phase 67: and the guard added for that looked at the WHOLE run, so one stage's failure held every other
+                    # open stage open. Each stage is now judged from its own steps (`_close_stages_on_done`).
+                    _close_stages_on_done(subgoals, observations)
                 await BUS.publish("orchestrator.done", goal=goal, ok=True, stopped="completed", actor=self.actor)
                 return OrchestratorResult(goal, observations, True, summary, "completed", subgoal_idx)
 
@@ -1407,7 +1398,7 @@ class Orchestrator:
             if subgoals:
                 target = _resolve_subgoal_index(decision.raw, len(subgoals), subgoal_idx)
                 if target != subgoal_idx:
-                    _advance_subgoals(subgoals, subgoal_idx, target)
+                    _advance_subgoals(subgoals, subgoal_idx, target, observations)
                     subgoal_idx = target
                     await BUS.publish(
                         "orchestrator.subgoal", goal=goal, index=subgoal_idx,
@@ -2482,17 +2473,51 @@ def _resolve_subgoal_index(decision: dict[str, Any], total: int, current: int) -
     return raw
 
 
-def _advance_subgoals(subgoals: list[Subgoal], old_idx: int, new_idx: int) -> None:
+def _advance_subgoals(
+    subgoals: list[Subgoal], old_idx: int, new_idx: int, observations: list[Observation] | None = None,
+) -> None:
     """Mark subgoals `[old_idx, new_idx)` as succeeded (skipped over —
     e.g. a subgoal satisfied by reasoning alone, with no tool call of its
     own) and `new_idx` as the new active one. A subgoal already FAILED is
-    left as-is rather than overwritten with a false SUCCEEDED."""
+    left as-is rather than overwritten with a false SUCCEEDED.
+
+    Phase 67: given the run's `observations`, a stage the run is leaving that WAS attempted and is not resolved (an unrecovered
+    failure, an unknown outcome, no success of its own -- `steps.stage_standing`) is marked FAILED, not SUCCEEDED: moving on to the
+    next stage -- or the next stage's unrelated success -- is not evidence that this one was achieved. A stage with no steps of its
+    own is still credited as before (satisfied by reasoning alone)."""
+    from friday import steps as _steps
     from friday.intelligence.goals import SubgoalStatus
 
+    standing = _steps.stage_standing(observations, subgoals) if observations is not None else None
     for i in range(old_idx, new_idx):
         if subgoals[i].status != SubgoalStatus.FAILED:
-            subgoals[i].status = SubgoalStatus.SUCCEEDED
+            unresolved = standing is not None and standing[i] == _steps.UNRESOLVED
+            subgoals[i].status = SubgoalStatus.FAILED if unresolved else SubgoalStatus.SUCCEEDED
     subgoals[new_idx].status = SubgoalStatus.ACTIVE
+
+
+def _close_stages_on_done(subgoals: list[Subgoal], observations: list[Observation]) -> None:
+    """The run is ending as completed -- the planner declared `done`, or a read-only run's evidence already answers the goal: credit the
+    open stages the EVIDENCE supports (Phase 67; the rule is in the `friday.steps` docstring).
+
+      * a RESOLVED stage (a success of its own, every failure of its own recovered, nothing unknown) becomes SUCCEEDED -- whatever any
+        other stage did;
+      * an UNRESOLVED stage (attempted: an unrecovered failure, an unknown outcome, a step waiting on the user, no success) stays open: it
+        was not achieved, and it is still 'remaining' for a later look at the goal;
+      * a stage NOTHING was done for is closed only where nothing contradicts the run ending as completed -- no stage of the run is
+        unresolved or failed (a reasoning-only stage, or a planner that never moved the stage pointer) -- and at least one step was
+        executed: a bare `done` over no steps, or over a run with unresolved work, closes nothing it has no evidence for."""
+    from friday import steps as _steps
+    from friday.intelligence.goals import SubgoalStatus
+
+    standing = _steps.stage_standing(observations, subgoals)
+    contradicted = any(st == _steps.UNRESOLVED for st in standing) or any(sg.status == SubgoalStatus.FAILED for sg in subgoals)
+    executed = any(_steps.classify(o) is not None for o in observations)
+    for i, sg in enumerate(subgoals):
+        if sg.status not in (SubgoalStatus.PENDING, SubgoalStatus.ACTIVE):
+            continue
+        if standing[i] == _steps.RESOLVED or (standing[i] == _steps.UNTOUCHED and executed and not contradicted):
+            sg.status = SubgoalStatus.SUCCEEDED
 
 
 # -- Phase 23.0: evidence-grounded subgoal advancement / answer stop -----------------
@@ -2537,7 +2562,7 @@ def _auto_advance_subgoal_idx(subgoals: list[Subgoal], idx: int, observations: l
         evidence = _subgoal_evidence(subgoals, idx, observations)
         if not evidence or not discovery.subgoal_step_satisfied(goal, evidence):
             break
-        _advance_subgoals(subgoals, idx, idx + 1)
+        _advance_subgoals(subgoals, idx, idx + 1, observations)
         idx += 1
     return idx
 

@@ -24,6 +24,23 @@ can supply the information). A failed state change counts as *recovered* only if
 target (a retry), or another tool of the same kind of action on the same, non-empty target. A success against a different file, page
 or name proves nothing about the one that failed and leaves the goal partial. A call with nothing but content to identify it only
 matches an identical call. Decided live, when the arguments are at hand, and stored as a flag.
+
+Stages (Phase 67). A decomposed goal's subgoals ("stages") are credited the same way, from THEIR OWN steps (the ones the orchestrator tagged with
+the stage), never from the run as a whole -- `stage_standing`:
+
+  resolved    at least one of its steps succeeded, none is unknown / running / waiting on the user, and every one of its failures was RECOVERED
+              (the rule above: a later success against the same objective). Completed and verified both count; the report still tells them apart.
+  unresolved  it was attempted and that does not hold: an unrecovered failure, an unknown outcome, a step waiting on the user, or no success at all.
+  untouched   no step of its own.
+
+The orchestrator credits a stage SUCCEEDED when it is resolved (the run ends as completed -- planner `done`, or a read-only run's evidence already
+answers the goal -- an explicit jump to a later stage, or evidence auto-advance). An unresolved stage stays open when the run ends and is marked FAILED
+when the run moves past it. An untouched stage is closed only where nothing contradicts the planner -- no stage of the run unresolved or failed, and at
+least one step executed -- so a bare `done` over no steps, or over unresolved work, closes nothing it has no evidence for. Another stage's failure or
+success never changes this stage's standing: a failed stage is not closed by an unrelated later success, and a stage that did succeed is not held open
+by an earlier stage's failure. (A stage whose only steps failed stays unresolved even if a later stage re-did the same thing: its own account is a
+failure, and the report says partial rather than guess.) The standing is derived from the same recovery flags that are persisted with the goal's
+progress, and the subgoal statuses are persisted with the goal, so a restart reproduces both.
 """
 
 from __future__ import annotations
@@ -246,8 +263,16 @@ def build_report(
     """The step-by-step account of a run. `stopped` is the orchestrator's stop reason; `subgoals` (when the run was decomposed)
     supplies what was never reached; `extra_unknown` names steps known only from the audit log (one that was in flight when the
     whole run was cut off, so no Observation exists for it)."""
+    steps, _sources = _records(observations, extra_unknown)
+    return _finalize(steps, stopped, _remaining_of(subgoals))
+
+
+def _records(observations: list[Any], extra_unknown: list[str] | None = None) -> tuple[list[StepRecord], list[Any]]:
+    """One StepRecord per executed observation, in order, with the recovery flags set (the rule in the module docstring), and the
+    observation each record came from (None for a step known only from the audit log)."""
     steps: list[StepRecord] = []
     calls: list[tuple[str, dict]] = []
+    sources: list[Any] = []
     for o in observations:
         state = classify(o)
         if state is None:
@@ -257,9 +282,11 @@ def build_report(
             len(steps) + 1, o.step.tool, state, note, audit=list(getattr(o, "audit_ids", []) or []), ver=_verdict(o),
         ))
         calls.append((o.step.tool, dict(o.step.args or {})))
+        sources.append(o)
     for tool in extra_unknown or []:
         steps.append(StepRecord(len(steps) + 1, tool, StepState.UNKNOWN))
         calls.append((tool, {}))
+        sources.append(None)
 
     for i, s in enumerate(steps):
         if s.state is not StepState.FAILED:
@@ -269,7 +296,30 @@ def build_report(
             if t.state in _OK_STATES and same_objective(s.tool, calls[i][1], t.tool, calls[j][1]):
                 s.recovered = True
                 break
-    return _finalize(steps, stopped, _remaining_of(subgoals))
+    return steps, sources
+
+
+RESOLVED, UNRESOLVED, UNTOUCHED = "resolved", "unresolved", "untouched"
+
+
+def stage_standing(observations: list[Any], subgoals: list[Any]) -> list[str]:
+    """For each subgoal (same order): RESOLVED / UNRESOLVED / UNTOUCHED, from the steps the orchestrator tagged with it
+    (`PlanStep.subgoal` = the stage's description) -- see the module docstring. Pure; reads only the observations."""
+    steps, sources = _records(observations)
+    by_stage: dict[str, list[StepRecord]] = {}
+    for rec, obs in zip(steps, sources):
+        by_stage.setdefault(getattr(obs.step, "subgoal", "") or "", []).append(rec)
+    out: list[str] = []
+    for sg in subgoals:
+        recs = by_stage.get(getattr(sg, "description", ""), [])
+        if not recs:
+            out.append(UNTOUCHED)
+            continue
+        open_ended = any(r.state in (StepState.UNKNOWN, StepState.RUNNING, StepState.NEEDS_INPUT) for r in recs)
+        unrecovered = any(r.state is StepState.FAILED and not r.recovered for r in recs)
+        succeeded = any(r.state in _OK_STATES for r in recs)
+        out.append(RESOLVED if succeeded and not open_ended and not unrecovered else UNRESOLVED)
+    return out
 
 
 def _remaining_of(subgoals: list[Any] | None) -> list[str]:

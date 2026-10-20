@@ -275,10 +275,56 @@ async def main() -> None:
         llm_provider=planner_e, tool_specs=MOCK_SPECS,
     )
     result_e = await orch_e.run_goal("recoverable goal", subgoals=[sg_e], max_replans=1)
-    ok = result_e.ok and sg_e.recovery_attempts == 1 and sg_e.status == SubgoalStatus.SUCCEEDED
-    print(f"  {'OK  ' if ok else 'MISS'} recovered -> ok={result_e.ok}, recovery_attempts={sg_e.recovery_attempts}, "
-          f"final status={sg_e.status.value}")
+    # Phase 67 -- what "recovered" means for a stage. The bounded replan lets the run CONTINUE after a failure (`recovery_attempts` counts
+    # it, `ok` follows the planner's `done`); whether the STAGE was achieved is a question of evidence (`friday.steps.stage_standing`): its
+    # own steps need a success AND every failure of its own recovered -- a later success against the same objective (same tool and
+    # target, or another tool of the same kind of action on the same target). Here mock.fail ("Always fails") was followed by mock.echo
+    # ("Echo back some text"): a different, unclassified tool with different arguments, no shared target and no verification. Nothing
+    # shows it did what mock.fail was for, so the stage is not claimed succeeded: it stays open while the run itself still completes.
+    # (Until Phase 66 this scenario expected SUCCEEDED, the Phase 11.2 optimism; Phase 53 and 54 made the reports evidence-based and the
+    # `done` rule followed. The controls below show a real recovery still closes its stage and an unrelated success does not.)
+    ok = result_e.ok and sg_e.recovery_attempts == 1 and sg_e.status == SubgoalStatus.ACTIVE
+    print(f"  {'OK  ' if ok else 'MISS'} adaptive step with nothing tying it to the failed one -> ok={result_e.ok}, "
+          f"recovery_attempts={sg_e.recovery_attempts}, final status={sg_e.status.value} (expected active)")
     overall &= ok
+
+    from friday import auditview, steps as steps_mod
+
+    saved_policy = {k: auditview.POLICY.get(k) for k in ("mock.write", "mock.append")}
+    auditview.POLICY["mock.write"] = {"name": auditview.KEEP, "text": auditview.OMIT}
+    auditview.POLICY["mock.append"] = {"name": auditview.KEEP, "text": auditview.OMIT}
+    write_specs = [ToolSpec(name="mock.write", description="Write a named file"), ToolSpec(name="mock.append", description="Append to a named file")]
+
+    async def write_runner(tool: str, args: dict, actor: str) -> SkillResult:
+        if tool == "mock.write" and args.get("name") == "a":
+            return SkillResult(speech="could not write a", ok=False)
+        return SkillResult(speech=f"{tool} ok for {args.get('name')}")
+
+    async def stage_after(replies: list[str]) -> tuple[Subgoal, object]:
+        stage = sg("save the file")
+        orch = Orchestrator(tools=["mock.write", "mock.append"], runner=write_runner, max_steps=6,
+                            llm_provider=ScriptedPlanner(replies), tool_specs=write_specs)
+        res = await orch.run_goal("save a file", subgoals=[stage], max_replans=1)
+        return stage, res
+
+    try:
+        stage_e2, res_e2 = await stage_after([call("mock.write", {"name": "a", "text": "x"}),
+                                              call("mock.append", {"name": "a", "text": "x"}), done("saved")])
+        ok = (res_e2.ok and stage_e2.status == SubgoalStatus.SUCCEEDED
+              and steps_mod.build_report(res_e2.observations, stopped="completed").steps[0].recovered)
+        print(f"  {'OK  ' if ok else 'MISS'} control: failure recovered by ANOTHER tool on the SAME target -> stage {stage_e2.status.value} (expected succeeded)")
+        overall &= ok
+        stage_e3, res_e3 = await stage_after([call("mock.write", {"name": "a", "text": "x"}),
+                                              call("mock.write", {"name": "b", "text": "x"}), done("saved")])
+        ok = res_e3.ok and stage_e3.status == SubgoalStatus.ACTIVE
+        print(f"  {'OK  ' if ok else 'MISS'} control: an unrelated success (a DIFFERENT file) does not close the failed stage -> {stage_e3.status.value} (expected active)")
+        overall &= ok
+    finally:
+        for k, v in saved_policy.items():
+            if v is None:
+                auditview.POLICY.pop(k, None)
+            else:
+                auditview.POLICY[k] = v
 
     # ========================================================================
     # F — repeated-action protection
