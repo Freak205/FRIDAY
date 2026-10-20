@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from friday import store
+from friday import auditview, store
 from friday.log import get
 
 log = get(__name__)
@@ -40,6 +40,14 @@ class Correction:
         )
 
 
+_MAX_TEXT = 500
+
+
+def _keep(text: str) -> str:
+    """What is stored of a piece of free text: credential-checked (a failed check stores a notice, never the original) and bounded."""
+    return (auditview.scrub_free_text((text or "").strip()) or "")[:_MAX_TEXT]
+
+
 def record(
     user_correction: str,
     *,
@@ -53,12 +61,12 @@ def record(
         "INSERT INTO corrections (at, goal_id, original_interpretation, user_correction, "
         "corrected_objective, context) VALUES (?,?,?,?,?,?)",
         (
-            store.now(), goal_id, original_interpretation.strip(),
-            user_correction.strip(), corrected_objective.strip(), context[:500],
+            store.now(), goal_id, _keep(original_interpretation),
+            _keep(user_correction), _keep(corrected_objective), _keep(context),
         ),
     )
     c.commit()
-    log.info("correction recorded (goal_id=%s): %r", goal_id, user_correction[:80])
+    log.info("correction recorded (goal_id=%s, %d chars)", goal_id, len(user_correction))
     return int(cur.lastrowid)
 
 

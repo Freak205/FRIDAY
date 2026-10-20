@@ -543,7 +543,7 @@ def _start_goal(goal: str) -> str | None:
 
         record = goals_mod.create(
             goal, goal,
-            success_criteria=f"The plan reports success and the goal is satisfied: {goal}",
+            success_criteria="The plan reports success and the goal is satisfied.",  # Phase 66: no third copy of the goal text
         )
         goals_mod.update_status(record.id, goals_mod.GoalStatus.RUNNING)
         INTEL.start_goal(goal, record.id)
@@ -653,8 +653,10 @@ def _seed_contract(goal_id: str | None, goal: str) -> "GoalContract":
 
     mode = discovery.classify_mode(goal)
     report_only = mode in (GoalMode.DIAGNOSTIC, GoalMode.INVESTIGATIVE, GoalMode.INFORMATION_SEEKING)
-    desired_outcome = f"identify and report findings for: {goal}" if (report_only and not _wants_mutation(goal)) else goal
-    contract = GoalContract(intent=goal, desired_outcome=desired_outcome, mode=mode.value)
+    # Phase 66: `intent` / `desired_outcome` used to be verbatim copies of the goal (nothing reads them: the goal text is the goal row's
+    # `objective`). They now say only what KIND of outcome was sought.
+    desired_outcome = "report findings only" if (report_only and not _wants_mutation(goal)) else "carry out the request"
+    contract = GoalContract(intent="", desired_outcome=desired_outcome, mode=mode.value)
     _save_contract(goal_id, contract)
     return contract
 
@@ -910,7 +912,7 @@ def _cancel_goal(goal_id: str | None, goal: str, subgoals: list["Subgoal"] | Non
         INTEL.end_goal(ok=False, status="cancelled")
     except Exception:
         log.exception("plan.run: cancellation bookkeeping failed (non-fatal)")
-    log.info("plan.run: goal %s cancelled (%r)", goal_id, goal[:60])
+    log.info("plan.run: goal %s cancelled (%d chars)", goal_id, len(goal))
 
 
 def _append_working_memory(goal: str, context: str, observation: object | None) -> str:

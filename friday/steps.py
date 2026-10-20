@@ -277,7 +277,10 @@ def _remaining_of(subgoals: list[Any] | None) -> list[str]:
     for sg in subgoals or []:
         status = getattr(getattr(sg, "status", None), "value", getattr(sg, "status", ""))
         if status == "pending":  # never started; a failed or active one was attempted and is in `steps`
-            remaining.append(_note(getattr(sg, "description", "")))
+            # model-written text; rows saved before Phase 66 were stored unchecked, so the reader checks it too
+            from friday import auditview
+
+            remaining.append(auditview.scrub_free_text(_note(getattr(sg, "description", ""))) or "")
     return remaining
 
 

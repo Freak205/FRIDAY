@@ -403,12 +403,9 @@ class Session:
             goal = goals_mod.most_recent_active()
             from friday.intelligence import corrections
 
-            corrections.record(
-                text,
-                goal_id=goal.id if goal else None,
-                original_interpretation=goal.objective if goal else "",
-                context=self.last_utterance,
-            )
+            # Phase 66: only the correction itself, linked to its goal. The goal's text is the goal row's (`goal_id`), and the user's
+            # PREVIOUS utterance (`last_utterance`) was a second raw copy that nothing reads.
+            corrections.record(text, goal_id=goal.id if goal else None)
             self._apply_context_correction(text)
         except Exception:
             log.exception("correction recording failed (non-fatal)")

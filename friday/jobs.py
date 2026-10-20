@@ -21,7 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from friday import notify, store
+from friday import auditview, notify, store
 from friday.bus import BUS
 from friday.log import get
 
@@ -162,7 +162,8 @@ async def run_job(job_id: int, *, actor: str = "scheduler") -> bool:
     await BUS.publish("job.start", job=job.name, id=job.id)
 
     started = time.perf_counter()
-    results: list[str] = []
+    results: list[str] = []  # what was said, for the notification and the in-process event
+    stored: list[str] = []   # Phase 66: what is PERSISTED (job_runs.detail, returned by schedule.history): minimized like an audit row
     ok = True
 
     for action in job.actions:
@@ -173,22 +174,25 @@ async def run_job(job_id: int, *, actor: str = "scheduler") -> bool:
         try:
             result = await EXECUTOR.run(skill_name, args, actor=actor)
             results.append(f"{skill_name}: {result.speech}")
+            stored.append(f"{skill_name}: {auditview.sanitize_result(skill_name, result.speech) or ''}")
             if not result.ok:
                 ok = False
         except PermissionError_ as exc:
             # The unattended ceiling did its job.
             results.append(f"{skill_name}: blocked — {exc}")
+            stored.append(f"{skill_name}: blocked — {auditview.sanitize_error(str(exc)) or ''}")
             ok = False
             break
         except Exception as exc:
             log.exception("job '%s' action %s failed", job.name, skill_name)
             results.append(f"{skill_name}: error — {exc}")
+            stored.append(f"{skill_name}: error — {auditview.sanitize_error(str(exc)) or ''}")
             ok = False
             break
 
     elapsed = int((time.perf_counter() - started) * 1000)
     detail = " | ".join(results)
-    _record_run(job, ok, detail, elapsed)
+    _record_run(job, ok, " | ".join(stored), elapsed)
 
     await BUS.publish(
         "job.done", job=job.name, id=job.id, ok=ok, detail=detail, ms=elapsed
@@ -197,7 +201,7 @@ async def run_job(job_id: int, *, actor: str = "scheduler") -> bool:
     # Unattended runs are invisible unless we say something. Announce failures
     # always; announce successes only when the job asked to be heard.
     if not ok:
-        log.warning("job '%s' failed: %s", job.name, detail)
+        log.warning("job '%s' failed: %s", job.name, " | ".join(stored))
         notify.send(f"{job.name} failed", results[-1] if results else detail, urgent=True)
     elif actor != "text" and job.trigger_spec.get("notify", True):
         spoken = next(

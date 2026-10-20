@@ -31,7 +31,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 
-from friday import store
+from friday import auditview, store
 from friday.log import get
 
 log = get(__name__)
@@ -317,6 +317,9 @@ def create(
     goal_id = str(uuid.uuid4())
     now = store.now()
     objective = objective.strip() or original_request.strip()
+    # `original_request` / `objective` hold the user's own words on purpose: resuming a goal after a clarification, widening it
+    # ("yes, fix it") and correcting it all re-read `objective`. Every OTHER text field of the goal is minimized (see below).
+    success_criteria = auditview.scrub_free_text(success_criteria) or ""
     c = store.conn()
     c.execute(
         "INSERT INTO goals (id, created_at, updated_at, original_request, objective, "
@@ -328,7 +331,7 @@ def create(
         ),
     )
     c.commit()
-    log.info("goal created: %s (%r)", goal_id, objective[:60])
+    log.info("goal created: %s (%d chars)", goal_id, len(objective))
     return Goal(
         id=goal_id, created_at=now, updated_at=now, original_request=original_request.strip(),
         objective=objective, status=GoalStatus.PENDING, parent_goal_id=parent_goal_id,
@@ -344,6 +347,7 @@ def update_status(
     current_step: int | None = None,
 ) -> None:
     c = store.conn()
+    failure_reason = (auditview.scrub_free_text(failure_reason) or "")[:600]  # Phase 66: bounded, credential-checked, fail-closed
     if current_step is None:
         c.execute(
             "UPDATE goals SET status=?, updated_at=?, failure_reason=? WHERE id=?",
@@ -374,7 +378,9 @@ def set_subgoals(goal_id: str | None, subgoals: list[Subgoal], *, current_index:
     c.execute(
         "UPDATE goals SET subgoals=?, current_subgoal_index=?, updated_at=? WHERE id=?",
         (
-            json.dumps([s.to_dict() for s in subgoals], ensure_ascii=False),
+            # Phase 66: model-written paraphrases of the user's request; credential-checked on the way to disk (the run keeps its own
+            # objects), and status / recovery counts are untouched
+            json.dumps([auditview.scrub_tree(s.to_dict()) for s in subgoals], ensure_ascii=False),
             current_index, store.now(), goal_id,
         ),
     )
@@ -390,7 +396,10 @@ def set_contract(goal_id: str | None, contract: GoalContract) -> None:
     c = store.conn()
     c.execute(
         "UPDATE goals SET goal_contract=?, updated_at=? WHERE id=?",
-        (json.dumps(contract.to_dict(), ensure_ascii=False), store.now(), goal_id),
+        # Phase 66: the contract carries text from several places (the scope's copy of the goal, a clarification answer, the follow-up
+        # that authorised a wider scope, findings read from tools). It is credential-checked on the way to disk; keys, flags and
+        # structure are untouched, so a scrubbed scope is simply re-derived when its goal text no longer matches.
+        (json.dumps(auditview.scrub_tree(contract.to_dict()), ensure_ascii=False), store.now(), goal_id),
     )
     c.commit()
 

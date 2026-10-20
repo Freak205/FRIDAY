@@ -110,7 +110,11 @@ def record(
         for o in steps
     ]
     errors = auditview.scrub_free_text("; ".join(o.speech for o in steps if not o.ok)[:500], echoes) or ""
-    context = auditview.scrub_free_text(context, echoes) or ""
+    # Phase 66: `context` (the ambient desktop / working-memory / recent-entity snapshot of the moment) is NOT stored. It is the
+    # most personal text an episode could hold (window titles, file and contact names), no runtime reader ever uses it
+    # (`experience.py` says so), and the only consumer is the optional offline `scripts/export_training_data.py`, which then
+    # exports an empty "context". The parameter stays so callers do not change; old rows keep what they have.
+    context = ""
     # Phase 56: the request is kept (experience retrieval matches on it) but a credential typed into it is not
     goal_text = auditview.scrub_free_text(goal_text, echoes) or ""
 

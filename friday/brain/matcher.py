@@ -171,7 +171,7 @@ class Matcher:
             (store.now(), skill_name, utterance.lower().strip(), "taught"),
         )
         c.commit()
-        log.info("taught: %r -> %s", utterance, skill_name)
+        log.info("taught a phrasing (%d chars) -> %s", len(utterance), skill_name)
         self.build(force=True)
 
 

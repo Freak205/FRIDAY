@@ -1985,9 +1985,12 @@ def sec_K(rec: Rec, quick: bool) -> None:
         ec.close()
         w.apply(w.target(ep, "active", other=b))
         scrubbed = table_rows(ep.path, f"select * from episodes where id={ep_id}")[0]
-        rec.check("K17 the live episode row equals the scrub of the same raw episode (plan, errors, context): same-as-live for episodes",
-                  json.loads(scrubbed["plan"]) == json.loads(liveep["plan"]) and scrubbed["errors"] == liveep["errors"] and scrubbed["context"] == liveep["context"],
-                  (scrubbed["errors"], liveep["errors"]))
+        # Phase 66: a NEW episode no longer stores the ambient context at all (nothing reads it), so for `context` the live row is stricter than
+        # the scrub of an old row, which still removes what it finds; plan and errors stay exactly as live.
+        rec.check("K17 the live episode row equals the scrub of the same raw episode for plan and errors, and stores no context while the scrub of an old row keeps it clean",
+                  json.loads(scrubbed["plan"]) == json.loads(liveep["plan"]) and scrubbed["errors"] == liveep["errors"]
+                  and liveep["context"] == "" and scrubbed["context"] != "" and "CANARY-" not in scrubbed["context"],
+                  (scrubbed["errors"], liveep["errors"], scrubbed["context"], liveep["context"]))
 
         # ------------------------------------------------ committed but NOT PURGED (VACUUM fails) -> loud, recoverable with compact
         nv = w.fix("9f01")

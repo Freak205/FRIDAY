@@ -74,5 +74,5 @@ def send(title: str, message: str = "", *, urgent: bool = False) -> bool:
         except Exception:
             log.debug("tray balloon failed", exc_info=True)
 
-    log.info("NOTIFY%s %s — %s", " (urgent)" if urgent else "", title, message)
+    log.info("NOTIFY%s %s (%d chars)", " (urgent)" if urgent else "", title, len(message))
     return False

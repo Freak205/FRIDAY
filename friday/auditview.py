@@ -85,10 +85,14 @@ POLICY: dict[str, dict[str, str]] = {
 
 # A skill whose `result` speech is content that was READ BACK (a file, the clipboard, a page, command output).
 # Only its length is stored.
+#
+# Phase 66: `plan.run` is here because its reply is the planner's summary of what its steps read -- a file's content that the
+# step's own row had reduced to a length was stored again, in words, on the goal's row; its outcome is the row's `ok` and the
+# per-step rows. `apps.list` speaks the titles of every open window (documents, mail subjects, pages).
 CONTENT_RESULT_SKILLS = frozenset({  # outputs of 80 chars or fewer are kept (scrubbed); longer ones keep only their length
     "files.read", "clipboard.read", "memory.recall", "memory.list", "notes.read", "screen.read_text", "screen.observe",
     "ui.read", "ui.inspect", "browser.read", "browser.inspect", "web.fetch", "knowledge.ask", "shell.run",
-    "dev.python", "dev.git",
+    "dev.python", "dev.git", "plan.run", "apps.list",
 })
 
 _CREDENTIAL_KEY = re.compile(

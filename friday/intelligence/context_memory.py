@@ -156,7 +156,7 @@ class ContextMemory:
         if self._items.maxlen != _max_items():
             self._items = deque(self._items, maxlen=_max_items())
         self._items.append(entity)
-        log.debug("context: remembered %s %r (source=%s)", entity_type, name, source)
+        log.debug("context: remembered a %s (%d chars, source=%s)", entity_type, len(name), source)
         return entity
 
     def recent(self, entity_type: str | None = None, limit: int | None = None) -> list[ContextEntity]:
