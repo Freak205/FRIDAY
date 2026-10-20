@@ -75,6 +75,93 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="FRIDAY", version=__version__, lifespan=lifespan)
 
 
+# -- Phase 62: who may talk to the daemon ------------------------------------------------------------------------------------
+#
+# The daemon has no authentication, so the boundary is WHERE it listens and WHICH web pages can reach it. Loopback is not enough on its
+# own: a browser lets any web page open a WebSocket to 127.0.0.1 (no same-origin policy, no preflight), and with DNS rebinding any page can
+# read a GET route; both then see the unfiltered event stream and (websocket) run skills as the user. Browsers always say which page they
+# act for (`Origin`) and which name they dialled (`Host`); command-line and local-program clients send no `Origin`.
+#   * the default `host` is loopback, and a non-loopback host refuses to start unless `daemon.allow_remote` is set (`check_bind`);
+#   * a request whose `Host` is not a loopback name is refused (DNS rebinding) unless `allow_remote`;
+#   * a request that carries an `Origin` is refused unless it is this daemon's own origin (same scheme-less host:port as `Host`).
+# This does not authenticate anyone: another program on the same machine still has full access.
+
+_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def is_loopback(host: str) -> bool:
+    import ipaddress
+
+    h = (host or "").strip().strip("[]").lower()
+    if h in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def check_bind(host: str, allow_remote: bool) -> None:
+    """Refuse to listen beyond loopback without an explicit opt-in. Raises RuntimeError with what to do."""
+    if is_loopback(host):
+        return
+    if not allow_remote:
+        raise RuntimeError(
+            f"refusing to start the daemon on {host!r}: it has no authentication, so anyone who can reach that address could run "
+            "skills and read the event stream. Use a loopback host (127.0.0.1), or set daemon.allow_remote: true in config.yaml "
+            "if you have put the port behind something that authenticates."
+        )
+    log.warning("daemon listening on %s with NO authentication (daemon.allow_remote is set)", host)
+
+
+def _host_name(host_header: str) -> str:
+    h = (host_header or "").strip().lower()
+    if h.startswith("["):  # [::1]:8765
+        return h[1:].split("]", 1)[0]
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+def request_allowed(host_header: str | None, origin: str | None, allow_remote: bool) -> bool:
+    from urllib.parse import urlsplit
+
+    if not allow_remote and not is_loopback(_host_name(host_header or "")):
+        return False
+    if origin is not None:
+        try:
+            same = urlsplit(origin).netloc.lower() == (host_header or "").strip().lower()
+        except ValueError:
+            same = False
+        if not same:  # a page from anywhere else, or "null"
+            return False
+    return True
+
+
+class LocalOnlyMiddleware:
+    """Pure ASGI (so it covers WebSockets): see the block comment above."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] in ("http", "websocket"):
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+            if not request_allowed(headers.get("host"), headers.get("origin"), CFG.daemon.allow_remote):
+                log.warning("daemon refused a %s request (host=%r origin=%r)", scope["type"], headers.get("host"), headers.get("origin"))
+                if scope["type"] == "websocket":
+                    await receive()  # the connect message
+                    await send({"type": "websocket.close", "code": 1008})
+                else:
+                    body = b'{"detail":"forbidden"}'
+                    await send({"type": "http.response.start", "status": 403,
+                                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+                    await send({"type": "http.response.body", "body": body})
+                return
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(LocalOnlyMiddleware)
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
     return {
@@ -195,6 +282,7 @@ async def websocket(ws: WebSocket) -> None:
 def serve() -> None:
     import uvicorn
 
+    check_bind(CFG.daemon.host, CFG.daemon.allow_remote)
     uvicorn.run(
         app,
         host=CFG.daemon.host,

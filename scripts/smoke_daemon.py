@@ -34,7 +34,7 @@ def main() -> None:
     from friday.daemon import app
 
     overall = True
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:  # Phase 62: the daemon refuses a Host that is not loopback
         print("\n--- A: /health boots cleanly ---\n")
         resp = client.get("/health")
         ok = resp.status_code == 200 and resp.json().get("ok") is True

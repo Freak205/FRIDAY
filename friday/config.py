@@ -16,6 +16,10 @@ Tier = Literal["L0", "L1", "L2", "L3"]
 class DaemonConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8765
+    # Phase 62: the daemon has NO authentication. A `host` that is not a loopback address is refused at startup unless this is set,
+    # and setting it is an informed decision to expose every route (including an event stream with read-back content and call
+    # arguments, and the ability to run skills) to whoever can reach the port.
+    allow_remote: bool = False
 
 
 class IdentityConfig(BaseModel):
