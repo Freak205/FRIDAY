@@ -231,7 +231,11 @@ def run(cap: Capture) -> None:
         os.environ.pop(daemon.TOKEN_ENV, None)
         with c.websocket_connect("/ws", headers={"host": "127.0.0.1:8765"}) as ws:
             ws.send_json({"text": "what time is it"})
-            topics = [ws.receive_json()["topic"] for _ in range(4)]
+            topics = []
+            for _ in range(60):
+                topics.append(ws.receive_json()["topic"])
+                if topics[-1] == "result":
+                    break
         check("G4 a local websocket without credentials works", "result" in topics or "skill.start" in topics, str(topics))
         check("G5 Host / Origin protection is unchanged in local mode", c.get("/health", headers={"origin": "https://evil.example"}).status_code == 403
               and c.get("/health", headers={"host": "evil.example"}).status_code == 403)

@@ -9,6 +9,8 @@ daemon:
   # allow_remote: true opens the daemon to other machines, and then REQUIRES a secret of at least 32 characters in the environment
   # variable FRIDAY_DAEMON_TOKEN (not in this file); every request and WebSocket connection must send "Authorization: Bearer <token>".
   # The token is a shared secret, not a user identity, and traffic is plain HTTP: put the port behind a VPN or an SSH tunnel as well.
+  # The /ws event stream is status-only for every client: which skill ran, how long, whether it worked - never what was asked or answered
+  # (no utterances, arguments, goals, planner output or reply speech), and a topic is only sent once it is listed in friday/remote_events.py.
   allow_remote: false
 
 identity:

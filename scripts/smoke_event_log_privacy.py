@@ -90,26 +90,26 @@ def main() -> int:
 
 
 async def external(topic: str, **data) -> dict:
-    """Publish and return what a stream consumer receives; also what an in-process subscriber received."""
+    """What the Phase 64 sanitizer (`auditview.sanitize_event`) makes of an event, and what an in-process subscriber received.
+
+    Since Phase 65 the bus applies the allowlist projection of `friday.remote_events` BEFORE this sanitizer (which is its second layer); these
+    tests keep pinning the sanitizer's own contract, over payloads the projection would already have dropped, so it stays correct on its own.
+    The projection itself, and what actually reaches a stream consumer, are tested in smoke_remote_events.py."""
     seen: dict = {}
 
     async def handler(event):
         seen.update(event.data)
 
     BUS.subscribe(topic, handler)
-    q = BUS.stream()
     try:
         await BUS.publish(topic, **data)
-        got = q.get_nowait()
     finally:
         BUS.unsubscribe(topic, handler)
-        BUS.drop(q)
-    assert got.topic == topic
-    return {"external": got.data, "internal": seen}
+    return {"external": auditview.sanitize_event(topic, data), "internal": seen}
 
 
 async def run() -> None:
-    scenario("A. stream consumers receive a sanitized copy; in-process subscribers keep the original")
+    scenario("A. the event sanitizer (second layer of the remote stream); in-process subscribers keep the original")
     r = await external("skill.start", skill="input.type", args={"text": f"my password is {S}", "password": S})
     check("A1 skill.start: typed text and a password field never reach the stream", S not in json.dumps(r["external"]), str(r["external"]))
     check("A2 ...but the skill identity and the argument names do", r["external"]["skill"] == "input.type" and set(r["external"]["args"]) == {"text", "password"})

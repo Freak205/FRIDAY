@@ -60,15 +60,17 @@ class EventBus:
             except Exception:
                 log.exception("handler failed for %s", topic)
 
-        # Fan out to streaming consumers (websocket clients). Phase 64: they are outside the process, so they receive a sanitized COPY
-        # (`auditview.sanitize_event`) -- one boundary for every topic, present and future -- while in-process subscribers above got the
-        # original. The copy is made once and only when somebody is listening.
+        # Fan out to streaming consumers (websocket clients). They are outside the process, so they receive a PROJECTION of the event
+        # (`friday.remote_events.project`: an explicit allowlist of topics and fields, deny by default, no content), made once and only when
+        # somebody is listening; in-process subscribers above got the original. A topic the policy does not list is not delivered at all.
         if self._queues:
-            from friday import auditview
+            from friday import remote_events
 
-            outbound = Event(topic=topic, data=auditview.sanitize_event(topic, data), at=event.at)
-            for queue in list(self._queues):
-                queue.put_nowait(outbound)
+            projected = remote_events.project(topic, data)
+            if projected is not None:
+                outbound = Event(topic=topic, data=projected, at=event.at)
+                for queue in list(self._queues):
+                    queue.put_nowait(outbound)
 
         return event
 
