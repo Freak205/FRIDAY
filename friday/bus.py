@@ -50,7 +50,8 @@ class EventBus:
 
     async def publish(self, topic: str, **data: Any) -> Event:
         event = Event(topic=topic, data=data)
-        log.debug("bus %s", event)
+        # Phase 64: the payload holds raw tool arguments, utterances and replies -- a debug log must say what happened, not repeat it
+        log.debug("bus %s fields=%s", topic, ",".join(sorted(data)))
 
         handlers = [*self._subs.get(topic, []), *self._subs.get("*", [])]
         for handler in handlers:
@@ -59,9 +60,15 @@ class EventBus:
             except Exception:
                 log.exception("handler failed for %s", topic)
 
-        # Fan out to streaming consumers (websocket clients).
-        for queue in list(self._queues):
-            queue.put_nowait(event)
+        # Fan out to streaming consumers (websocket clients). Phase 64: they are outside the process, so they receive a sanitized COPY
+        # (`auditview.sanitize_event`) -- one boundary for every topic, present and future -- while in-process subscribers above got the
+        # original. The copy is made once and only when somebody is listening.
+        if self._queues:
+            from friday import auditview
+
+            outbound = Event(topic=topic, data=auditview.sanitize_event(topic, data), at=event.at)
+            for queue in list(self._queues):
+                queue.put_nowait(outbound)
 
         return event
 

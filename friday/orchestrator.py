@@ -250,6 +250,7 @@ async def run_verified(
         from friday import toolview
 
         speech = toolview.safe_speech(speech)
+        obs.data = auditview.scrub_tree(obs.data)  # Phase 64: `data["verification"]` quotes what was read back
     return SkillResult(speech=speech, ok=obs.ok, data=obs.data)
 
 

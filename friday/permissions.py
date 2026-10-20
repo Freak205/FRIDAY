@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from friday import audit, toolview
+from friday import audit, auditview, toolview
 from friday.bus import BUS
 from friday.config import CFG
 from friday.log import get
@@ -278,6 +278,10 @@ class Executor:
             # /say, /invoke, the event stream, plan steps) receives it from here, so it gets the credential check once, here.
             # A successful reply is left alone: "what's in my clipboard" is exactly what the user asked to hear.
             result.speech = toolview.safe_speech(result.speech)
+            if result.data:
+                # Phase 64: the same for the structured part -- callers return `data` to API clients as is. A copy with the
+                # strings credential-checked; keys, flags, numbers and ids (a recovery token, `confirmation_declined`) are untouched.
+                result.data = auditview.scrub_tree(result.data)
         audit.complete(
             audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed
         )

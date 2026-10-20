@@ -200,6 +200,59 @@ def scrub_free_text(text: str | None, echoes: Any = ()) -> str | None:
         return "[omitted: could not be scrubbed]"
 
 
+WITHHELD_TEXT = "[omitted: could not be scrubbed]"
+_MAX_TREE_DEPTH = 8
+
+
+def scrub_tree(value: Any, _depth: int = 0) -> Any:
+    """A COPY of `value` with every string passed through `scrub_free_text` (credentials named in sentences or `key: value`
+    shapes, URL query / userinfo). Structure, keys, numbers, booleans and None are untouched, so a flag or a count that code
+    reads back is never altered; a string that cannot be checked becomes a fixed notice, never itself. Phase 64: used where a
+    result's `data` leaves the process (failure results) and as the free-text pass of `sanitize_event`."""
+    if isinstance(value, str):
+        return scrub_free_text(value)
+    if _depth >= _MAX_TREE_DEPTH:
+        return _marker(value) if isinstance(value, (list, tuple, dict)) else value
+    if isinstance(value, dict):
+        return {k: scrub_tree(v, _depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub_tree(v, _depth + 1) for v in value]
+    return value
+
+
+# Event fields that carry raw model output (the planner's whole reply, which names the tool AND its arguments): never sent out.
+_RAW_EVENT_KEYS = frozenset({"raw", "raw_first", "raw_last"})
+# Event fields that are the reply itself, delivered as the user asked for it (read-back content included); failure replies
+# arrive here already checked (`Executor.run`).
+_REPLY_EVENT_KEYS = frozenset({"speech"})
+
+
+def sanitize_event(topic: str, data: dict[str, Any]) -> dict[str, Any]:
+    """The form of a bus event that may leave the process (the WebSocket stream). Returns a COPY; in-process subscribers keep the
+    original. Phase 64:
+      * `args` (skill.start, orchestrator.step, orchestrator.continuation, brain.*): the redacted field-aware form the audit log
+        keeps -- what was touched, never a body of text, a message or code -- keyed by the event's own skill / tool name;
+      * raw planner replies are replaced by their length;
+      * every other string (a goal, an utterance, a confirmation preview, a window title, an error) goes through `scrub_free_text`;
+      * the `speech` of a reply is left as the user asked to receive it; numbers, booleans and structure are untouched.
+    If anything fails the event keeps its topic and loses its payload: it never falls back to the original."""
+    try:
+        name = str(data.get("skill") or data.get("tool") or "")
+        out: dict[str, Any] = {}
+        for key, value in data.items():
+            if key == "args" and isinstance(value, (dict, list, str)):
+                out[key] = sanitize_args(name, value)
+            elif key in _RAW_EVENT_KEYS and isinstance(value, str):
+                out[key] = _marker(value)
+            elif key in _REPLY_EVENT_KEYS:
+                out[key] = value
+            else:
+                out[key] = scrub_tree(value)
+        return out
+    except Exception:  # noqa: BLE001
+        return {"withheld": WITHHELD_TEXT}
+
+
 def _marker(value: Any) -> str:
     if isinstance(value, str):
         lines = value.count("\n") + 1 if value else 0
