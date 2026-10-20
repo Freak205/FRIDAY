@@ -4,9 +4,11 @@
 daemon:
   host: 127.0.0.1
   port: 8765
-  # The daemon has no authentication: anyone who can reach this port can run skills and read the event stream. A host other than
-  # a loopback address (127.0.0.1, ::1, localhost) is refused at startup unless allow_remote is true. Leave it false unless you
-  # have put the port behind something that authenticates (a VPN, an SSH tunnel, a reverse proxy).
+  # Local mode (the default) has no authentication: it relies on the loopback address plus a Host/Origin check, so any program on
+  # this computer can use the daemon. A host other than a loopback address (127.0.0.1, ::1, localhost) is refused at startup.
+  # allow_remote: true opens the daemon to other machines, and then REQUIRES a secret of at least 32 characters in the environment
+  # variable FRIDAY_DAEMON_TOKEN (not in this file); every request and WebSocket connection must send "Authorization: Bearer <token>".
+  # The token is a shared secret, not a user identity, and traffic is plain HTTP: put the port behind a VPN or an SSH tunnel as well.
   allow_remote: false
 
 identity:

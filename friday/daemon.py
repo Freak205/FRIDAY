@@ -84,7 +84,8 @@ app = FastAPI(title="FRIDAY", version=__version__, lifespan=lifespan)
 #   * the default `host` is loopback, and a non-loopback host refuses to start unless `daemon.allow_remote` is set (`check_bind`);
 #   * a request whose `Host` is not a loopback name is refused (DNS rebinding) unless `allow_remote`;
 #   * a request that carries an `Origin` is refused unless it is this daemon's own origin (same scheme-less host:port as `Host`).
-# This does not authenticate anyone: another program on the same machine still has full access.
+#   * (Phase 63) remote mode additionally requires a bearer token on every request and WebSocket handshake.
+# In local mode this does not authenticate anyone: another program on the same machine still has full access.
 
 _LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 
@@ -101,17 +102,51 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+# Phase 63: remote mode (`daemon.allow_remote`) is only available with a shared secret. It is read from the environment -- never from
+# config.yaml (which sits in the repository / a synced folder), never generated, never logged or returned -- must be at least 32
+# characters, and every HTTP request and every WebSocket handshake must present it as `Authorization: Bearer <token>`. It is a
+# shared secret for a program on the other end, not a user identity: it does not say WHO is calling and gives no per-user rights.
+TOKEN_ENV = "FRIDAY_DAEMON_TOKEN"
+MIN_TOKEN_CHARS = 32
+
+
+def daemon_token() -> str | None:
+    """The configured token, or None when it is missing or too weak to count (short, or a few repeated characters)."""
+    import os
+
+    token = os.environ.get(TOKEN_ENV, "").strip()
+    return token if len(token) >= MIN_TOKEN_CHARS and len(set(token)) >= 8 else None
+
+
+def token_matches(header: str | None, token: str | None) -> bool:
+    import hmac
+
+    if not token or not header:
+        return False
+    scheme, _, presented = header.strip().partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(presented.strip().encode(), token.encode())
+
+
 def check_bind(host: str, allow_remote: bool) -> None:
-    """Refuse to listen beyond loopback without an explicit opt-in. Raises RuntimeError with what to do."""
-    if is_loopback(host):
-        return
+    """Refuse to start where the daemon would be reachable without protection. Raises RuntimeError with what to do.
+
+    * loopback host, remote mode off: fine (local clients; Host/Origin guard below).
+    * a non-loopback host without `daemon.allow_remote`: refused.
+    * `daemon.allow_remote` (any host): refused unless a strong `FRIDAY_DAEMON_TOKEN` is set -- the daemon has no other authentication."""
     if not allow_remote:
+        if is_loopback(host):
+            return
         raise RuntimeError(
-            f"refusing to start the daemon on {host!r}: it has no authentication, so anyone who can reach that address could run "
-            "skills and read the event stream. Use a loopback host (127.0.0.1), or set daemon.allow_remote: true in config.yaml "
-            "if you have put the port behind something that authenticates."
+            f"refusing to start the daemon on {host!r}: it would be reachable from other machines. Use a loopback host "
+            "(127.0.0.1), or set daemon.allow_remote: true in config.yaml AND a token in the FRIDAY_DAEMON_TOKEN environment variable."
         )
-    log.warning("daemon listening on %s with NO authentication (daemon.allow_remote is set)", host)
+    if daemon_token() is None:
+        raise RuntimeError(
+            f"refusing to start the daemon in remote mode (daemon.allow_remote) on {host!r}: no usable access token. Set the "
+            f"{TOKEN_ENV} environment variable to a secret of at least {MIN_TOKEN_CHARS} characters "
+            "(for example: python -c \"import secrets; print(secrets.token_urlsafe(32))\"); clients send it as 'Authorization: Bearer <token>'."
+        )
+    log.warning("daemon in remote mode on %s: every request needs the %s token (shared secret; no user identity)", host, TOKEN_ENV)
 
 
 def _host_name(host_header: str) -> str:
@@ -145,18 +180,31 @@ class LocalOnlyMiddleware:
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         if scope["type"] in ("http", "websocket"):
             headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
-            if not request_allowed(headers.get("host"), headers.get("origin"), CFG.daemon.allow_remote):
+            remote = CFG.daemon.allow_remote
+            if not request_allowed(headers.get("host"), headers.get("origin"), remote):
                 log.warning("daemon refused a %s request (host=%r origin=%r)", scope["type"], headers.get("host"), headers.get("origin"))
-                if scope["type"] == "websocket":
-                    await receive()  # the connect message
-                    await send({"type": "websocket.close", "code": 1008})
-                else:
-                    body = b'{"detail":"forbidden"}'
-                    await send({"type": "http.response.start", "status": 403,
-                                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
-                    await send({"type": "http.response.body", "body": body})
+                await self._refuse(scope, receive, send, 403, b'{"detail":"forbidden"}')
+                return
+            # Phase 63: in remote mode every request must carry the token, checked BEFORE any handler, the session, the executor or the event
+            # stream is reached. No usable token configured = nothing is served (the app can be started without `serve()`). The reply is the
+            # same whether the header is missing, malformed or wrong; neither the header nor the token is logged.
+            if remote and not token_matches(headers.get("authorization"), daemon_token()):
+                log.warning("daemon refused an unauthenticated %s request", scope["type"])
+                await self._refuse(scope, receive, send, 401, b'{"detail":"unauthorized"}', challenge=True)
                 return
         await self.inner(scope, receive, send)
+
+    @staticmethod
+    async def _refuse(scope: dict, receive: Any, send: Any, status: int, body: bytes, *, challenge: bool = False) -> None:
+        if scope["type"] == "websocket":
+            await receive()  # the connect message: the socket is closed without ever being accepted
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
+        if challenge:
+            headers.append((b"www-authenticate", b"Bearer"))
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": body})
 
 
 app.add_middleware(LocalOnlyMiddleware)

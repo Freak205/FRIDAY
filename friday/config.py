@@ -16,9 +16,9 @@ Tier = Literal["L0", "L1", "L2", "L3"]
 class DaemonConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8765
-    # Phase 62: the daemon has NO authentication. A `host` that is not a loopback address is refused at startup unless this is set,
-    # and setting it is an informed decision to expose every route (including an event stream with read-back content and call
-    # arguments, and the ability to run skills) to whoever can reach the port.
+    # Phase 62/63: local mode has no authentication (loopback + Host/Origin checks only). A `host` that is not a loopback address is
+    # refused at startup unless this is set, and setting it ALSO requires a strong FRIDAY_DAEMON_TOKEN in the environment: every request
+    # and WebSocket handshake must then carry it as a bearer token. See friday/daemon.py.
     allow_remote: bool = False
 
 

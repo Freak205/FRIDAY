@@ -35,6 +35,7 @@ from friday.registry import REGISTRY  # noqa: E402
 from friday.session import SESSION  # noqa: E402
 
 EVIL = {"origin": "https://evil.example"}
+TEST_TOKEN = "test-only-token-0123456789-abcdefghijklmnop-XYZ"  # synthetic; never a real credential
 
 
 def refused_ws(client: TestClient, headers: dict) -> bool:
@@ -79,8 +80,11 @@ def run() -> None:
         except RuntimeError as exc:
             assert "allow_remote" in str(exc)
     check("A4 every non-loopback host is refused without the opt-in, and the message says how to opt in", not refused, str(refused))
+    import os
+
+    os.environ[daemon.TOKEN_ENV] = TEST_TOKEN
     daemon.check_bind("0.0.0.0", True)
-    check("A5 with daemon.allow_remote it is allowed (and logged as unauthenticated)", True)
+    check("A5 with daemon.allow_remote AND a token it is allowed (Phase 63: the token is mandatory; see smoke_daemon_auth)", True)
 
     import uvicorn
 
@@ -101,8 +105,9 @@ def run() -> None:
         CFG.daemon.host, CFG.daemon.allow_remote = "0.0.0.0", True
         calls.clear()
         daemon.serve()
-        check("A8 serve() with the opt-in starts it on the requested host", len(calls) == 1 and calls[0]["host"] == "0.0.0.0")
+        check("A8 serve() with the opt-in and a token starts it on the requested host", len(calls) == 1 and calls[0]["host"] == "0.0.0.0")
     finally:
+        os.environ.pop(daemon.TOKEN_ENV, None)
         uvicorn.run = real_run  # type: ignore[assignment]
         CFG.daemon.host, CFG.daemon.allow_remote = "127.0.0.1", False
 
@@ -177,13 +182,15 @@ def run() -> None:
 
     scenario("D. with allow_remote: other hosts may connect, other web pages still may not")
     CFG.daemon.allow_remote = True
+    os.environ[daemon.TOKEN_ENV] = TEST_TOKEN
     try:
-        with TestClient(daemon.app, base_url="http://192.168.1.5:8765") as c:
+        with TestClient(daemon.app, base_url="http://192.168.1.5:8765", headers={"authorization": f"Bearer {TEST_TOKEN}"}) as c:
             check("D1 a non-loopback Host is accepted when the operator opted in", c.get("/health").status_code == 200)
             check("D2 the daemon's own (LAN) origin is accepted", c.get("/health", headers={"origin": "http://192.168.1.5:8765"}).status_code == 200)
-            check("D3 a cross-origin page is still refused, HTTP and websocket", c.get("/health", headers=EVIL).status_code == 403 and refused_ws(c, EVIL))
+            check("D3 a cross-origin page is still refused, HTTP and websocket", c.get("/health", headers=EVIL).status_code == 403 and refused_ws(c, {**EVIL, "authorization": f"Bearer {TEST_TOKEN}"}))
     finally:
         CFG.daemon.allow_remote = False
+        os.environ.pop(daemon.TOKEN_ENV, None)
 
     scenario("E. the header rules themselves")
     allow = daemon.request_allowed
