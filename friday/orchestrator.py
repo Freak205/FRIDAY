@@ -246,6 +246,10 @@ async def run_verified(
     speech = obs.speech
     if obs.verification.status in (verify.VerifyStatus.UNVERIFIED, verify.VerifyStatus.PARTIAL):
         speech = f"{speech} {verify.UNCONFIRMED_NOTE}".strip()
+    if not obs.ok:  # Phase 61: "It did not take effect -- <what was read back>" is a failure message (see Executor.run)
+        from friday import toolview
+
+        speech = toolview.safe_speech(speech)
     return SkillResult(speech=speech, ok=obs.ok, data=obs.data)
 
 

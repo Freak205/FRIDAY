@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from friday import audit
+from friday import audit, toolview
 from friday.bus import BUS
 from friday.config import CFG
 from friday.log import get
@@ -260,7 +260,9 @@ class Executor:
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             audit.complete(audit_id, ok=False, error=str(exc), duration_ms=elapsed)
-            await BUS.publish("skill.error", skill=skill.name, error=str(exc))
+            # Phase 61: the event goes to every bus consumer (GUI, every websocket client); an exception message is library text the
+            # user never asked to hear and may carry a key or token (an HTTP error quotes its URL), so it gets the credential check
+            await BUS.publish("skill.error", skill=skill.name, error=toolview.safe_speech(str(exc)))
             log.exception("skill %s failed", skill.name)
             _record_action(skill.name, args, actor=actor, status="error")
             raise
@@ -270,6 +272,12 @@ class Executor:
             _CURRENT_ACTOR.reset(actor_token)
 
         elapsed = int((time.perf_counter() - started) * 1000)
+        if not result.ok:
+            # Phase 61: a FAILURE reply is an error message, not content the user asked to read back, and skills build it from
+            # library exceptions ("I couldn't fetch it: HTTP 401 for https://...?api_key=..."). Every direct caller (GUI, voice,
+            # /say, /invoke, the event stream, plan steps) receives it from here, so it gets the credential check once, here.
+            # A successful reply is left alone: "what's in my clipboard" is exactly what the user asked to hear.
+            result.speech = toolview.safe_speech(result.speech)
         audit.complete(
             audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed
         )

@@ -1053,7 +1053,9 @@ class Session:
             return SkillResult(speech="That skill isn't available.", ok=False)
         except Exception as exc:
             log.exception("skill %s failed", skill_name)
-            return SkillResult(speech=f"That failed: {exc}", ok=False)
+            from friday import toolview
+
+            return SkillResult(speech=f"That failed: {toolview.safe_speech(str(exc))}", ok=False)  # Phase 61: library text
         self._remember_context_entities(skill_name, args, result)
         self.last_data = dict(result.data or {})
         if skill_name == "plan.run":
