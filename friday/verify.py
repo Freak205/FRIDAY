@@ -960,11 +960,25 @@ def _identity(tool: str, args: dict[str, Any]) -> str:
     return f"{tool}:{sorted(intent.normalize_args(tool, args, semantic=True).items(), key=repr)!r}"
 
 
+def _redone(failed: Any, later: Any) -> bool:
+    """Did the later observation redo what the failed one was after? The same call (`_identity`: Phase 22), or the objective the
+    step report already treats as a recovery (`steps.same_objective`, Phase 54: the same tool on the same target with other content --
+    the only kind of retry the orchestrator's repeat guard lets through -- or another tool of the same kind of action on the same
+    target). Only the SAME objective: a different file or another kind of action recovers nothing."""
+    from friday import steps
+
+    if _identity(failed.step.tool, failed.step.args) == _identity(later.step.tool, later.step.args):
+        return True
+    return steps.same_objective(failed.step.tool, dict(failed.step.args or {}), later.step.tool, dict(later.step.args or {}))
+
+
 def summarize(observations: list[Any]) -> GoalVerification:
     """Fold per-step verifications into one verdict. Considers only steps that carry a
     verification (a state-changing call that really executed and reported success); a step
     that failed on its own is an ordinary failure and is reported as one elsewhere. A
-    FAILED step is recovered when the same call later VERIFIED."""
+    FAILED step is recovered when a LATER step that pursued the same objective (`_redone`)
+    was itself read back and VERIFIED -- a recovery the step report labels but that nobody
+    confirmed (a completion, a partial or unverified read-back) leaves the failed check standing."""
     rows: list[tuple[Any, Verification]] = [
         (o, o.verification) for o in observations if getattr(o, "verification", None) is not None
     ]
@@ -984,12 +998,8 @@ def summarize(observations: list[Any]) -> GoalVerification:
             n_verified += 1
             continue
         if v.status is VerifyStatus.FAILED:
-            key = _identity(o.step.tool, o.step.args)
-            if any(
-                later.status is VerifyStatus.VERIFIED and _identity(lo.step.tool, lo.step.args) == key
-                for lo, later in rows[i + 1:]
-            ):
-                continue  # recovered by a later, verified repeat of the same call
+            if any(later.status is VerifyStatus.VERIFIED and _redone(o, lo) for lo, later in rows[i + 1:]):
+                continue  # recovered by a later, verified redo of the same objective
             failed.append(label)
         else:
             unverified.append(label)
