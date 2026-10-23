@@ -19,6 +19,14 @@ keeps the stored state only if the row still agrees. A stored success with no ro
 stored `verified` stays verified only while its verdict is stored AND the row says succeeded; a step that was in flight when the
 process died is found from the audit log even if it was never checkpointed. Nothing here executes, retries or undoes anything.
 
+Read-back verdicts (Phase 68). The audit row records the TOOL's own verdict, and for a step whose read-back contradicted it that verdict is
+"succeeded": the contradiction exists only in the stored progress (state `failed`, with a verdict whose status is `failed` and at least one check
+false). A stored failure that its row calls succeeded is therefore not a disagreement when that stored verdict explains it -- the step stays
+`failed` (it did not take effect), however often the goal is refreshed or reloaded. The verdict is kept in the stored progress for as long as the
+step is `failed` or `unknown`, so a step whose row had no outcome yet (and so could only be called unknown) is still failed, not completed, when
+its late result lands; only new verification evidence for the step (a different stored verdict) can change that. A stored failure the row
+contradicts with no verdict on record keeps the old rule: unknown, never success. A step the tool itself reported as failed is unaffected.
+
 Recovery. A failed READ is recovered by any later successful read of the same tool or kind (it changed nothing, and a different read
 can supply the information). A failed state change counts as *recovered* only if a LATER successful step pursued the same objective: the same tool on the same
 target (a retry), or another tool of the same kind of action on the same, non-empty target. A success against a different file, page
@@ -466,14 +474,33 @@ def ledger_for_goal(goal_id: str, probe: Any = None) -> list[StepRecord]:
     return [StepRecord(i + 1, r["skill"], _row_state(r, probe), audit=[r["id"]]) for i, r in enumerate(_audit_rows(goal_id))]
 
 
+# States in which a stored read-back verdict still decides the step: it is not (yet) a success, and a row that says "the tool succeeded"
+# only repeats the claim the read-back contradicted.
+_VERDICT_DECIDES = (StepState.FAILED, StepState.UNKNOWN, StepState.RUNNING)
+_CONTRADICTED_NOTE = "it did not take effect: reading the state back contradicted the tool's success"
+
+
+def _contradicted(ver: Any) -> bool:
+    """Does a stored verdict positively establish that the read-back contradicted the tool's success? Its status must be `failed` AND at
+    least one check must be an explicit False (an unreadable check is None, which is not a contradiction). Anything else -- no verdict, a
+    malformed one, a partial or unverified one -- establishes nothing."""
+    if not isinstance(ver, dict) or ver.get("status") != "failed":
+        return False
+    checks = ver.get("checks")
+    return isinstance(checks, list) and any(isinstance(c, (list, tuple)) and len(c) > 1 and c[1] is False for c in checks)
+
+
 def _merge(stored: StepState, row_state: StepState | None, ver: dict | None) -> tuple[StepState, str]:
     """Reconcile a stored state with what its audit row says now. The row decides what happened; the stored state can only
-    confirm it, or supply what the row cannot (`verified`). Disagreement is never resolved in favour of success."""
+    confirm it, or supply what the row cannot (`verified`, or the read-back verdict that contradicted a success the row only
+    repeats). Disagreement is never resolved in favour of success."""
     if row_state is None:                      # references a row that is gone
         if stored in _OK_STATES:
             return StepState.UNKNOWN, "its audit record is no longer available, so a stored success cannot be confirmed"
         return stored, ""
     if row_state in _OK_STATES:                # row: succeeded
+        if stored in _VERDICT_DECIDES and _contradicted(ver):
+            return StepState.FAILED, ""        # the tool said yes, the read-back said no: the row has only the tool's word
         if stored in (StepState.COMPLETED, StepState.VERIFIED, StepState.UNKNOWN, StepState.RUNNING):
             if stored is StepState.VERIFIED:
                 ok = bool(ver) and ver.get("status") == "verified" and all(c[1] is True for c in ver.get("checks", []))
@@ -531,10 +558,13 @@ def reconstruct(goal_id: str, probe: Any = None, *, stopped: str | None = None) 
             notes.append(f"step {p.get('n')} ('{p.get('tool')}'): {why}")
         note = ""
         if state is StepState.FAILED and found:
-            note = _note(found[-1].get("error") or found[-1].get("result") or "")
+            # a contradicted success: the row's own words are the success the read-back refuted, so they are not the note
+            note = (_CONTRADICTED_NOTE if row_state in _OK_STATES
+                    else _note(found[-1].get("error") or found[-1].get("result") or ""))
+        keep_ver = state is StepState.VERIFIED or (state in _VERDICT_DECIDES and _contradicted(p.get("ver")))
         steps.append(StepRecord(
             len(steps) + 1, str(p.get("tool", "?")), state, note, recovered=bool(p.get("recovered")) and state is StepState.FAILED,
-            audit=ids, ver=p.get("ver") if state is StepState.VERIFIED else None,
+            audit=ids, ver=p.get("ver") if keep_ver else None,
         ))
     for r in rows:                             # started but never checkpointed (the process died around it)
         if r["id"] in seen:

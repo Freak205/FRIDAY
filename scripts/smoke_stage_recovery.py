@@ -179,34 +179,26 @@ def tuples(report: dict) -> list[tuple]:
     return [(s["tool"], s["state"], bool(s.get("recovered"))) for s in report["steps"]]
 
 
-def parity(label: str, r: SkillResult, *, exact: bool = True) -> None:
-    """The goal as a restart would find it (the database alone) says what the live run said. `exact=False` is for the one account whose
-    LABEL legitimately differs: a step the tool called successful but the read-back contradicted is `failed` live and `unknown` once
-    rebuilt (Phase 54's merge rule: a stored failure that the audit row -- which only has the tool's own claim -- disagrees with is not
-    resolved in favour of either); there the rebuilt account must still be no better than the live one."""
+def parity(label: str, r: SkillResult) -> None:
+    """The goal as a restart would find it (the database alone) says what the live run said. (Until Phase 68 one account had to be
+    compared more loosely: a step the tool called successful but the read-back contradicted was `failed` live and `unknown` once rebuilt.
+    It is now `failed` in both, so every account is compared exactly.)"""
     gid = r.data["goal_id"]
     live = r.data["report"]
     rebuilt = steps.reconstruct(gid).to_dict()
-    if exact:
-        check(f"{label}: rebuilt from the database alone, the report matches the live one (outcome, steps, what is left)",
-              rebuilt["outcome"] == live["outcome"] and tuples(rebuilt) == tuples(live)
-              and rebuilt.get("remaining", []) == live.get("remaining", []), f"{rebuilt} VS {live}")
-    else:
-        check(f"{label}: rebuilt from the database alone, the same steps and still not a success (the label may be more cautious)",
-              [t[0] for t in tuples(rebuilt)] == [t[0] for t in tuples(live)]
-              and rebuilt["outcome"] in ("partial", "failed", "unknown") and live["outcome"] in ("partial", "failed", "unknown"),
-              f"{rebuilt} VS {live}")
+    check(f"{label}: rebuilt from the database alone, the report matches the live one (outcome, steps, what is left)",
+          rebuilt["outcome"] == live["outcome"] and tuples(rebuilt) == tuples(live)
+          and rebuilt.get("remaining", []) == live.get("remaining", []), f"{rebuilt} VS {live}")
     saved = stage_rows(gid)
     check(f"{label}: every stage is recorded succeeded only if the account is complete (no stage claims what the steps do not)",
           saved != ["succeeded"] * len(saved) or rebuilt["outcome"] in ("complete", "complete_unverified"), f"{saved} {rebuilt['outcome']}")
-    # A restart's refresh rewrites the stored step account from the audit log. It must never touch the stages or the goal's status; and
-    # (except for the one account above, whose labels it does change -- a Phase 54 limitation, see the report) the steps stay as they were.
+    # A restart's refresh rewrites the stored step account from the audit log. It must never touch the stages or the goal's status, and the
+    # steps stay as they were.
     before = (saved, goals_mod.get(gid).status.value, tuples(rebuilt))
     steps.refresh_goals()
     after = (stage_rows(gid), goals_mod.get(gid).status.value, tuples(steps.reconstruct(gid).to_dict()))
-    check(f"{label}: a restart's refresh leaves this goal's stages and status exactly as they were"
-          + (", and its step account" if exact else ""),
-          before == after if exact else before[:2] == after[:2], f"{before} VS {after}")
+    check(f"{label}: a restart's refresh leaves this goal's stages, status and step account exactly as they were",
+          before == after, f"{before} VS {after}")
 
 
 def obs(tool: str, ok: bool = True, *, stage: str = "", args: dict | None = None, error: str = "", ver: str = "") -> Observation:
@@ -488,7 +480,7 @@ def c_verification() -> None:
               f"{stage_rows(gid)} {r.ok} {r.data['report']}")
         check("C''4 ...the contradicted step is a failure, not a completion",
               r.data["report"]["steps"][1] == {"n": 2, "tool": "test.sr_append", "state": "failed"}, str(r.data["report"]))
-        parity("C''3", r, exact=False)
+        parity("C''3", r)
     finally:
         verify.register("test.sr_append", PASSES)
     FAIL_NAMES.clear()
