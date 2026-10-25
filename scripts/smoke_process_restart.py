@@ -158,7 +158,7 @@ class Fixtures:
         @skill(name=SL, tier="L1", action="modify", description="a write that outlives its timeout (Phase 70 fixture)")
         def slow(name: str = "a") -> SkillResult:
             record(f"slow:{name}")
-            time.sleep(60)
+            time.sleep(float(spec.get("slow_s", 60)))       # Phase 71: a spec may make it finish late instead of never
             return SkillResult(speech="Wrote the slow file.")
 
         @skill(name=DIE, tier="L1", action="modify", description="a write during which the process dies (Phase 70 fixture)")
@@ -270,6 +270,7 @@ def child_write(root: Path, name: str) -> None:
     }
     (root / f"expected_{name}.json").write_text(json.dumps(exp), encoding="utf-8")
     sys.stdout.flush()
+    time.sleep(float(spec.get("linger_s", 0)))     # Phase 71: stay alive long enough for an abandoned step's late result to land
     os._exit(0)     # a hard exit, with the slow tool's thread still asleep and no atexit hook run
 
 
