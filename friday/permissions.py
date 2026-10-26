@@ -268,8 +268,8 @@ class Executor:
             raise
         finally:
             self._in_flight.pop(audit_id, None)
-            DETACH.reset(detach_token)
-            _CURRENT_ACTOR.reset(actor_token)
+            audit.reset_context(DETACH, detach_token)
+            audit.reset_context(_CURRENT_ACTOR, actor_token)
 
         elapsed = int((time.perf_counter() - started) * 1000)
         if not result.ok:

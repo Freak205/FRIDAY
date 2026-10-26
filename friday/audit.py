@@ -32,6 +32,19 @@ _CURRENT_GOAL: contextvars.ContextVar[str | None] = contextvars.ContextVar("_CUR
 _SCOPE_IDS: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar("_SCOPE_IDS", default=None)
 
 
+def reset_context(var: contextvars.ContextVar, token: contextvars.Token) -> None:
+    """`var.reset(token)`, except that a reset from a different Context is not an error.
+
+    Phase 72: a run abandoned at shutdown (or at a step timeout) is finalised -- by the garbage collector, or at interpreter exit -- from
+    another Context than the one that set the variable. The `ValueError` this raised in a `finally` replaced the `GeneratorExit` being
+    handled, reached `Executor.run`'s `except Exception`, and wrote `ok=False` over the "outcome unknown" marker of a goal that had not
+    failed. There is nothing to restore in a Context nobody will read again."""
+    try:
+        var.reset(token)
+    except ValueError:
+        pass
+
+
 @contextlib.contextmanager
 def goal_scope(goal_id: str | None) -> Iterator[list[int]]:
     ids: list[int] = []
@@ -40,8 +53,8 @@ def goal_scope(goal_id: str | None) -> Iterator[list[int]]:
     try:
         yield ids
     finally:
-        _SCOPE_IDS.reset(ids_token)
-        _CURRENT_GOAL.reset(token)
+        reset_context(_SCOPE_IDS, ids_token)
+        reset_context(_CURRENT_GOAL, token)
 
 
 def scope_ids() -> list[int] | None:
