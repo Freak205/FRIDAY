@@ -18,8 +18,9 @@ model and cache folders, recovery store) into the temp folder BEFORE importing `
 installs an audit hook that records ANY open / mkdir / listdir / rename / remove of a path under the repository's `data/` -- reads included --
 into the temp folder. The suite fails if there is one. Nothing real runs and the only database is a throwaway under the OS temp folder.
 
-Not covered, and not claimed: a graceful shutdown (the Phase 48 "outcome unknown" marker is written by an atexit hook that a hard exit skips),
-the GUI, voice and the daemon -- only the goal-progress path they all read.
+Not covered, and not claimed: a graceful shutdown (the Phase 48 "outcome unknown" marker is written by `Backend._wind_down` on the quit path, which a
+hard exit never reaches; there is no atexit hook in FRIDAY -- Phase 72 covers the shutdown), the GUI, voice and the daemon -- only the goal-progress path
+they all read.
 """
 
 from __future__ import annotations
@@ -428,8 +429,9 @@ def main() -> int:
             check("7.7 across every restart the fixtures ran only in process A: calls.log has no line from B, C or D",
                   all(line.startswith("A_") for line in (root / "calls.log").read_text(encoding="utf-8").splitlines()))
             pids = [ln.split() for ln in (root / "pids.log").read_text(encoding="utf-8").splitlines()]
-            check("7.8 every child was a genuinely separate OS process: %d distinct process ids, none of them this process's" % len(pids),
-                  len({p[1] for p in pids}) == len(pids) == 2 * len(SPECS) + 2 and str(parent_pid) not in {p[1] for p in pids}, str(pids))
+            # Children run one after another, so Windows may hand a finished child's id to a later one: uniqueness across them proves nothing
+            check("7.8 every one of the %d children was its own OS process, none of them this process" % len(pids),
+                  len(pids) == 2 * len(SPECS) + 2 and str(parent_pid) not in {p[1] for p in pids}, str(pids))
         (root / "watched").mkdir()
         ph = spawn(root, "hookcheck")
         hits = (root / "data_hits_hookcheck.log").read_text(encoding="utf-8") if (root / "data_hits_hookcheck.log").exists() else ""

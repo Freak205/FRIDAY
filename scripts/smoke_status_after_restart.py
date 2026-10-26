@@ -365,9 +365,9 @@ def main() -> int:
             check("7.7 across every process the fixture tools ran only in process A: calls.log has no line from any status process",
                   all(line.startswith("A_") for line in (root / "calls.log").read_text(encoding="utf-8").splitlines()))
             pids = [ln.split() for ln in (root / "pids.log").read_text(encoding="utf-8").splitlines()]
-            check("7.8 every child was a genuinely separate OS process: %d distinct process ids, none of them this process's" % len(pids),
-                  len({p[1] for p in pids}) == len(pids) and str(parent_pid) not in {p[1] for p in pids}
-                  and len(pids) == 3 * len(P70.SPECS) + 2, str(pids))
+            # Children run one after another, so Windows may hand a finished child's id to a later one: uniqueness across them proves nothing
+            check("7.8 every one of the %d children was its own OS process, none of them this process" % len(pids),
+                  str(parent_pid) not in {p[1] for p in pids} and len(pids) == 3 * len(P70.SPECS) + 2, str(pids))
             check("7.9 no process touched data/", P70.no_data_access(root))
         (root / "watched").mkdir()
         ph = spawn(root, "hookcheck")
