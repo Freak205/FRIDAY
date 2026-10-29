@@ -320,15 +320,14 @@ def step_in_stage(step: Any, sg: Any, subgoals: list[Any]) -> bool:
         whatever the descriptions say -- two stages with the same wording are different stages;
       * a step tagged with an id no stage of `subgoals` carries belongs to none: nothing says which stage it was for, and a description
         that happens to match is not evidence;
-      * an untagged step (legacy, or hand-built), or one whose id is ambiguous (two stages share it), is matched by `PlanStep.subgoal`
-        = the stage's description, exactly as before."""
+      * a step tagged with an id that two or more stages share belongs to none (Phase 83): which of them it was for cannot be told, and
+        guessing from the description would credit work to stages it may not have run under;
+      * only an untagged step (legacy, or hand-built: no or empty id) is matched by `PlanStep.subgoal` = the stage's description,
+        exactly as before."""
     sid = str(getattr(step, "subgoal_id", "") or "")
     if sid:
         owners = sum(1 for g in subgoals if str(getattr(g, "id", "") or "") == sid)
-        if owners == 1:
-            return str(getattr(sg, "id", "") or "") == sid
-        if owners == 0:
-            return False
+        return owners == 1 and str(getattr(sg, "id", "") or "") == sid
     return (getattr(step, "subgoal", "") or "") == getattr(sg, "description", "")
 
 

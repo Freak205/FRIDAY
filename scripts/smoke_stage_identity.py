@@ -85,10 +85,20 @@ def main() -> int:
               _subgoal_evidence([a, b], 0, [failed_a]) == [failed_a] and _subgoal_evidence([a, b], 1, [failed_a]) == [])
         check("a step with an id that no stage carries belongs to none (a matching description is not evidence)",
               steps.stage_standing([obs("test.x", Subgoal(id="gone", description=DESC))], [a, b]) == [steps.UNTOUCHED] * 2)
-        check("an id carried by two stages is ambiguous: falls back to the description (both match, as before)",
-              steps.stage_standing([obs("test.x", Subgoal(id="same", description=DESC))],
-                                   [Subgoal(id="same", description=DESC), Subgoal(id="same", description=DESC)])
-              == [steps.RESOLVED, steps.RESOLVED])
+        twins = [Subgoal(id="same", description=DESC), Subgoal(id="same", description=DESC)]
+        amb = obs("test.x", Subgoal(id="same", description=DESC))
+        check("an id carried by two stages is ambiguous: matches NONE, despite identical descriptions (no description fallback)",
+              steps.stage_standing([amb], twins) == [steps.UNTOUCHED] * 2 and not any(steps.step_in_stage(amb.step, g, twins) for g in twins))
+        check("ambiguous id gives no evidence to either stage", _subgoal_evidence(twins, 0, [amb]) == [] and _subgoal_evidence(twins, 1, [amb]) == [])
+        mixed = [Subgoal(id="same", description=DESC), Subgoal(id="same", description="other"), Subgoal(id="solo", description=DESC)]
+        check("ambiguous id does not leak to a differently-ided stage with the same text",
+              steps.stage_standing([amb], mixed) == [steps.UNTOUCHED] * 3)
+        check("an untagged step with the same text still matches by description in that list",
+              steps.stage_standing([obs("test.x", mixed[0], tagged=False)], mixed) == [steps.RESOLVED, steps.UNTOUCHED, steps.RESOLVED])
+        check("missing attribute and empty id both take the legacy path",
+              steps.step_in_stage(type("S", (), {"subgoal": DESC})(), twins[0], twins)
+              and steps.step_in_stage(PlanStep("t", {}, DESC, subgoal_id=""), twins[0], twins))
+        check("a unique id still matches only its own stage", steps.stage_standing([obs("test.x", mixed[2])], mixed) == [steps.UNTOUCHED] * 2 + [steps.RESOLVED])
 
         scenario("B  progression: evidence for stage 0 advances to stage 1 only, never through a same-worded sibling")
         goal = "Check the time."
