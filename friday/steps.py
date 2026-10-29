@@ -272,7 +272,8 @@ def build_report(
     supplies what was never reached; `extra_unknown` names steps known only from the audit log (one that was in flight when the
     whole run was cut off, so no Observation exists for it)."""
     steps, _sources = _records(observations, extra_unknown)
-    return _finalize(steps, stopped, _remaining_of(subgoals))
+    # a step known only from the audit log (cut off in flight) belongs to the current stage but has no tag: then say nothing about it
+    return _finalize(steps, stopped, _remaining_of(subgoals, None if extra_unknown else observations))
 
 
 def _records(observations: list[Any], extra_unknown: list[str] | None = None) -> tuple[list[StepRecord], list[Any]]:
@@ -330,11 +331,16 @@ def stage_standing(observations: list[Any], subgoals: list[Any]) -> list[str]:
     return out
 
 
-def _remaining_of(subgoals: list[Any] | None) -> list[str]:
+def _remaining_of(subgoals: list[Any] | None, observations: list[Any] | None = None) -> list[str]:
+    # Given the run's observations, an ACTIVE stage that no step was tagged with was entered but nothing ran under it (the planner
+    # failed on its first decision, say); it is not in `steps`, so it is named here. Without them (a rebuild from stored progress,
+    # which keeps no stage per step) an ACTIVE stage is assumed to have its steps recorded, as before.
+    standing = stage_standing(observations, subgoals) if observations is not None and subgoals else []
     remaining: list[str] = []
-    for sg in subgoals or []:
+    for i, sg in enumerate(subgoals or []):
         status = getattr(getattr(sg, "status", None), "value", getattr(sg, "status", ""))
-        if status == "pending":  # never started; a failed or active one was attempted and is in `steps`
+        # never started; a failed one, or an active one with steps, was attempted and is in `steps`
+        if status == "pending" or (status == "active" and standing and standing[i] == UNTOUCHED):
             # model-written text; rows saved before Phase 66 were stored unchecked, so the reader checks it too
             from friday import auditview
 
