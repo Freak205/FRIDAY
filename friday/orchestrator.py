@@ -145,6 +145,9 @@ class PlanStep:
     # it expected and what actually happened is visible to it.
     subgoal: str = ""
     expected_outcome: str = ""
+    # Phase 82: the stable id of that Subgoal (`Subgoal.id`), so two stages whose descriptions match are still told apart.
+    # "" = untagged (a legacy / hand-built step): matched by `subgoal` text as before. Never persisted.
+    subgoal_id: str = ""
 
 
 @dataclass(slots=True)
@@ -1179,7 +1182,7 @@ class Orchestrator:
                     rejected_keys.add(call_key)
                     step = PlanStep(
                         tool=tool_name, args=tool_args,
-                        subgoal=subgoals[subgoal_idx].description if subgoals else "",
+                        **_stage_tag(subgoals, subgoal_idx),
                     )
                     fits = _fitting_tools(scope, prompt_specs, user_goal, tool_name) if CFG.planner.action_completion else []
                     observations.append(Observation(
@@ -1235,7 +1238,7 @@ class Orchestrator:
                     rejected_keys.add(call_key)
                     step = PlanStep(
                         tool=tool_name, args=tool_args,
-                        subgoal=subgoals[subgoal_idx].description if subgoals else "",
+                        **_stage_tag(subgoals, subgoal_idx),
                     )
                     observations.append(Observation(
                         step, False, fam.reason, error="intent_mismatch",
@@ -1294,7 +1297,7 @@ class Orchestrator:
                         repeat_streak += 1
                         step = PlanStep(
                             tool=tool_name, args=tool_args,
-                            subgoal=subgoals[subgoal_idx].description if subgoals else "",
+                            **_stage_tag(subgoals, subgoal_idx),
                         )
                         observations.append(Observation(
                             step, False,
@@ -1348,7 +1351,7 @@ class Orchestrator:
                 repeat_streak += 1
                 step = PlanStep(
                     tool=tool_name, args=tool_args,
-                    subgoal=subgoals[subgoal_idx].description if subgoals else "",
+                    **_stage_tag(subgoals, subgoal_idx),
                 )
                 previous = (prior_obs.speech or prior_obs.error or "no output").strip()
                 # Phase 22.0: a paged read that reported where the next part starts says so —
@@ -1407,7 +1410,7 @@ class Orchestrator:
 
             step = PlanStep(
                 tool=tool_name, args=tool_args,
-                subgoal=subgoals[subgoal_idx].description if subgoals else "",
+                **_stage_tag(subgoals, subgoal_idx),
                 expected_outcome=decision.expected_outcome,
             )
             obs, stop = await self._run_step_tracked(step, cancel_check=cancel_check)
@@ -2540,8 +2543,18 @@ def _subgoal_evidence(subgoals: list[Subgoal], idx: int, observations: list[Obse
     stays correctly attributed even if `idx` is later relabeled."""
     if not (0 <= idx < len(subgoals)):
         return []
-    desc = subgoals[idx].description
-    return [o for o in observations if o.step.subgoal == desc and o.error not in NOT_EXECUTED_ERRORS]
+    from friday import steps as _steps
+
+    sg = subgoals[idx]
+    return [o for o in observations if _steps.step_in_stage(o.step, sg, subgoals) and o.error not in NOT_EXECUTED_ERRORS]
+
+
+def _stage_tag(subgoals: list[Subgoal] | None, idx: int) -> dict[str, str]:
+    """The `PlanStep` fields that attribute a step to the current stage: its description (as before) and its stable id.
+    Empty when the run was not given subgoals."""
+    if not subgoals:
+        return {}
+    return {"subgoal": subgoals[idx].description, "subgoal_id": str(subgoals[idx].id or "")}
 
 
 def _auto_advance_subgoal_idx(subgoals: list[Subgoal], idx: int, observations: list[Observation], goal: str) -> int:

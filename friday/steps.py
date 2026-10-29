@@ -313,16 +313,33 @@ def _records(observations: list[Any], extra_unknown: list[str] | None = None) ->
 RESOLVED, UNRESOLVED, UNTOUCHED = "resolved", "unresolved", "untouched"
 
 
+def step_in_stage(step: Any, sg: Any, subgoals: list[Any]) -> bool:
+    """Was `step` run under stage `sg` (one of `subgoals`)? (Phase 82)
+
+      * a step tagged with an id (`PlanStep.subgoal_id`) that names exactly one stage of `subgoals` belongs to THAT stage and no other,
+        whatever the descriptions say -- two stages with the same wording are different stages;
+      * a step tagged with an id no stage of `subgoals` carries belongs to none: nothing says which stage it was for, and a description
+        that happens to match is not evidence;
+      * an untagged step (legacy, or hand-built), or one whose id is ambiguous (two stages share it), is matched by `PlanStep.subgoal`
+        = the stage's description, exactly as before."""
+    sid = str(getattr(step, "subgoal_id", "") or "")
+    if sid:
+        owners = sum(1 for g in subgoals if str(getattr(g, "id", "") or "") == sid)
+        if owners == 1:
+            return str(getattr(sg, "id", "") or "") == sid
+        if owners == 0:
+            return False
+    return (getattr(step, "subgoal", "") or "") == getattr(sg, "description", "")
+
+
 def stage_standing(observations: list[Any], subgoals: list[Any]) -> list[str]:
     """For each subgoal (same order): RESOLVED / UNRESOLVED / UNTOUCHED, from the steps the orchestrator tagged with it
-    (`PlanStep.subgoal` = the stage's description) -- see the module docstring. Pure; reads only the observations."""
+    (`PlanStep.subgoal_id` = the stage's id, else `PlanStep.subgoal` = its description; see `step_in_stage`) -- see the module
+    docstring. Pure; reads only the observations."""
     steps, sources = _records(observations)
-    by_stage: dict[str, list[StepRecord]] = {}
-    for rec, obs in zip(steps, sources):
-        by_stage.setdefault(getattr(obs.step, "subgoal", "") or "", []).append(rec)
     out: list[str] = []
     for sg in subgoals:
-        recs = by_stage.get(getattr(sg, "description", ""), [])
+        recs = [rec for rec, obs in zip(steps, sources) if step_in_stage(obs.step, sg, subgoals)]
         if not recs:
             out.append(UNTOUCHED)
             continue
