@@ -93,6 +93,7 @@ class StepRecord:
     after_failure: bool = False  # a success that ran after an unrecovered failure: not vouched for
     audit: list[int] = field(default_factory=list)   # audit rows that recorded this step
     ver: dict[str, Any] | None = None                # {"status": ..., "checks": [[name, passed], ...]}: verdict, no values
+    fp: dict[str, Any] | None = None                 # keyed objective fingerprint (Phase 89, friday.objectivefp): digests only. Persisted, never shown.
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -321,7 +322,27 @@ def _records(observations: list[Any], extra_unknown: list[str] | None = None) ->
             if redone:
                 s.recovered = True
                 break
+    _fingerprint(steps, calls, sources)
     return steps, sources
+
+
+def _fingerprint(steps: list[StepRecord], calls: list[tuple[str, dict]], sources: list[Any]) -> None:
+    """Phase 89: keyed fingerprints (`friday.objectivefp`) of the steps a restart will need to compare -- a contradicted read-back that a
+    verified step ran after, and the verified steps that ran after one -- made now, while the arguments are in hand. Without a usable key
+    nothing is set and the step is exactly what it was before (the live decisions above never use a fingerprint)."""
+    contradicted = [i for i, s in enumerate(steps)
+                    if s.state is StepState.FAILED and (s.ver or {}).get("status") == "failed" and sources[i] is not None]
+    verified = [i for i, s in enumerate(steps) if s.state is StepState.VERIFIED and sources[i] is not None]
+    want = {i for i in contradicted if any(j > i for j in verified)} | {j for j in verified if any(i < j for i in contradicted)}
+    if not want:
+        return
+    from friday import objectivefp
+
+    key = objectivefp.subkey()
+    if key is None:
+        return
+    for i in sorted(want):
+        steps[i].fp = objectivefp.make(steps[i].tool, calls[i][1], key=key)
 
 
 RESOLVED, UNRESOLVED, UNTOUCHED = "resolved", "unresolved", "untouched"
@@ -454,6 +475,7 @@ def progress_of(report: GoalReport, stopped: str) -> dict[str, Any]:
                 "n": s.n, "tool": s.tool, "state": s.state.value, "audit": list(s.audit),
                 **({"ver": s.ver} if s.ver else {}),
                 **({"recovered": True} if s.recovered else {}),
+                **({"fp": s.fp} if s.fp else {}),
             }
             for s in report.steps
         ],
@@ -629,7 +651,7 @@ def reconstruct(
         keep_ver = state is StepState.VERIFIED or (state in _VERDICT_DECIDES and _contradicted(p.get("ver")))
         steps.append(StepRecord(
             len(steps) + 1, str(p.get("tool", "?")), state, note, recovered=bool(p.get("recovered")) and state is StepState.FAILED,
-            audit=ids, ver=p.get("ver") if keep_ver else None,
+            audit=ids, ver=p.get("ver") if keep_ver else None, fp=p.get("fp") if isinstance(p.get("fp"), dict) and p.get("fp") else None,
         ))
         stored_verified.append(stored is StepState.VERIFIED)
         stored_contradicted.append(_contradicted(p.get("ver")))
@@ -641,10 +663,17 @@ def reconstruct(
         stored_contradicted.append(False)
         notes.append(f"step {len(steps)} ('{r['skill']}') was found only in the audit log")
     if reconcile_recovery:
+        from friday import objectivefp
+
         for i, s in enumerate(steps):
-            if s.recovered and s.state is StepState.FAILED and stored_contradicted[i] and not any(
-                steps[j].state is StepState.VERIFIED or stored_verified[j] for j in range(i + 1, len(steps))
-            ):
+            if not (s.recovered and s.state is StepState.FAILED and stored_contradicted[i]):
+                continue
+            if not any(steps[j].state is StepState.VERIFIED or stored_verified[j] for j in range(i + 1, len(steps))):
+                s.recovered = False
+            # Phase 89: with fingerprints the other half of the Phase 84 rule can be replayed -- the flag stays only if a later step with
+            # adequate evidence (rebuilt as VERIFIED) is fingerprinted as the same objective. Where the fingerprints cannot decide (a
+            # legacy step, no key, another key or version) the flag stays as Phase 85 left it.
+            elif objectivefp.recovered(s, steps[i + 1:]) is False:
                 s.recovered = False
     if not progress and rows:
         notes = ["no step progress was checkpointed; this account comes from the audit log alone"]
@@ -700,7 +729,9 @@ def _stored_steps(progress: dict) -> list[dict]:
 def _steps_view(progress: dict) -> list[tuple]:
     return [(str(s.get("tool")), str(s.get("state")), tuple(i for i in (s.get("audit") if isinstance(s.get("audit"), list) else [])
                                                          if isinstance(i, int)),
-             bool(s.get("recovered")), json.dumps(s.get("ver"), sort_keys=True, default=str)) for s in _stored_steps(progress)]
+             bool(s.get("recovered")), json.dumps(s.get("ver"), sort_keys=True, default=str),
+             json.dumps(s.get("fp") if isinstance(s.get("fp"), dict) and s.get("fp") else None, sort_keys=True, default=str))
+            for s in _stored_steps(progress)]
 
 
 def settle_interrupted_goals(probe: Any = None) -> int:
