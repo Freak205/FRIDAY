@@ -571,11 +571,21 @@ def _merge(stored: StepState, row_state: StepState | None, ver: dict | None) -> 
     return row_state, ""                       # row: running / unknown
 
 
-def reconstruct(goal_id: str, probe: Any = None, *, stopped: str | None = None) -> GoalReport | None:
+def reconstruct(
+    goal_id: str, probe: Any = None, *, stopped: str | None = None, reconcile_recovery: bool = True,
+) -> GoalReport | None:
     """Rebuild a goal's step account from what is stored, WITHOUT running anything: the checkpointed progress (if any), every audit
     row of the goal (the source of truth for outcomes, including a step that was in flight and never checkpointed), the saved
     subgoal statuses (what never started) and Phase 52 ownership (is an open row's process alive?). Read-only and idempotent.
-    None if the goal does not exist."""
+    None if the goal does not exist.
+
+    Phase 85: a stored `recovered` flag on a CONTRADICTED READ-BACK that an older run set under the pre-Phase-84 rule (any later equivalent
+    success) is not taken at its word. Whether a later step was "the same objective" cannot be rebuilt (arguments are not stored; the audit
+    row keeps only a sanitized form), but the rule's other half can: Phase 84 recovers such a failure only through a later step that was
+    itself VERIFIED. If no later step is verified -- neither as stored nor as rebuilt -- the flag is dropped in this account. With a verified
+    later step the flag stays: it may be right, and the evidence to say otherwise is not durable. A plain tool failure (no read-back verdict)
+    is never touched. Nothing stored is changed; `reconcile_recovery=False` (the callers that WRITE progress back) leaves the flag as stored,
+    so a derived correction is never persisted over history."""
     from friday import owner
     from friday.intelligence import goals as goals_mod
 
@@ -589,6 +599,8 @@ def reconstruct(goal_id: str, probe: Any = None, *, stopped: str | None = None) 
     notes: list[str] = []
     steps: list[StepRecord] = []
     seen: set[int] = set()
+    stored_verified: list[bool] = []           # per rebuilt step: did the STORED progress call it verified (before the row re-judged it)?
+    stored_contradicted: list[bool] = []       # per rebuilt step: does its stored verdict positively establish a contradicted read-back?
 
     for p in _stored_steps(progress):
         try:
@@ -619,11 +631,21 @@ def reconstruct(goal_id: str, probe: Any = None, *, stopped: str | None = None) 
             len(steps) + 1, str(p.get("tool", "?")), state, note, recovered=bool(p.get("recovered")) and state is StepState.FAILED,
             audit=ids, ver=p.get("ver") if keep_ver else None,
         ))
+        stored_verified.append(stored is StepState.VERIFIED)
+        stored_contradicted.append(_contradicted(p.get("ver")))
     for r in rows:                             # started but never checkpointed (the process died around it)
         if r["id"] in seen:
             continue
         steps.append(StepRecord(len(steps) + 1, r["skill"], _row_state(r, probe), audit=[r["id"]]))
+        stored_verified.append(False)
+        stored_contradicted.append(False)
         notes.append(f"step {len(steps)} ('{r['skill']}') was found only in the audit log")
+    if reconcile_recovery:
+        for i, s in enumerate(steps):
+            if s.recovered and s.state is StepState.FAILED and stored_contradicted[i] and not any(
+                steps[j].state is StepState.VERIFIED or stored_verified[j] for j in range(i + 1, len(steps))
+            ):
+                s.recovered = False
     if not progress and rows:
         notes = ["no step progress was checkpointed; this account comes from the audit log alone"]
 
@@ -656,7 +678,7 @@ def refresh_goals(probe: Any = None) -> int:
     ).fetchall()]
     for gid in ids:
         goal = goals_mod.get(gid)
-        report = reconstruct(gid, probe)
+        report = reconstruct(gid, probe, reconcile_recovery=False)   # never write a derived correction over what was stored
         if goal is None or report is None:
             continue
         stored = goal.progress or {}
@@ -708,7 +730,7 @@ def settle_interrupted_goals(probe: Any = None) -> int:
             continue
         if verdict != owner.DEAD:
             continue
-        report = reconstruct(gid, probe, stopped="interrupted")
+        report = reconstruct(gid, probe, stopped="interrupted", reconcile_recovery=False)
         if report is None:
             continue
         did = sum(1 for s in report.steps if s.state in _OK_STATES)
