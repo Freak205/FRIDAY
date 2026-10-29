@@ -31,7 +31,10 @@ Recovery. A failed READ is recovered by any later successful read of the same to
 can supply the information). A failed state change counts as *recovered* only if a LATER successful step pursued the same objective: the same tool on the same
 target (a retry), or another tool of the same kind of action on the same, non-empty target. A success against a different file, page
 or name proves nothing about the one that failed and leaves the goal partial. A call with nothing but content to identify it only
-matches an identical call. Decided live, when the arguments are at hand, and stored as a flag.
+matches an identical call. Decided live, when the arguments are at hand, and stored as a flag. Phase 84: a failure that is a CONTRADICTED
+READ-BACK (the tool said yes, reading the state back said no -- the verdict is stored with the step) is recovered only as the goal verdict
+(`verify.summarize`) accepts: by a later step that pursued the same objective AND was itself read back and VERIFIED (`verify._redone`). A
+retry that merely completed, or was only partly or never read back, leaves that failure standing at stage level too.
 
 Stages (Phase 67). A decomposed goal's subgoals ("stages") are credited the same way, from THEIR OWN steps (the ones the orchestrator tagged with
 the stage), never from the run as a whole -- `stage_standing`:
@@ -302,9 +305,20 @@ def _records(observations: list[Any], extra_unknown: list[str] | None = None) ->
     for i, s in enumerate(steps):
         if s.state is not StepState.FAILED:
             continue
+        # a step whose own read-back contradicted the tool (Phase 84) is recovered only the way the goal verdict accepts: `verify._redone`
+        # by a later step that was itself read back and VERIFIED -- the same decision `verify.summarize` makes for that failure
+        contradicted = (s.ver or {}).get("status") == "failed" and sources[i] is not None
         for j in range(i + 1, len(steps)):
             t = steps[j]
-            if t.state in _OK_STATES and same_objective(s.tool, calls[i][1], t.tool, calls[j][1]):
+            if t.state not in _OK_STATES:
+                continue
+            if contradicted:
+                from friday import verify
+
+                redone = t.state is StepState.VERIFIED and sources[j] is not None and verify._redone(sources[i], sources[j])  # noqa: SLF001
+            else:
+                redone = same_objective(s.tool, calls[i][1], t.tool, calls[j][1])
+            if redone:
                 s.recovered = True
                 break
     return steps, sources

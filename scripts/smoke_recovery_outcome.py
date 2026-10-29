@@ -270,10 +270,10 @@ def section_c() -> None:
     CONTRA_ONCE.add("n")
     r = run_plan([call("test.ro_write", {"name": "n", "text": "x"}), call("test.ro_note", {"name": "n", "text": "x"}), done("Wrote.")])
     unresolved("C4", r, "a retry that could not be read back (a completion, not new evidence about the world)",
-               want_steps=[("ro_write", "failed", True), ("ro_note", "completed", False)])
-    check("C4b ...although the step report labels the failed step recovered (Phase 54: completed counts for the report) -- the label alone does not "
-          "override the failed read-back, and the answer still says it could not confirm",
-          r.data["report"]["steps"][0].get("recovered") is True and "couldn't confirm" in r.speech, r.speech)
+               want_steps=[("ro_write", "failed", False), ("ro_note", "completed", False)])
+    check("C4b ...and (Phase 84) the step report no longer labels the failed read-back recovered either: report and verdict agree, and the "
+          "answer still says it could not confirm",
+          r.data["report"]["steps"][0].get("recovered") is not True and "couldn't confirm" in r.speech, r.speech)
 
     CONTRA_ONCE.add("p")
     CONTRA.add("o")
