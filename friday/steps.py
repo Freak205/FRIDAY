@@ -106,6 +106,7 @@ class GoalReport:
     remaining: list[str] = field(default_factory=list)   # subgoals / parts of the request that never ran
     next_action: str = ""
     notes: list[str] = field(default_factory=list)       # what could not be established (reconstruction only)
+    empty_active: list[str] = field(default_factory=list)  # ids of ACTIVE stages named in `remaining` because nothing ran under them; stored, not shown
 
     @property
     def needs_account(self) -> bool:
@@ -273,7 +274,8 @@ def build_report(
     whole run was cut off, so no Observation exists for it)."""
     steps, _sources = _records(observations, extra_unknown)
     # a step known only from the audit log (cut off in flight) belongs to the current stage but has no tag: then say nothing about it
-    return _finalize(steps, stopped, _remaining_of(subgoals, None if extra_unknown else observations))
+    empty = [] if extra_unknown else _empty_active_ids(subgoals, observations)
+    return _finalize(steps, stopped, _remaining_of(subgoals, empty), empty_active=empty)
 
 
 def _records(observations: list[Any], extra_unknown: list[str] | None = None) -> tuple[list[StepRecord], list[Any]]:
@@ -331,16 +333,27 @@ def stage_standing(observations: list[Any], subgoals: list[Any]) -> list[str]:
     return out
 
 
-def _remaining_of(subgoals: list[Any] | None, observations: list[Any] | None = None) -> list[str]:
-    # Given the run's observations, an ACTIVE stage that no step was tagged with was entered but nothing ran under it (the planner
-    # failed on its first decision, say); it is not in `steps`, so it is named here. Without them (a rebuild from stored progress,
-    # which keeps no stage per step) an ACTIVE stage is assumed to have its steps recorded, as before.
-    standing = stage_standing(observations, subgoals) if observations is not None and subgoals else []
+def _status_of(sg: Any) -> Any:
+    return getattr(getattr(sg, "status", None), "value", getattr(sg, "status", ""))
+
+
+def _empty_active_ids(subgoals: list[Any] | None, observations: list[Any]) -> list[str]:
+    """Ids of the ACTIVE stages that no step was tagged with: entered, but nothing ran under them (the planner failed on its first
+    decision, say), so they are in neither `steps` nor the pending list. Only a live run can tell (it sees each step's stage); the ids
+    are stored with the progress (`empty_active`) so a rebuild can say the same."""
+    if not subgoals:
+        return []
+    standing = stage_standing(observations, subgoals)
+    return [str(getattr(sg, "id", "")) for sg, st in zip(subgoals, standing) if _status_of(sg) == "active" and st == UNTOUCHED
+            and getattr(sg, "id", "")]
+
+
+def _remaining_of(subgoals: list[Any] | None, empty_active: list[str] | None = None) -> list[str]:
     remaining: list[str] = []
-    for i, sg in enumerate(subgoals or []):
-        status = getattr(getattr(sg, "status", None), "value", getattr(sg, "status", ""))
-        # never started; a failed one, or an active one with steps, was attempted and is in `steps`
-        if status == "pending" or (status == "active" and standing and standing[i] == UNTOUCHED):
+    for sg in subgoals or []:
+        status = _status_of(sg)
+        # never started, or active with nothing run under it; a failed one, or an active one with steps, was attempted and is in `steps`
+        if status == "pending" or (status == "active" and str(getattr(sg, "id", "")) in (empty_active or ())):
             # model-written text; rows saved before Phase 66 were stored unchecked, so the reader checks it too
             from friday import auditview
 
@@ -348,7 +361,9 @@ def _remaining_of(subgoals: list[Any] | None, observations: list[Any] | None = N
     return remaining
 
 
-def _finalize(steps: list[StepRecord], stopped: str, remaining: list[str], notes: list[str] | None = None) -> GoalReport:
+def _finalize(
+    steps: list[StepRecord], stopped: str, remaining: list[str], notes: list[str] | None = None, empty_active: list[str] | None = None,
+) -> GoalReport:
     """The outcome, the flags on later steps and the next safe action, from step states alone (shared by a live run and a
     reconstruction, so both say the same thing about the same steps)."""
     first_unrecovered = next((i for i, s in enumerate(steps) if s.state is StepState.FAILED and not s.recovered), None)
@@ -394,7 +409,7 @@ def _finalize(steps: list[StepRecord], stopped: str, remaining: list[str], notes
         next_action = "I can try the failed step again if you ask."
     if outcome in ("partial", "unknown", "needs_input", "failed") and stopped not in ("completed", "cancelled") and not remaining:
         remaining = ["the rest of the request"]
-    return GoalReport(outcome, steps, remaining, next_action, list(notes or []))
+    return GoalReport(outcome, steps, remaining, next_action, list(notes or []), list(empty_active or []))
 
 
 # -- persistence --------------------------------------------------------------------------------------------------------------
@@ -412,6 +427,8 @@ def progress_of(report: GoalReport, stopped: str) -> dict[str, Any]:
             }
             for s in report.steps
         ],
+        # stage ids only (no text); absent in progress saved before Phase 80, which a rebuild reads as "unknown", as it always did
+        **({"empty_active": list(report.empty_active)} if report.empty_active else {}),
     }
 
 
@@ -581,10 +598,15 @@ def reconstruct(goal_id: str, probe: Any = None, *, stopped: str | None = None) 
         notes = ["no step progress was checkpointed; this account comes from the audit log alone"]
 
     stop = stopped if stopped is not None else str(progress.get("stopped") or "")
-    remaining = _remaining_of(goal.subgoals)
+    # Stage ids the live run stored as "entered, nothing ran under it". Used only while the stage is still ACTIVE, and not at all when
+    # a step is known only from the audit log (it ran after that checkpoint, in some stage: the stored claim may no longer hold).
+    raw_empty = progress.get("empty_active")
+    empty = [i for i in raw_empty if isinstance(i, str)] if isinstance(raw_empty, list) and all(r["id"] in seen for r in rows) else []
+    remaining = _remaining_of(goal.subgoals, empty)
+    kept = [str(getattr(sg, "id", "")) for sg in (goal.subgoals or []) if _status_of(sg) == "active" and str(getattr(sg, "id", "")) in empty]
     if not remaining and goal.status.value in ("running", "partial", "failed") and stop != "completed" and (steps or progress):
         remaining = ["the rest of the request"]
-    return _finalize(steps, stop or "interrupted", remaining, notes)
+    return _finalize(steps, stop or "interrupted", remaining, notes, empty_active=kept)
 
 
 def refresh_goals(probe: Any = None) -> int:

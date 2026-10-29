@@ -186,13 +186,9 @@ def parity(label: str, r: SkillResult) -> None:
     gid = r.data["goal_id"]
     live = r.data["report"]
     rebuilt = steps.reconstruct(gid).to_dict()
-    # Phase 79: the live report also names an ACTIVE stage under which no step ran (it can see each step's stage). Stored progress
-    # keeps no stage per step, so a rebuild cannot tell that stage from one with steps and leaves it out. Nothing else may differ.
-    active = {s.description for s in (goals_mod.get(gid).subgoals or []) if s.status.value == "active"}
-    live_left = [d for d in live.get("remaining", []) if d not in active]
     check(f"{label}: rebuilt from the database alone, the report matches the live one (outcome, steps, what is left)",
           rebuilt["outcome"] == live["outcome"] and tuples(rebuilt) == tuples(live)
-          and rebuilt.get("remaining", []) == live_left, f"{rebuilt} VS {live}")
+          and rebuilt.get("remaining", []) == live.get("remaining", []), f"{rebuilt} VS {live}")
     saved = stage_rows(gid)
     check(f"{label}: every stage is recorded succeeded only if the account is complete (no stage claims what the steps do not)",
           saved != ["succeeded"] * len(saved) or rebuilt["outcome"] in ("complete", "complete_unverified"), f"{saved} {rebuilt['outcome']}")
