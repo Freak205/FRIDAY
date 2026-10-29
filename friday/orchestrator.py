@@ -1785,7 +1785,9 @@ class Orchestrator:
         if subgoals:
             lines = []
             for i, sg in enumerate(subgoals):
-                tag = "CURRENT" if i == current_index else ("done" if sg.status.value == "succeeded" else "pending")
+                # Phase 78: a stage that was attempted and FAILED is shown as such, not as "pending" (which reads as
+                # never attempted). Display only -- the stage pointer and every status are unchanged.
+                tag = "CURRENT" if i == current_index else {"succeeded": "done", "failed": "failed"}.get(sg.status.value, "pending")
                 lines.append(f"  {i}. [{tag}] {sg.description}")
             current = subgoals[current_index]
             subgoal_block = (
