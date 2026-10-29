@@ -51,6 +51,25 @@ def _default_db() -> Path:
 DB_PATH = _default_db()  # tests redirect this (store.use_temp_db); production code never assigns it
 DEFAULT_DB_PATH = DB_PATH  # the un-redirected default, so a redirect can be told from the real thing
 LEGACY_DB = DATA / "friday.db"  # where Phases 1-34 kept it; migrated from, never deleted by FRIDAY
+
+
+def _default_key() -> Path | None:
+    """Where the DPAPI-protected master key lives (Phase 87; see friday.keystore).
+
+    Order: the FRIDAY_KEY_FILE environment variable (tests and advanced use); then the per-user local
+    application-data folder (not synced). With neither it is None and the key store is unavailable: the key
+    is never put under `data/`, which is a cloud-synced folder here."""
+    override = os.environ.get("FRIDAY_KEY_FILE", "").strip()
+    if override:
+        return Path(os.path.expandvars(override)).expanduser()
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    if local:
+        return Path(local) / "FRIDAY" / "fingerprint.key"
+    return None
+
+
+KEY_FILE = _default_key()  # tests redirect this (iso_env.isolated_runtime); production code never assigns it
+DEFAULT_KEY_FILE = KEY_FILE
 CONFIG_PATH = ROOT / "config.yaml"
 
 

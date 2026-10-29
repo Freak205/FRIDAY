@@ -101,6 +101,24 @@ def canonical_store() -> Path | None:
     return Path(local) / "FRIDAY" / "snapshots" if local else None
 
 
+def canonical_key() -> Path | None:
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    return Path(local) / "FRIDAY" / "fingerprint.key" if local else None
+
+
+def real_key_paths() -> list[Path]:
+    out = [p for p in (canonical_key(),) if p is not None]
+    default = paths.DEFAULT_KEY_FILE
+    if default is not None and not _under(default, _temp_root()):
+        out.append(Path(default))
+    return out
+
+
+def is_real_key(path: str | os.PathLike[str]) -> bool:
+    n = _norm(path)
+    return any(n == _norm(p) for p in real_key_paths())
+
+
 def real_db_paths() -> list[Path]:
     out = [p for p in (canonical_db(), Path(paths.LEGACY_DB)) if p is not None]
     cfg = configured_db()
@@ -170,6 +188,16 @@ def guard_store(path: str | os.PathLike[str]) -> None:
         raise IsolationError(
             f"refusing to use the real recovery store {path} from a test/benchmark run. "
             "Point paths.SNAPSHOTS at a temp folder, or set FRIDAY_ALLOW_REAL_DB=1 if you really mean it."
+        )
+
+
+def guard_key(path: str | os.PathLike[str]) -> None:
+    """Refuse to touch the user's real key file from a test or benchmark entry point."""
+    if is_test_entrypoint() and is_real_key(path):
+        raise IsolationError(
+            f"refusing to use the real FRIDAY key file {path} from a test/benchmark run. "
+            "Wrap the run in `iso_env.isolated_runtime()` (or point paths.KEY_FILE at a temp file), "
+            "or set FRIDAY_ALLOW_REAL_DB=1 if you really mean it."
         )
 
 
