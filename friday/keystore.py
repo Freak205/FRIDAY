@@ -35,6 +35,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 from pathlib import Path
 
 from friday import dbplace, paths
@@ -56,6 +57,7 @@ _MESSAGES = {
     "undecryptable": "the key file could not be decrypted",
     "bad_length": "the key file holds key material of the wrong length",
     "io_error": "the key file could not be read or written",
+    "unsafe_location": "the key file location is not allowed (repository, data folder, synced folder, or unclassifiable)",
 }
 
 
@@ -96,11 +98,205 @@ def _unprotect(blob: bytes) -> bytes:
         raise KeyUnavailable("undecryptable") from None
 
 
+# --- where the key file may live (Phase 88) ------------------------------------------------------------
+#
+# A path is allowed only if it is positively classified as outside (a) the repository -- which contains
+# `data/` -- and (b) every cloud-synced folder we can enumerate. It is judged both as written (absolute,
+# lexical) and fully resolved (symlinks / junctions followed), and BOTH must be clean. Anything that cannot be
+# classified (an unreadable registry key, a malformed Dropbox config, an unresolvable path) is refused, never
+# assumed safe. This runs before the key file is read and before any directory or file is created.
+
+_PROFILE_SYNC_NAMES = ("dropbox", "google drive", "googledrive", "icloud", "iclouddrive", "box")  # default folders in %USERPROFILE%
+
+
+class _Unclassified(Exception):
+    """A location list could not be read; the caller refuses the path."""
+
+
+def _lex(p: str | os.PathLike[str]) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(p)))
+
+
+def _within(child: str, parent: str) -> bool:
+    return child == parent or child.startswith(parent.rstrip("\\/") + os.sep)
+
+
+def _resolved(p: str | os.PathLike[str]) -> str:
+    try:
+        return os.path.normcase(os.path.realpath(os.fspath(p)))
+    except (OSError, ValueError):
+        raise _Unclassified from None
+
+
+def _onedrive_registry_roots() -> list[str]:
+    """Every OneDrive account folder and mounted library the OneDrive client has registered (HKCU)."""
+    if sys.platform != "win32":
+        return []
+    import winreg
+
+    out: list[str] = []
+    try:
+        accounts = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\OneDrive\Accounts")
+    except FileNotFoundError:
+        return out  # OneDrive has never been set up for this user
+    except OSError:
+        raise _Unclassified from None
+    try:
+        with accounts:
+            for i in range(winreg.QueryInfoKey(accounts)[0]):
+                with winreg.OpenKey(accounts, winreg.EnumKey(accounts, i)) as acct:
+                    try:
+                        out.append(str(winreg.QueryValueEx(acct, "UserFolder")[0]))
+                    except FileNotFoundError:
+                        pass
+                    try:
+                        with winreg.OpenKey(acct, "ScopeIdToMountPointPathCache") as mounts:
+                            for j in range(winreg.QueryInfoKey(mounts)[1]):
+                                out.append(str(winreg.EnumValue(mounts, j)[1]))
+                    except FileNotFoundError:
+                        pass
+    except OSError:
+        raise _Unclassified from None
+    return out
+
+
+def _dropbox_roots() -> list[str]:
+    """Folders named in Dropbox's own `info.json` (per-user and per-machine locations)."""
+    import json
+
+    out: list[str] = []
+    for var in ("APPDATA", "LOCALAPPDATA"):
+        base = os.environ.get(var, "").strip()
+        if not base:
+            continue
+        f = Path(base) / "Dropbox" / "info.json"
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            raise _Unclassified from None
+        if not isinstance(data, dict):
+            raise _Unclassified
+        for acct in data.values():
+            if isinstance(acct, dict) and isinstance(acct.get("path"), str):
+                out.append(acct["path"])
+    return out
+
+
+def _synced_roots() -> list[str]:
+    """All cloud-sync roots we can name: OneDrive (environment + client registry), Dropbox (its own config),
+    and the default sync folders directly under the user profile."""
+    roots: list[str] = []
+    for var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        v = os.environ.get(var, "").strip()
+        if v:
+            roots.append(v)
+    roots += _onedrive_registry_roots()
+    roots += _dropbox_roots()
+    profile = os.environ.get("USERPROFILE", "").strip()
+    if profile:
+        try:
+            for entry in os.scandir(profile):
+                low = entry.name.lower()
+                if low.startswith("onedrive") or low in _PROFILE_SYNC_NAMES:
+                    roots.append(entry.path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise _Unclassified from None
+    return roots
+
+
+def _prepare(path: str | os.PathLike[str]) -> str:
+    """The path as a plain drive-letter path, or `_Unclassified`.
+
+    Windows reaches one file through many spellings (`\\\\?\\C:\\...`, `\\\\localhost\\C$\\...`) that string
+    comparison would not match against the repository. Only the `\\\\?\\X:` / `\\\\.\\X:` forms are unwrapped;
+    every other extended or UNC (network) form is refused as unclassifiable, as is an embedded NUL."""
+    s = os.fspath(path)
+    if "\x00" in s:
+        raise _Unclassified
+    if s.startswith(("\\\\?\\", "\\\\.\\")):
+        rest = s[4:]
+        if not re.match(r"^[A-Za-z]:[\\/]", rest):
+            raise _Unclassified
+        s = rest
+    if os.path.splitdrive(s)[0].startswith(("\\\\", "//")):
+        raise _Unclassified
+    return s
+
+
+def _unsafe(path: Path) -> str | None:
+    """None when `path` is allowed, else a short category (for the log; never shown with a key)."""
+    try:
+        path = Path(_prepare(path))
+        repo = [_lex(paths.ROOT)]
+        if not _within(_lex(paths.DATA), repo[0]):
+            repo.append(_lex(paths.DATA))  # data/ is normally inside the repository; only list it if it is not
+        synced = [_lex(r) for r in _synced_roots()]
+        lexical = _lex(path)
+        # the path as written: decided without touching the filesystem
+        if any(_within(lexical, r) for r in repo):
+            return "repository"
+        if any(_within(lexical, r) for r in synced):
+            return "synced"
+        # the path as it really resolves (follows symlinks and junctions, even through missing tails)
+        real = _resolved(path)
+        if os.path.splitdrive(real)[0].startswith(("\\\\", "//")):
+            raise _Unclassified  # resolved onto a network / extended-length path
+        repo_real = [_resolved(paths.ROOT)] + ([_resolved(paths.DATA)] if len(repo) > 1 else [])
+        if any(_within(real, r) for r in repo_real):
+            return "repository"
+        if any(_within(real, r) for r in synced + [_resolved(r) for r in synced]):
+            return "synced"
+        # last, a deliberately over-cautious name check; it can only refuse more, never allow
+        if dbplace.in_synced_folder(path) or dbplace.in_synced_folder(real):
+            return "synced"
+    except _Unclassified:
+        return "unclassified"
+    return None
+
+
+def _require_safe_location(path: Path) -> None:
+    why = _unsafe(path)
+    if why is not None:
+        _note(f"unsafe_location:{why}", str(path))
+        raise KeyUnavailable("unsafe_location")
+
+
 # --- the key file --------------------------------------------------------------------------------------
 
+_TMP_STALE_S = 3600  # an in-flight temp file lives for milliseconds; one this old was abandoned by a crash
 _lock = threading.Lock()
 _cache: dict[str, bytes] = {}  # normalized key-file path -> master key, so DPAPI runs once per path per process
 _warned: set[tuple[str, str]] = set()
+
+
+def _sweep_abandoned_tmp(path: Path) -> None:
+    """Delete `<name>.tmp-<12 hex>` files in the key's folder that a crashed creator abandoned.
+
+    Narrow on purpose: the exact name pattern we generate, a plain file (not a link), no bigger than a DPAPI
+    blob, and untouched for `_TMP_STALE_S` -- far longer than the milliseconds a live creator needs, so another
+    process's in-flight temp file is never taken. Nothing else in the folder is looked at."""
+    pattern = re.compile(re.escape(path.name) + r"\.tmp-[0-9a-f]{12}")
+    now = time.time()
+    try:
+        with os.scandir(path.parent) as it:
+            for entry in it:
+                if not pattern.fullmatch(entry.name):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                        continue
+                    if st.st_size > _MAX_BLOB or now - st.st_mtime < _TMP_STALE_S:
+                        continue
+                    os.unlink(entry.path)
+                except OSError:
+                    continue
+    except (OSError, ValueError):
+        return
 
 
 def _read(path: Path) -> bytes | None:
@@ -110,7 +306,7 @@ def _read(path: Path) -> bytes | None:
             return f.read(_MAX_BLOB + 1)
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, ValueError):
         raise KeyUnavailable("io_error") from None
 
 
@@ -125,11 +321,13 @@ def _decode(blob: bytes) -> bytes:
 
 def _create(path: Path) -> bytes:
     """Make the key file if (and only if) it does not exist; return the key that is now on disk."""
+    _require_safe_location(path)  # first, so even a direct caller creates no folder in an unsafe place
     key = secrets.token_bytes(KEY_BYTES)
     blob = _protect(key)  # before touching the disk: with no DPAPI, nothing is left behind
     tmp = path.with_name(f"{path.name}.tmp-{secrets.token_hex(6)}")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _require_safe_location(path)  # again now that the folders exist: a link swapped in meanwhile is refused
         with open(tmp, "xb") as f:
             f.write(blob)
             f.flush()
@@ -154,6 +352,9 @@ def _master() -> bytes:
         _note("no_location", "")
         raise KeyUnavailable("no_location")
     path = Path(raw)
+    # every call, cached or not (the repository root or the sync roots can change under a live process), and
+    # first: before the isolation guard resolves the path, before the key file is read, before anything is made
+    _require_safe_location(path)
     dbplace.guard_key(path)
     cache_key = dbplace._norm(path)
     try:
@@ -161,6 +362,7 @@ def _master() -> bytes:
             cached = _cache.get(cache_key)
             if cached is not None:
                 return cached
+            _sweep_abandoned_tmp(path)
             blob = _read(path)
             key = _create(path) if blob is None else _decode(blob)
             _cache[cache_key] = key
