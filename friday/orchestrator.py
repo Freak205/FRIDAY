@@ -438,6 +438,13 @@ def _times_done(observations: list[Observation], tool: str, args: dict[str, Any]
     )
 
 
+def _never_started(o: Observation) -> bool:
+    """Phase 92: did this step report that the command was never started (`shell.run` status `not_started`: no job object, the
+    assignment or the resume failed)? That is a setup failure of the operation, not an outcome of the command -- the identical call
+    would meet the same failure, so an unrelated step in between does not make it a fresh attempt. A different command is another key."""
+    return not o.ok and (o.data or {}).get("status") == "not_started"
+
+
 def find_prior_attempt(
     observations: list[Observation], tool: str, args: dict[str, Any], tier_of: dict[str, str],
 ) -> tuple[int, Observation] | None:
@@ -463,7 +470,7 @@ def find_prior_attempt(
             continue
         later = [x for x in observations[i + 1:] if x.error not in NOT_EXECUTED_ERRORS]
         if not passive:
-            return (i, o) if not later else None
+            return (i, o) if not later or _never_started(o) else None
         if o.fingerprint != _state_fingerprint(args):
             return None  # the file it read has changed underneath it
         if later and (not o.ok or (o.data or {}).get("uncertain")):
@@ -1325,8 +1332,8 @@ class Orchestrator:
                             )
                         avoid = (tool_name, "count_reached")
                         continue
-                    if prior is not None:
-                        prior = None  # asked for again by the user's own count: not a redundant repeat
+                    if prior is not None and not _never_started(prior[1]):
+                        prior = None  # asked for again by the user's own count: not a redundant repeat (a call that never started is not one of its runs)
             if prior is not None and continuation:
                 # Phase 21.0: the user's own words ask for MORE ("read more", "next
                 # page", "continue"). An identical read is then not a redundant one —
