@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
 
+from friday import shellproc
 from friday.log import get
 from friday.registry import SkillResult, skill
 from friday.intent import GIT_RULE
@@ -87,27 +89,54 @@ def run(
         else ["cmd", "/c", command]
     )
 
-    try:
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=_TIMEOUT, cwd=workdir
+    # Phase 90: the command runs as an operation that owns its process tree (friday.shellproc), tied to the goal running
+    # now, so FRIDAY's one STOP signal can end exactly that tree instead of waiting it out.
+    owner, stop_requested = _stop_scope()
+    done = shellproc.run_owned(argv, cwd=workdir, timeout_s=_TIMEOUT, owner=owner, stop_requested=stop_requested)
+
+    out = (done.stdout or "").strip()
+    err = (done.stderr or "").strip()
+    data = {"stdout": out, "stderr": err, "returncode": done.returncode}
+
+    if done.state == shellproc.COMPLETED:
+        ok = done.returncode == 0
+        if ok:
+            speech = out[:400] if out else "Done, no output."
+        else:
+            speech = f"Exit code {done.returncode}. {(err or out)[:300]}"
+        return SkillResult(speech=speech, ok=ok, data=data)
+
+    # Never ok: the command did not finish, whatever the exit code of what was left says.
+    if done.state == shellproc.UNKNOWN:
+        why = "stopped" if done.cause == shellproc.CANCELLED else f"timed out after {_TIMEOUT} seconds"
+        return SkillResult(
+            speech=f"That command was {why}, but I couldn't confirm that it and everything it started have ended.",
+            ok=False, data={**data, "status": "unknown_outcome", "reason": done.detail},
         )
-    except subprocess.TimeoutExpired:
-        return SkillResult(speech=f"That command timed out after {_TIMEOUT} seconds.", ok=False)
-
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
-    ok = proc.returncode == 0
-
-    if ok:
-        speech = out[:400] if out else "Done, no output."
-    else:
-        speech = f"Exit code {proc.returncode}. {(err or out)[:300]}"
-
+    if done.state == shellproc.CANCELLED:
+        return SkillResult(
+            speech="I stopped that command.", ok=False, data={**data, "status": "cancelled", "ended": done.how},
+        )
     return SkillResult(
-        speech=speech,
-        ok=ok,
-        data={"stdout": out, "stderr": err, "returncode": proc.returncode},
+        speech=f"That command timed out after {_TIMEOUT} seconds.", ok=False,
+        data={**data, "status": "timeout", "ended": done.how},
     )
+
+
+def _stop_scope() -> tuple[str | None, Callable[[], bool] | None]:
+    """(owner, stop_requested) for a command started now. The shared STOP flag is armed only while a goal runs; the command is
+    tied to THAT goal, so a stop meant for it ends it and a flag armed later for some other goal never does. A command started
+    outside any goal (a direct request) has no stop signal to follow, as before."""
+    try:
+        from friday.intelligence.state import INTEL
+
+        if not INTEL.goal_running:
+            return None, None
+        gid = INTEL.state.current_goal_id   # may be "" for a goal started without tracking; still THE running goal
+        return str(gid), lambda: INTEL.goal_running and INTEL.state.current_goal_id == gid and INTEL.is_cancel_requested()
+    except Exception:
+        log.exception("stop scope failed (non-fatal)")
+        return None, None
 
 
 @skill(

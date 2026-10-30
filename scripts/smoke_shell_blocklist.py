@@ -114,22 +114,23 @@ def main() -> int:
         why = shell._screen(command)
         check(f"allowed: {label}", why is None, f"{command!r} -> {why!r}")
 
-    scenario("E: fail-closed — a blocked command never reaches subprocess.run")
-    import subprocess
+    scenario("E: fail-closed — a blocked command never reaches the process runner")
+    # Phase 90: shell.run no longer calls subprocess.run; `shellproc.run_owned` is the one place it starts a process.
+    from friday import shellproc
 
     spawned = []
-    original_run = subprocess.run
+    original_run = shellproc.run_owned
 
     def spy_run(*args, **kwargs):
         spawned.append(args)
         return original_run(*args, **kwargs)
 
-    subprocess.run = spy_run
+    shellproc.run_owned = spy_run
     try:
         result = shell.run(command="format c:")
         check("blocked command returns ok=False", not result.ok, result.speech)
         check("blocked command's speech explains why, without running it", "format" in result.speech.lower() and "won't" in result.speech.lower(), result.speech)
-        check("subprocess.run was never invoked for a blocked command", spawned == [], spawned)
+        check("the process runner was never invoked for a blocked command", spawned == [], spawned)
 
         spawned.clear()
         result2 = shell.run(command="del /s /q c:\\")
@@ -139,7 +140,7 @@ def main() -> int:
         result3 = shell.run(command="dir")
         check("an ALLOWED command still actually runs", result3.ok and spawned != [], f"ok={result3.ok} spawned={bool(spawned)}")
     finally:
-        subprocess.run = original_run
+        shellproc.run_owned = original_run
 
     return finish("Phase 25 — shell.run blocklist", time.perf_counter() - t0, min_assertions=30, min_scenarios=5)
 
