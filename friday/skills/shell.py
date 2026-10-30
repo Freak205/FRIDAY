@@ -106,6 +106,13 @@ def run(
             speech = f"Exit code {done.returncode}. {(err or out)[:300]}"
         return SkillResult(speech=speech, ok=ok, data=data)
 
+    # Phase 91: ownership of the process tree could not be set up before the command could run, so it was never started.
+    if done.state == shellproc.NOT_STARTED:
+        return SkillResult(
+            speech="I didn't run that command: I couldn't set it up so that I could reliably stop it.",
+            ok=False, data={"status": "not_started", "reason": done.detail},
+        )
+
     # Never ok: the command did not finish, whatever the exit code of what was left says.
     if done.state == shellproc.UNKNOWN:
         why = "stopped" if done.cause == shellproc.CANCELLED else f"timed out after {_TIMEOUT} seconds"

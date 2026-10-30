@@ -262,7 +262,7 @@ def main() -> int:
         restore_fast()
         INTEL.end_goal(ok=False, status="cancelled")
         cleanup()
-    return finish("Phase 90 shell cancellation", time.perf_counter() - started, min_assertions=135, min_scenarios=11)
+    return finish("Phase 90 shell cancellation", time.perf_counter() - started, min_assertions=130, min_scenarios=11)
 
 
 def scenarios() -> None:
@@ -308,14 +308,14 @@ def scenarios() -> None:
     # a stop acted on after the process has already exited: nothing to terminate, nothing sent, nothing harmed
     proc = subprocess.Popen([sys.executable, "-c", "pass"], stdout=subprocess.PIPE, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
     job = shellproc._new_job()
-    tracked = shellproc._assign(job, proc)
+    shellproc._assign(job, proc)
     proc.communicate()
     calls = {"term": 0, "send": 0}
     o_term, o_send = shellproc._terminate_job, shellproc._send_graceful
     shellproc._terminate_job = lambda j: calls.__setitem__("term", calls["term"] + 1) or True
     shellproc._send_graceful = lambda p: calls.__setitem__("send", calls["send"] + 1) or False   # never aim a signal at a dead pid
     try:
-        gone, how = shellproc._stop_tree(proc, job, tracked, grace_s=0.3, confirm_s=0.3)
+        gone, how = shellproc._stop_tree(proc, job, grace_s=0.3, confirm_s=0.3)
     finally:
         shellproc._terminate_job, shellproc._send_graceful = o_term, o_send
         shellproc._close(job)
@@ -502,26 +502,30 @@ def scenarios() -> None:
     check("H4 unknown is not reported as cancelled or completed", out is not None and out.state not in (shellproc.CANCELLED, shellproc.COMPLETED))
     check("H5 the registry is cleaned up even so", shellproc.active() == [])
 
+    # Phase 91: ownership is established BEFORE the child can run, so "no job" / "assignment failed" are no longer an
+    # "unknown" end of a running process: the command is simply never started (see smoke_shell_ownership for the full set).
     o_new = shellproc._new_job
     shellproc._new_job = lambda: None
     try:
         a, ready = argv("sleep", "h2")
         op = Op(a, ready, timeout_s=60, grace_s=0.5, confirm_s=0.5)
-        out = op.join()
+        out = op.join(10.0)
     finally:
         shellproc._new_job = o_new
-    check("H6 no job object -> unknown (the descendants cannot be named)", out is not None and out.state == shellproc.UNKNOWN, getattr(out, "state", ""))
-    check("H7 detail not_tracked", out is not None and out.detail == "not_tracked", getattr(out, "detail", ""))
+    check("H6 no job object -> the command is not started (not 'unknown', not running)", out is not None and out.state == shellproc.NOT_STARTED, getattr(out, "state", ""))
+    check("H7 detail no_job", out is not None and out.detail == "no_job", getattr(out, "detail", ""))
+    check("H7b the child never ran (its ready file was never written)", not ready.exists())
 
     o_as = shellproc._assign
     shellproc._assign = lambda j, p: False
     try:
         a, ready = argv("sleep", "h3")
         op = Op(a, ready, timeout_s=60, grace_s=0.5, confirm_s=0.5)
-        out = op.join()
+        out = op.join(10.0)
     finally:
         shellproc._assign = o_as
-    check("H8 assignment to the job fails -> unknown", out is not None and out.state == shellproc.UNKNOWN and out.detail == "not_tracked", str(out))
+    check("H8 assignment to the job fails -> not started", out is not None and out.state == shellproc.NOT_STARTED and out.detail == "assign_failed", str(out))
+    check("H8b the child never ran", not ready.exists())
 
     o_ac = shellproc._active_count
     shellproc._active_count = lambda j: None
@@ -533,22 +537,23 @@ def scenarios() -> None:
         shellproc._active_count = o_ac
     check("H9 the job cannot be queried -> unknown", out is not None and out.state == shellproc.UNKNOWN, getattr(out, "state", ""))
 
+    # shell.run end to end for an unconfirmed termination (the job reports a process still active)
     restore = shellproc.run_owned
     shellproc.run_owned = lambda *aa, **kk: restore(*aa, **{**kk, "grace_s": 0.5, "confirm_s": 0.5})
-    o_new = shellproc._new_job
-    shellproc._new_job = lambda: None
+    o_ac = shellproc._active_count
+    shellproc._active_count = lambda j: 1
     try:
         cmd, ready = cmdline("sleep", "h5")
         box = run_in_goal(cmd, ready)
     finally:
-        shellproc._new_job = o_new
+        shellproc._active_count = o_ac
         shellproc.run_owned = restore
     r = box["result"]
     check("H10 shell.run: ok False", r.ok is False)
     check("H11 shell.run: status unknown_outcome", r.data.get("status") == "unknown_outcome", str(r.data))
     check("H12 shell.run: speech says it could not confirm", "couldn't confirm" in r.speech, r.speech)
     check("H13 shell.run: never says cancelled or stopped successfully", r.data.get("status") != "cancelled" and "I stopped that command" not in r.speech)
-    check("H14 shell.run: reason is a fixed code", r.data.get("reason") == "not_tracked", str(r.data))
+    check("H14 shell.run: reason is a fixed code", r.data.get("reason") == "tree_still_running", str(r.data))
     cleanup()
 
     # ------------------------------------------------------------------ I
@@ -647,31 +652,32 @@ def note_ready(ready: Path) -> None:
 def scenario_k() -> None:
     scenario("K  regressions: hang on an untracked tree, a failing stop callback, an empty goal id, a finish just before the stop")
 
-    # ---- K1: nothing may hang when the tree cannot be tracked or terminated
+    # ---- K1: nothing may hang when the tree cannot be owned or terminated
     check("K0 the base interpreter exists and has no spaces (cmd /c is unquoted)", Path(BASE_PY).exists() and " " not in BASE_PY, BASE_PY)
+    # Phase 91: with no job the child is never started, so there is nothing that could hold a pipe and nothing to hang on.
     o_new = shellproc._new_job
     shellproc._new_job = lambda: None
     try:
         a, ready = hold_argv("k1a")
         op = Op(a, ready, timeout_s=60, grace_s=0.5, confirm_s=0.5)
         out = op.join(10.0)
-        note_ready(ready)
-        returned = not op.thread.is_alive()
-        check("K1 untracked, child+grandchild ignore Break and hold the pipe: run_owned RETURNS within 10 s", returned, f"{op.elapsed:.1f}s")
-        check("K2 ... state unknown", out is not None and out.state == shellproc.UNKNOWN, str(out))
-        check("K3 ... detail not_tracked", out is not None and out.detail == "not_tracked", getattr(out, "detail", ""))
+        check("K1 no job: run_owned RETURNS within 10 s", not op.thread.is_alive(), f"{op.elapsed:.1f}s")
+        check("K2 ... state not_started", out is not None and out.state == shellproc.NOT_STARTED, str(out))
+        check("K3 ... detail no_job", out is not None and out.detail == "no_job", getattr(out, "detail", ""))
         check("K4 ... no exception escaped", op.error is None, repr(op.error))
-        check("K5 ... registry cleaned up", shellproc.active() == [])
-        cleanup()
+        check("K5 ... registry cleaned up and the child never ran", shellproc.active() == [] and not ready.exists())
 
-        cmd = f"{BASE_PY} {HOLD} {TMP / 'k1b.ready'}"
         (TMP / "k1b.ready").unlink(missing_ok=True)
-        box = run_in_goal(cmd, TMP / "k1b.ready", wait_s=15.0)
+        cmd = f"{BASE_PY} {HOLD} {TMP / 'k1b.ready'}"
+        INTEL.start_goal("p90 test", "goal-k1b")
+        try:
+            r = shell.run(cmd, shell="cmd", cwd=str(TMP))
+        finally:
+            INTEL.end_goal(ok=False, status="cancelled")
         note_ready(TMP / "k1b.ready")
-        r = box.get("result")
-        check("K6 shell.run on the same untracked tree returns (not hung)", r is not None, str(box.get("error")))
+        check("K6 shell.run with no job returns (not hung)", r is not None)
         check("K7 ... ok False", r is not None and r.ok is False)
-        check("K8 ... status unknown_outcome with reason not_tracked", r is not None and r.data.get("status") == "unknown_outcome" and r.data.get("reason") == "not_tracked", str(getattr(r, "data", "")))
+        check("K8 ... status not_started with reason no_job", r is not None and r.data.get("status") == "not_started" and r.data.get("reason") == "no_job", str(getattr(r, "data", "")))
     finally:
         shellproc._new_job = o_new
         cleanup()
@@ -701,7 +707,7 @@ def scenario_k() -> None:
     check("K14 every spawned hold process was cleaned up by recorded pid", not any(alive(p, c) for p, c in SPAWNED.items()))
 
     # ---- K2: an exception from the stop callback must not leave the process running
-    for label, untracked in (("tracked", False), ("untracked", True)):
+    for label, untracked in (("tracked", False),):   # Phase 91: an untracked run can no longer start
         a, ready = argv("tree", f"k2{label}")
         calls = {"n": 0}
         snap: list[tuple[int, float]] = []

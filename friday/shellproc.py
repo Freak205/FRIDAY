@@ -9,8 +9,24 @@ processes an operation owned.
 What an operation owns here:
 
   * its own process group (`CREATE_NEW_PROCESS_GROUP`), so a console Ctrl+Break can be aimed at it and nothing else; and
-  * a Windows job object the child is assigned to right after it starts. Every descendant it starts joins the job, so "the
-    operation's tree" is a kernel-tracked set, not a guess from names or parent ids. Nothing else is ever in that job.
+  * a Windows job object the child is assigned to BEFORE it executes a single instruction (Phase 91, below). Every descendant it
+    starts joins the job, so "the operation's tree" is a kernel-tracked set, not a guess from names or parent ids. Nothing else is
+    ever in that job.
+
+Starting, in this order (Phase 91; Phase 90 assigned the job after the child was already running, so a child could start a
+descendant first and that descendant would never be in the job):
+
+  1. create the operation's job object, armed kill-on-close (so a crash of FRIDAY while the child is suspended takes the child
+     with it) -- if that fails, nothing is started;
+  2. create the child SUSPENDED (`CREATE_SUSPENDED`): its initial thread has not run any code, not even the loader;
+  3. assign it to the job -- if that fails, the suspended child is killed without ever having run;
+  4. switch the job's kill-on-close off, then resume the child's one initial thread (checked: it is the only thread, and it had been
+     suspended exactly once) -- if either fails, the child is killed, still not having run;
+  5. only now can it run, and everything it starts inherits the job.
+
+A failure at any step ends in the "not_started" outcome with a fixed reason code, and the job, the process handle and the pipes are
+released. Nested jobs (FRIDAY itself inside a job) are handled by Windows 8+ job nesting; where Windows refuses the assignment the
+command is simply not run -- never run unowned.
 
 Stopping, bounded and in this order (nothing is ever killed by image name, and `taskkill` is never used):
 
@@ -18,12 +34,12 @@ Stopping, bounded and in this order (nothing is ever killed by image name, and `
   2. forced:   `TerminateJobObject` on the operation's own job -- only if step 1 did not empty it (or could not be sent);
   3. confirm:  wait up to `confirm_s` for the job to report zero active processes.
 
-If step 3 cannot show the tree is gone (the job could not be created or queried, or a process outlived the terminate) the outcome
+If step 3 cannot show the tree is gone (the job could not be queried, or a process outlived the terminate) the outcome
 is "unknown", never "cancelled". A process that finished on its own before the stop is simply "completed": a stop that arrives
 after the fact changes nothing and harms nothing, and a repeated stop is the same flag read again -- the worker thread that owns
 the process handles it once, then leaves.
 
-The job is deliberately NOT created with kill-on-close: a command that intentionally leaves something running (`start notepad`)
+Once released, the job is NOT kill-on-close: a command that intentionally leaves something running (`start notepad`)
 keeps doing so after it completes normally, exactly as before.
 
 Only the thread that started the process ever stops it; the caller supplies `stop_requested()`, scoped by the caller to the
@@ -33,6 +49,7 @@ are released on every path.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import signal
 import subprocess
@@ -55,6 +72,10 @@ COMPLETED = "completed"   # the process ended by itself (any exit code)
 TIMEOUT = "timeout"       # the time limit ran out and the tree was confirmed gone
 CANCELLED = "cancelled"   # a stop request ended it and the tree was confirmed gone
 UNKNOWN = "unknown"       # a stop/timeout was acted on but the tree could not be confirmed gone
+NOT_STARTED = "not_started"  # ownership could not be established before the child could run, so it never ran
+
+CREATE_SUSPENDED = 0x00000004
+_THREAD_SUSPEND_RESUME = 0x0002
 
 _WIN = sys.platform == "win32"
 if _WIN:
@@ -70,7 +91,7 @@ class Outcome:
     stdout: str = ""
     stderr: str = ""
     how: str = ""          # "", "graceful" or "forced": how a stop/timeout ended the tree
-    detail: str = ""       # a fixed reason code for UNKNOWN (never argument text)
+    detail: str = ""       # a fixed reason code for UNKNOWN / NOT_STARTED (never argument text)
     cause: str = ""        # for UNKNOWN: what was being acted on, CANCELLED or TIMEOUT
 
 
@@ -95,19 +116,43 @@ def active() -> list[dict]:
 
 # -- the Windows seam: every kernel call lives here so tests can replace one function -----------------------------------------
 
+def _set_kill_on_close(job, on: bool) -> bool:
+    try:
+        info = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
+        flags = info["BasicLimitInformation"]["LimitFlags"]
+        flags = (flags | win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) if on else (flags & ~win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        info["BasicLimitInformation"]["LimitFlags"] = flags
+        win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, info)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _new_job():
-    """A job object for one operation, or None. Not kill-on-close (see the module docstring)."""
+    """A job object for one operation, or None. It starts kill-on-close, so if FRIDAY dies while the child is still suspended the
+    child dies with it; `_disarm` turns that off just before the child is released (see the module docstring)."""
     if not _WIN:
         return None
     try:
-        return win32job.CreateJobObject(None, "")
+        job = win32job.CreateJobObject(None, "")
     except Exception:  # noqa: BLE001
-        log.warning("shell operation: job object unavailable; the process tree cannot be tracked")
+        log.warning("shell operation: job object unavailable")
         return None
+    if not _set_kill_on_close(job, True):
+        _close(job)
+        log.warning("shell operation: job object could not be armed")
+        return None
+    return job
+
+
+def _disarm(job) -> bool:
+    """Stop the job killing its processes when its handle closes: from here on a command that deliberately leaves something running
+    keeps doing so after it completes, exactly as before."""
+    return _set_kill_on_close(job, False)
 
 
 def _assign(job, proc: subprocess.Popen) -> bool:
-    """Put the just-started child in the job. False when that is not possible (then the tree is not tracked)."""
+    """Put the suspended child in the job. False when that is not possible."""
     if job is None:
         return False
     try:
@@ -118,7 +163,7 @@ def _assign(job, proc: subprocess.Popen) -> bool:
             h.Close()
         return True
     except Exception:  # noqa: BLE001
-        log.warning("shell operation: could not assign the process to its job; the tree cannot be tracked")
+        log.warning("shell operation: could not assign the process to its job")
         return False
 
 
@@ -159,41 +204,84 @@ def _close(job) -> None:
             pass
 
 
+def _resume(proc: subprocess.Popen, job=None) -> bool:
+    """Let a child that was created suspended run: resume its one initial thread. True only if it really was the only thread and it had
+    been suspended exactly once (ResumeThread returns the previous suspend count), i.e. the child is now running and nothing else is
+    still holding it back. The job's kill-on-close is switched off immediately before the thread is released (if that fails, the child
+    is not released). Anything else is False and the caller kills the child."""
+    try:
+        import psutil
+
+        threads = psutil.Process(proc.pid).threads()
+        if len(threads) != 1:
+            return False
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenThread.restype = ctypes.c_void_p
+        k32.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.ResumeThread.restype = ctypes.c_uint32
+        k32.ResumeThread.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = k32.OpenThread(_THREAD_SUSPEND_RESUME, 0, threads[0].id)
+        if not handle:
+            return False
+        try:
+            if job is not None and not _disarm(job):
+                return False
+            return k32.ResumeThread(handle) == 1
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _discard(proc: subprocess.Popen, job) -> None:
+    """Undo a start that could not be completed: the child never ran (or, if it somehow did, it is in the job), so ending the job and
+    the process ends everything; then release the process handle, the pipes (no reader was ever started, so closing is immediate) and
+    the job. Never raises."""
+    _terminate_job(job)
+    try:
+        proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        proc.wait(timeout=CONFIRM_S)
+    except Exception:  # noqa: BLE001
+        pass
+    _release(proc, inline=True)
+    _close(job)
+
+
 # -- stopping ---------------------------------------------------------------------------------------------------------------
 
-def _tree_gone(proc: subprocess.Popen, job, tracked: bool) -> bool | None:
+def _tree_gone(proc: subprocess.Popen, job) -> bool | None:
     """True / False when the tree is known gone / still there; None when that cannot be known."""
-    if not tracked:
-        return None
     n = _active_count(job)
     if n is None:
         return None
     return n == 0 and proc.poll() is not None
 
 
-def _stop_tree(proc: subprocess.Popen, job, tracked: bool, *, grace_s: float, confirm_s: float) -> tuple[bool | None, str]:
+def _stop_tree(proc: subprocess.Popen, job, *, grace_s: float, confirm_s: float) -> tuple[bool | None, str]:
     """Graceful, then forced, then confirm. Returns (gone, how)."""
     how = ""
     if _send_graceful(proc):
         how = "graceful"
         end = time.monotonic() + grace_s
         while time.monotonic() < end:
-            if _tree_gone(proc, job, tracked) or (not tracked and proc.poll() is not None):
+            if _tree_gone(proc, job):
                 break
             time.sleep(POLL_S / 2)
-    gone = _tree_gone(proc, job, tracked)
+    gone = _tree_gone(proc, job)
     if gone is not True:
-        if tracked and _terminate_job(job):
-            how = "forced"
-        else:
+        if not _terminate_job(job):
             try:
-                proc.kill()           # the direct child only: its descendants are not ours to name without the job
+                proc.kill()           # the job could not be ended: at least the direct child (the outcome stays unconfirmed)
             except Exception:  # noqa: BLE001
                 pass
-            how = "forced"
+        how = "forced"
         end = time.monotonic() + confirm_s
         while time.monotonic() < end:
-            gone = _tree_gone(proc, job, tracked)
+            gone = _tree_gone(proc, job)
             if gone is not False:
                 break
             time.sleep(POLL_S / 2)
@@ -244,12 +332,30 @@ def run_owned(
 
     `owner` is only an identifier kept in the registry. `stop_requested` is polled from the calling thread every `POLL_S`; it is the
     caller's job to make it true only for a stop that is meant for this operation."""
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP if _WIN else 0
-    proc = subprocess.Popen(
-        list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, creationflags=flags,
-    )
+    flags = (subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED) if _WIN else 0
     job = _new_job()
-    tracked = _assign(job, proc)
+    if job is None:
+        log.warning("shell operation: not started (no job object, so the process tree could not be owned)")
+        return Outcome(NOT_STARTED, detail="no_job")
+    try:
+        proc = subprocess.Popen(
+            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, creationflags=flags,
+        )
+    except BaseException:
+        _close(job)
+        raise
+    # The child exists but has executed nothing. It is assigned to the job, and only then allowed to run.
+    try:
+        owned = _assign(job, proc)
+        resumed = owned and _resume(proc, job)
+    except BaseException:
+        _discard(proc, job)
+        raise
+    if not resumed:
+        detail = "assign_failed" if not owned else "resume_failed"
+        log.warning("shell operation: not started (%s)", detail)
+        _discard(proc, job)
+        return Outcome(NOT_STARTED, detail=detail)
     with _LOCK:
         _NEXT[0] += 1
         op = _Op(_NEXT[0], proc.pid, owner)
@@ -275,7 +381,7 @@ def run_owned(
         except BaseException:
             # Anything unexpected while we own a running process (a failing stop callback, the worker being torn down): it must not
             # be left running behind us, unowned.
-            if not (tracked and _terminate_job(job)):
+            if not _terminate_job(job):
                 try:
                     proc.kill()
                 except Exception:  # noqa: BLE001
@@ -286,11 +392,11 @@ def run_owned(
             # reported as a stop.
             out, err, drained = _drain(proc, confirm_s)
             return Outcome(COMPLETED, proc.returncode, out, err)
-        gone, how = _stop_tree(proc, job, tracked, grace_s=grace_s, confirm_s=confirm_s)
+        gone, how = _stop_tree(proc, job, grace_s=grace_s, confirm_s=confirm_s)
         out, err, drained = _drain(proc, confirm_s)
         if gone is True:
             return Outcome(reason, proc.poll(), out, err, how)
-        detail = "tree_still_running" if gone is False else ("not_tracked" if not tracked else "not_confirmed")
+        detail = "tree_still_running" if gone is False else "not_confirmed"
         log.warning("shell operation: stop acted on but not confirmed (%s)", detail)
         return Outcome(UNKNOWN, proc.poll(), out, err, how, detail, reason)
     finally:
