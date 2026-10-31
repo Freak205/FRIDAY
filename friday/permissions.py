@@ -234,10 +234,22 @@ class Executor:
             args=args, decision=audit_decision,
         )
 
-        await BUS.publish("skill.start", skill=skill.name, args=args)
+        try:
+            await BUS.publish("skill.start", skill=skill.name, args=args)
+        except (asyncio.CancelledError, Exception) as exc:
+            # Phase 96: the row exists but the skill was never called -- nothing may be left open for good in a process that lives on.
+            try:
+                audit.complete(
+                    audit_id, ok=False, outcome=audit.NOT_STARTED,
+                    error="not started: cancelled before it began" if isinstance(exc, asyncio.CancelledError) else str(exc),
+                )
+            except Exception:
+                log.exception("could not close the audit row of %s (audit %d)", skill.name, audit_id)  # never replaces the cancel
+            raise
         started = time.perf_counter()
         actor_token = _CURRENT_ACTOR.set(actor)
         self._in_flight[audit_id] = skill.name
+        refused = bool(skill.unknown_args(args))  # Phase 96: `Skill.__call__` turns such a call away before the skill runs
         detach = Detach(lambda fut: _record_late_outcome(audit_id, skill.name, fut, started))
         detach_token = DETACH.set(detach)
         try:
@@ -255,8 +267,12 @@ class Executor:
             if detach.started:
                 audit.mark_outcome_unknown(audit_id, detached=True)
             else:
+                # Phase 96: a worker-thread skill whose job the cancel removed from the queue never ran (not_started); any other
+                # cancelled call was seen to end by cancellation -- whether it had a partial effect is not established, so it is
+                # `cancelled`, never a plain failure. The cancel carries no reason, so a timeout and a stop request read alike.
                 audit.complete(
                     audit_id, ok=False, error="interrupted before it finished (cancelled)", duration_ms=elapsed,
+                    outcome=audit.NOT_STARTED if detach.never_ran else audit.CANCELLED,
                 )
             _record_action(skill.name, args, actor=actor, status="cancelled")
             raise
@@ -289,7 +305,7 @@ class Executor:
         # not just "ok=False"); an unknown outcome keeps `ok` NULL in the row -- see `audit.complete`.
         audit.complete(
             audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed,
-            outcome=audit.outcome_of_result(skill.name, result.ok, result.data),
+            outcome=audit.NOT_STARTED if refused else audit.outcome_of_result(skill.name, result.ok, result.data),
         )
         _record_action(
             skill.name, args, actor=actor, status="success" if result.ok else "failed",

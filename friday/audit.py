@@ -122,10 +122,13 @@ def record(
 # redaction); NULL means "not classified" and is read exactly as before Phase 94 -- nothing is back-filled or inferred.
 SUCCESS = "success"
 FAILURE = "failure"                # the skill ran and said it did not succeed
-NOT_STARTED = "not_started"        # the command was never started (friday.shellproc could not own its process tree first)
+NOT_STARTED = "not_started"        # the work was never begun: a shell command friday.shellproc could not own first; (Phase 96) a call the
+                                   # skill refused for its arguments, a worker job cancelled while queued, a cancel before the skill was called
 UNKNOWN_OUTCOME = "unknown_outcome"  # stopped or timed out, the process tree not confirmed gone: it MAY have run -- neither done nor failed
-TIMEOUT = "timeout"                # the time limit ran out and the process tree was confirmed gone
-CANCELLED = "cancelled"            # a stop request ended it and the process tree was confirmed gone
+TIMEOUT = "timeout"                # shell.run only: the time limit ran out and the process tree was confirmed gone
+CANCELLED = "cancelled"            # shell.run: a stop request ended it and the process tree was confirmed gone. (Phase 96) any other skill:
+                                   # the call was seen to end by cancellation (a stop OR a timeout -- the cancel carries no reason); a partial
+                                   # effect is not ruled out, so unlike the shell's it does not say the work left nothing behind
 OUTCOMES = frozenset({SUCCESS, FAILURE, NOT_STARTED, UNKNOWN_OUTCOME, TIMEOUT, CANCELLED})
 
 # Where the execution layer itself establishes more than ok/not ok: a skill's own `data["status"]`, accepted only for the skills

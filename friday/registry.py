@@ -45,6 +45,8 @@ class Detach:
     def __init__(self, on_done: Callable[[concurrent.futures.Future], None]) -> None:
         self.on_done = on_done
         self.started = False
+        # Phase 96: the cancel reached the future while it was still queued, so the worker never took it and nothing ran.
+        self.never_ran = False
 
 
 DETACH: contextvars.ContextVar[Detach | None] = contextvars.ContextVar("DETACH", default=None)
@@ -122,9 +124,14 @@ class Skill:
     # is not offered to the planner, the matcher, or the skill listing as something to ask for.
     internal: bool = False
 
-    async def __call__(self, **kwargs: Any) -> SkillResult:
+    def unknown_args(self, kwargs: dict[str, Any]) -> list[str]:
+        """The argument names this skill does not take. A call with any is refused by `__call__` before the skill runs; the
+        Executor asks the same question to know that such a refusal never started anything (Phase 96)."""
         known = {p.name for p in self.params}
-        unknown = sorted(set(kwargs) - known)
+        return sorted(set(kwargs) - known)
+
+    async def __call__(self, **kwargs: Any) -> SkillResult:
+        unknown = self.unknown_args(kwargs)
         if unknown:
             valid = ", ".join(p.name for p in self.params) or "none"
             return SkillResult(
@@ -162,8 +169,15 @@ class Skill:
         try:
             return await asyncio.wrap_future(cf, loop=loop)
         except asyncio.CancelledError:
-            if detach is not None and detach.started:
-                cf.add_done_callback(detach.on_done)  # runs at once if it has already finished
+            if detach is not None:
+                # Phase 96: whether the worker took the job is read from the future itself, not from the flag the worker sets a
+                # moment after taking it -- a cancel landing in that gap left `started` False for a thread that then ran, and its
+                # outcome was never recorded. A future the cancel really cancelled was never run; any other one is running or done.
+                if cf.cancelled():
+                    detach.never_ran = True
+                else:
+                    detach.started = True
+                    cf.add_done_callback(detach.on_done)  # runs at once if it has already finished
             raise
 
     def preview(self, **kwargs: Any) -> str:
