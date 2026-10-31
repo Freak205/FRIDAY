@@ -80,12 +80,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Annotated
 
 from friday import audit, auditview, steps, toolview
 from friday.config import CFG
 from friday.log import get
-from friday.orchestrator import NOT_EXECUTED_ERRORS, Orchestrator
+from friday.orchestrator import _HELD_MAX, NOT_EXECUTED_ERRORS, Orchestrator, calls_to_hold
 from friday.permissions import current_actor
 from friday.registry import REGISTRY, SkillResult, skill
 from friday.verify import UNCONFIRMED_NOTE
@@ -288,6 +289,7 @@ async def _run_plan(goal: str, resume_goal_id: str = "", clarification_answer: s
     observations: list = []
     from friday.intelligence.state import INTEL
 
+    held = _held_for(goal_id) if (expanded or resume_goal_id) else []  # Phase 95: only a RESUMED goal carries anything over
     try:
         with audit.goal_scope(goal_id):  # Phase 53: every audited step of this run names the goal
             result = await asyncio.wait_for(
@@ -300,6 +302,7 @@ async def _run_plan(goal: str, resume_goal_id: str = "", clarification_answer: s
                     # expansion's planner goal is a composed sentence, not a request).
                     coverage_goal="" if expanded else goal,
                     checkpoint=_checkpointer(goal_id, subgoals),
+                    held_calls=held,
                 ),
                 timeout=CFG.planner.total_timeout_s,
             )
@@ -346,6 +349,8 @@ async def _run_plan(goal: str, resume_goal_id: str = "", clarification_answer: s
         # cancelled run doesn't sit forever in "running".
         _cancel_goal(goal_id, goal, subgoals)
         raise
+    finally:
+        _remember_held(goal_id, held, observations)
 
     duration_ms = int((time.perf_counter() - started) * 1000)
 
@@ -692,6 +697,34 @@ def _save_contract(goal_id: str | None, contract: "GoalContract") -> None:
         goals_mod.set_contract(goal_id, contract)
     except Exception:
         log.exception("plan.run: saving goal contract failed (non-fatal)")
+
+
+# Phase 95: a RESUMED goal (a clarification answer, "yes, fix it") runs `run_goal` again with a fresh observation list, so the repeat
+# guard forgot that a command of the earlier run never started or ended with an unknown outcome. These are the calls to keep
+# blocking, per goal id, for this process only. A call still running when the WHOLE plan times out has no observation, so it is not
+# held (the audit row says it is unknown; its arguments are not recoverable). Nothing is rebuilt from the audit log: its shell arguments are stored redacted
+# (first token and counts), which cannot tell `git add a.txt` from `git add b.txt`, and blocking a different command would be wrong.
+_HELD: "OrderedDict[str, list]" = OrderedDict()
+_HELD_GOALS = 64
+
+
+def _held_for(goal_id: str | None) -> list:
+    return list(_HELD.get(goal_id, ())) if goal_id else []
+
+
+def _remember_held(goal_id: str | None, carried: list, observations: list) -> None:
+    """Keep what this run (plus what it was resumed with) must not repeat; forget the oldest goals beyond a small bound."""
+    if not goal_id:
+        return
+    try:
+        kept = (carried + calls_to_hold(observations))[-_HELD_MAX:]
+        if kept:
+            _HELD[goal_id] = kept
+            _HELD.move_to_end(goal_id)
+            while len(_HELD) > _HELD_GOALS:
+                _HELD.popitem(last=False)
+    except Exception:  # noqa: BLE001 -- bookkeeping must never fail a run
+        log.exception("could not remember the held calls of goal %s", goal_id)
 
 
 def _resume_goal(resume_goal_id: str, clarification_answer: str) -> "tuple[str | None, GoalContract, str]":

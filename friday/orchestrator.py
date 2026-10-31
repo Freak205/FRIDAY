@@ -457,6 +457,25 @@ def _holds_repeat(o: Observation) -> bool:
     return _never_started(o) or _outcome_unknown(o)
 
 
+_HELD_MAX = 20
+
+
+def _step_ref(previous_step: Any) -> str:
+    """How a blocked repeat names the call it repeats: "step 3", or (Phase 95) "an earlier run of this goal"."""
+    return f"step {previous_step}" if isinstance(previous_step, int) else str(previous_step or "step ?")
+
+
+def calls_to_hold(observations: list[Observation]) -> list[Observation]:
+    """Phase 95: what a RESUMED run of the same goal must not forget -- the calls of this run that stay blocked for an identical
+    repeat (`_holds_repeat`: never started, or outcome unknown). Compact copies: the step (its exact arguments, so the repeat guard's
+    own identity rules apply unchanged), the speech and the status word -- no output, no result data."""
+    held = [
+        Observation(o.step, False, o.speech, {"status": (o.data or {}).get("status")})
+        for o in observations if _holds_repeat(o)
+    ]
+    return held[-_HELD_MAX:]
+
+
 def find_prior_attempt(
     observations: list[Observation], tool: str, args: dict[str, Any], tier_of: dict[str, str],
 ) -> tuple[int, Observation] | None:
@@ -745,8 +764,13 @@ class Orchestrator:
         action_scope: GoalScope | None = None,
         coverage_goal: str | None = None,
         checkpoint: Callable[[list[Observation]], None] | None = None,
+        held_calls: list[Observation] | None = None,
     ) -> OrchestratorResult:
         """Ask a local LLM which tool to call next, one bounded step at a time.
+
+        `held_calls` (Phase 95), when given, are calls an EARLIER run of this same goal could not complete safely (see the module
+        function `calls_to_hold`): an identical repeat of one is blocked like an immediate repeat of a call of this run. They are only
+        consulted by the repeat guard -- never shown as steps, counted, reported or answered from.
 
         `checkpoint` (Phase 54), when given, is called with the observations so far after every executed step has been
         recorded -- so a caller can persist progress while the run is still going, not only when it ends. It must not raise
@@ -1301,6 +1325,12 @@ class Orchestrator:
                     continue
 
             prior = find_prior_attempt(observations, tool_name, tool_args, tier_of)
+            earlier_run = False
+            if prior is None and held_calls:
+                # Phase 95: this goal is RESUMED -- an identical call that never started, or whose outcome is unknown, in an
+                # earlier run of it is still not to be repeated. Same identity rules (`_call_key`), same block.
+                prior = find_prior_attempt(held_calls, tool_name, tool_args, tier_of)
+                earlier_run = prior is not None
             if CFG.planner.counted_repeats and not intent.is_passive_call(
                 tool_name, tool_args, tier_hint=tier_of.get(tool_name, ""),
             ):
@@ -1360,6 +1390,7 @@ class Orchestrator:
                 if advanced is not None:
                     tool_args = advanced
                     prior = find_prior_attempt(observations, tool_name, tool_args, tier_of)
+                    earlier_run = False   # Phase 95: a prior found now is this run's own, not a held one
                     await BUS.publish("orchestrator.continuation", goal=goal, tool=tool_name, args=tool_args)
             if prior is not None:
                 # A blocked repeat never advances/credits a subgoal — only a
@@ -1382,9 +1413,12 @@ class Orchestrator:
                 # `truncated: False`) — the model kept re-reading a complete file "to reach the end".
                 complete = bool(prior_obs.ok and (prior_obs.data or {}).get("truncated") is False)
                 unknown = _outcome_unknown(prior_obs)
+                # Phase 95: a call held over from an earlier run of this goal has no step number in this one.
+                prior_ref = "an earlier run of this goal" if earlier_run else prior_idx + 1
                 warning = (
-                    f"ALREADY_TRIED: '{step.tool}' was already run with these exact arguments (step "
-                    f"{prior_idx + 1}) and nothing relevant has changed since — not repeating it. "
+                    f"ALREADY_TRIED: '{step.tool}' was already run with these exact arguments ("
+                    + (f"{prior_ref}, before this goal was resumed" if earlier_run else f"step {prior_ref}")
+                    + ") and nothing relevant has changed since — not repeating it. "
                     + (
                         # Phase 93: not "FAILED" and not "ok": the command may already have run, so running it again could do it twice.
                         f"Its outcome is UNKNOWN: it may already have run (or still be running), so it must not be run again. "
@@ -1402,7 +1436,7 @@ class Orchestrator:
                     data={
                         "status": "already_tried", "tool": tool_name, "args": tool_args,
                         "reason": "same action with no relevant state change",
-                        "previous_step": prior_idx + 1, "previous_ok": None if unknown else prior_obs.ok,
+                        "previous_step": prior_ref, "previous_ok": None if unknown else prior_obs.ok,
                         "previous_result": previous[:300],
                         **({"previous_outcome": "unknown"} if unknown else {}),
                         **({"next_hint": next_hint} if next_hint else {}),
@@ -1711,15 +1745,15 @@ class Orchestrator:
         if o.error == "repeated_call" and (o.data or {}).get("previous_outcome") == "unknown":
             # Phase 93: the earlier identical call may already have run -- neither "FAILED" nor "nothing has changed".
             return (
-                f"{i+1}. called {o.step.tool}({o.step.args}) -> NOT RUN AGAIN: the outcome of step "
-                f"{o.data.get('previous_step', '?')} (the same command) is UNKNOWN and it may already have run; previous result: "
+                f"{i+1}. called {o.step.tool}({o.step.args}) -> NOT RUN AGAIN: the outcome of "
+                f"{_step_ref(o.data.get('previous_step'))} (the same command) is UNKNOWN and it may already have run; previous result: "
                 f"{str(o.data.get('previous_result') or o.speech)[:110]} Check its effect with a read-only tool, use a "
                 "different command, or reply done."
             )
         if o.error == "repeated_call":
             return (
-                f"{i+1}. called {o.step.tool}({o.step.args}) -> ALREADY_TRIED (same as step "
-                f"{o.data.get('previous_step', '?')}; nothing has changed): previous result: "
+                f"{i+1}. called {o.step.tool}({o.step.args}) -> ALREADY_TRIED (same as "
+                f"{_step_ref(o.data.get('previous_step'))}; nothing has changed): previous result: "
                 f"{str(o.data.get('previous_result') or o.speech)[:110]}"
                 + (f" More remains: use {o.data['next_hint']} for the next part." if o.data.get("next_hint") else "")
                 + (" That result was complete: nothing more remains to read." if o.data.get("complete") else "")
