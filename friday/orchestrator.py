@@ -445,6 +445,18 @@ def _never_started(o: Observation) -> bool:
     return not o.ok and (o.data or {}).get("status") == "not_started"
 
 
+def _outcome_unknown(o: Observation) -> bool:
+    """Phase 93: did this `shell.run` end as `unknown_outcome` -- it was stopped or timed out but the process tree could not be
+    confirmed gone, so the command MAY already have run (or still be running)? Neither done nor failed: repeating the identical call
+    could do it twice, however many steps ran in between. A different command, shell or directory is another key."""
+    return o.step.tool == "shell.run" and not o.ok and (o.data or {}).get("status") == "unknown_outcome"
+
+
+def _holds_repeat(o: Observation) -> bool:
+    """The identical state-changing call stays blocked for the rest of the run: it never started (Phase 92) or its outcome is unknown."""
+    return _never_started(o) or _outcome_unknown(o)
+
+
 def find_prior_attempt(
     observations: list[Observation], tool: str, args: dict[str, Any], tier_of: dict[str, str],
 ) -> tuple[int, Observation] | None:
@@ -470,7 +482,7 @@ def find_prior_attempt(
             continue
         later = [x for x in observations[i + 1:] if x.error not in NOT_EXECUTED_ERRORS]
         if not passive:
-            return (i, o) if not later or _never_started(o) else None
+            return (i, o) if not later or _holds_repeat(o) else None
         if o.fingerprint != _state_fingerprint(args):
             return None  # the file it read has changed underneath it
         if later and (not o.ok or (o.data or {}).get("uncertain")):
@@ -1332,8 +1344,8 @@ class Orchestrator:
                             )
                         avoid = (tool_name, "count_reached")
                         continue
-                    if prior is not None and not _never_started(prior[1]):
-                        prior = None  # asked for again by the user's own count: not a redundant repeat (a call that never started is not one of its runs)
+                    if prior is not None and not _holds_repeat(prior[1]):
+                        prior = None  # asked for again by the user's own count: not a redundant repeat (a call that never started, or whose outcome is unknown, is not one of its runs)
             if prior is not None and continuation:
                 # Phase 21.0: the user's own words ask for MORE ("read more", "next
                 # page", "continue"). An identical read is then not a redundant one —
@@ -1369,21 +1381,30 @@ class Orchestrator:
                 # ...and one that says outright it was ALL there was (a read that reported
                 # `truncated: False`) — the model kept re-reading a complete file "to reach the end".
                 complete = bool(prior_obs.ok and (prior_obs.data or {}).get("truncated") is False)
+                unknown = _outcome_unknown(prior_obs)
                 warning = (
                     f"ALREADY_TRIED: '{step.tool}' was already run with these exact arguments (step "
                     f"{prior_idx + 1}) and nothing relevant has changed since — not repeating it. "
-                    f"Previous result ({'ok' if prior_obs.ok else 'FAILED'}): {previous[:200]} "
-                    + (f"More of it remains: use {next_hint} for the next part. " if next_hint else "")
-                    + ("That result was complete — nothing more remains to read. " if complete and not next_hint else "")
-                    + "Use that result, call a different tool, or declare done."
+                    + (
+                        # Phase 93: not "FAILED" and not "ok": the command may already have run, so running it again could do it twice.
+                        f"Its outcome is UNKNOWN: it may already have run (or still be running), so it must not be run again. "
+                        f"Previous result: {previous[:200]} Check its effect with a read-only tool, call a different "
+                        "command or tool, or declare done."
+                        if unknown else
+                        f"Previous result ({'ok' if prior_obs.ok else 'FAILED'}): {previous[:200]} "
+                        + (f"More of it remains: use {next_hint} for the next part. " if next_hint else "")
+                        + ("That result was complete — nothing more remains to read. " if complete and not next_hint else "")
+                        + "Use that result, call a different tool, or declare done."
+                    )
                 )
                 observations.append(Observation(
                     step, False, warning, error="repeated_call",
                     data={
                         "status": "already_tried", "tool": tool_name, "args": tool_args,
                         "reason": "same action with no relevant state change",
-                        "previous_step": prior_idx + 1, "previous_ok": prior_obs.ok,
+                        "previous_step": prior_idx + 1, "previous_ok": None if unknown else prior_obs.ok,
                         "previous_result": previous[:300],
+                        **({"previous_outcome": "unknown"} if unknown else {}),
                         **({"next_hint": next_hint} if next_hint else {}),
                         **({"complete": True} if complete and not next_hint else {}),
                     },
@@ -1399,7 +1420,7 @@ class Orchestrator:
                         + _found_so_far(observations),
                         "repeated_action", subgoal_idx,
                     )
-                avoid = (tool_name, "already_tried")
+                avoid = (tool_name, "outcome_unknown" if unknown else "already_tried")
                 continue
 
             repeat_streak = 0
@@ -1687,6 +1708,14 @@ class Orchestrator:
                 f"covers {o.data.get('allowed', 'reading')}. Choose a tool that fits"
                 + (f" (for this request: {', '.join(fits)})" if fits else "") + ", or reply done."
             )
+        if o.error == "repeated_call" and (o.data or {}).get("previous_outcome") == "unknown":
+            # Phase 93: the earlier identical call may already have run -- neither "FAILED" nor "nothing has changed".
+            return (
+                f"{i+1}. called {o.step.tool}({o.step.args}) -> NOT RUN AGAIN: the outcome of step "
+                f"{o.data.get('previous_step', '?')} (the same command) is UNKNOWN and it may already have run; previous result: "
+                f"{str(o.data.get('previous_result') or o.speech)[:110]} Check its effect with a read-only tool, use a "
+                "different command, or reply done."
+            )
         if o.error == "repeated_call":
             return (
                 f"{i+1}. called {o.step.tool}({o.step.args}) -> ALREADY_TRIED (same as step "
@@ -1869,6 +1898,13 @@ class Orchestrator:
                     f" Your last call to '{tool}' was blocked because you already have its result (the step "
                     'marked ALREADY_TRIED). It is no longer offered this turn. If the results above already '
                     'answer the goal, reply with action "done" and summarize them; otherwise call a different tool.'
+                )
+            elif why == "outcome_unknown":
+                # Phase 93: not "you already have its result" -- the earlier identical call may already have run.
+                system += (
+                    f" Your last call to '{tool}' was not run: the identical earlier call has an UNKNOWN outcome and may already "
+                    "have run, and it is no longer offered this turn. Check its effect with a read-only tool, or reply done "
+                    "saying what is unknown."
                 )
             elif why == "tool_family":
                 system += (

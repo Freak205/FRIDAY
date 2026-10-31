@@ -7,12 +7,12 @@ succeeded. For a command that never started, the setup failure is the same for t
 
   A  `find_prior_attempt` (pure), once per reason: the identical call (however re-spelled) is a duplicate even after other steps
      ran; a different command, or a different shell, is not; the same shape of result WITHOUT `not_started` (ordinary failure,
-     timeout, cancelled, unknown_outcome, success) keeps the Phase 5 rule exactly (immediate = blocked, after a step = allowed)
+     timeout, cancelled, success; unknown_outcome is Phase 93 and has its own check) keeps the Phase 5 rule exactly (immediate = blocked, after a step = allowed)
   B  the real `shell.run`, one run per reason: the result really has that shape (never ran: no returncode/output, never
      cancelled/timeout/unknown_outcome) and the speech says it was not run
   C  the real `run_goal` with a fixture that returns that shape: identical retry after an intervening read never runs, the block
      says the earlier attempt FAILED, a different command still runs, and the user's "twice" does not re-run it
-  D  controls: ordinary failures, timeouts, cancelled and unknown_outcome results are retried exactly as before
+  D  controls: ordinary failures, timeouts and cancelled results are retried exactly as before (unknown_outcome: Phase 93)
 
 Deterministic: scripted planner replies; the shell tool is a `test.ns_run` fixture or the real `shell.run` with
 `shellproc.run_owned` replaced (no process is started); every real non-L0 skill is hard-denied; no Ollama; data/ is untouched.
@@ -136,7 +136,7 @@ def section_a() -> None:
         check(f"{reason}: a different working directory is a different call", find_prior_attempt(after, "shell.run", {**sh("ipconfig /all"), "cwd": str(Path.home())}, TIER) is None)
 
     scenario("A[controls]: results that are not `not_started` keep the Phase 5 rule exactly")
-    for kind in ("ordinary", "timeout", "cancelled", "unknown_outcome", "ok"):
+    for kind in ("ordinary", "timeout", "cancelled", "ok"):
         obs = [shell_obs("ipconfig /all", kind)]
         check(f"{kind}: not treated as never started", not _never_started(obs[0]))
         check(f"{kind}: immediate identical retry is blocked (unchanged)", find_prior_attempt(obs, "shell.run", sh("ipconfig /all"), TIER) is not None)
@@ -226,7 +226,7 @@ async def section_c() -> None:
 
 
 async def section_d() -> None:
-    for kind in ("ordinary", "timeout", "cancelled", "unknown_outcome"):
+    for kind in ("ordinary", "timeout", "cancelled"):
         scenario(f"D[{kind}]: run_goal -- retry behaviour is exactly what it was")
         reset(kind)
         res = await drive("Update big.txt", [call("test.ns_run", sh("ipconfig")), call("test.ns_other"), call("test.ns_run", sh("ipconfig")), done("x")])
