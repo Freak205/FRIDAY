@@ -70,9 +70,26 @@ class EventBus:
             if projected is not None:
                 outbound = Event(topic=topic, data=projected, at=event.at)
                 for queue in list(self._queues):
-                    queue.put_nowait(outbound)
+                    try:
+                        queue.put_nowait(outbound)
+                    except asyncio.QueueFull:
+                        # Phase 100: one client that stopped reading must not break the publish for the code that raised the event
+                        # (a finished skill would be reported as failed) or for the clients that are keeping up
+                        self._drop_slow(queue)
 
         return event
+
+    def _drop_slow(self, queue: asyncio.Queue[Event]) -> None:
+        """Stop feeding a client whose queue is full. Its backlog is discarded and replaced by one fixed `bus.dropped` event, so a client
+        that does start reading again finds out it missed events and must reconnect, instead of waiting on a stream that went quiet."""
+        self._queues.discard(queue)
+        log.warning("bus: a streaming client stopped keeping up (%d events queued) and was dropped", queue.qsize())
+        try:
+            while True:
+                queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        queue.put_nowait(Event(topic="bus.dropped", data={"reason": "slow_consumer"}))
 
     # -- streaming consumers --------------------------------------------------
 

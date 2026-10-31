@@ -349,6 +349,34 @@ async def _run_plan(goal: str, resume_goal_id: str = "", clarification_answer: s
         # cancelled run doesn't sit forever in "running".
         _cancel_goal(goal_id, goal, subgoals)
         raise
+    except Exception as exc:
+        # Phase 100: whatever the planning layer raises that is not a timeout or a cancel (a dropped Ollama connection or a reply `llm`
+        # did not wrap, a bug) must not discard the run. Before, it left `plan.run` as a bare "That failed" with steps that had really
+        # run unreported, the goal row `running` and the stop flag still armed. The steps are kept, the goal is finished as failed, and
+        # only the exception TYPE is reported -- its message is library text the user never asked to hear (it is in the log, checked).
+        log_exception(log, "plan.run: the planner layer raised; the steps that ran are kept")
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        if subgoals:
+            _save_subgoals(goal_id, subgoals)
+        report = steps.build_report(
+            observations, stopped="planner_error", subgoals=subgoals, extra_unknown=_unknown_unobserved(goal_id, observations),
+        )
+        steps.save_progress(goal_id, report, "planner_error")
+        _finish_goal(
+            goal_id, goal, context, observations, "planner_error", ok=False, duration_ms=duration_ms, contract=contract,
+            report=report,
+        )
+        return SkillResult(
+            speech=_planner_error_speech(observations, report),
+            ok=False,
+            data={
+                "stopped": "planner_error",
+                "goal_id": goal_id,
+                "error": type(exc).__name__,
+                "report": report.to_dict(),
+                "steps": [_public_step(o) for o in observations],
+            },
+        )
     finally:
         _remember_held(goal_id, held, observations)
 
@@ -1051,6 +1079,42 @@ def _unknown_from_audit(goal_id: str | None) -> list[str]:
         return []
 
 
+def _unknown_unobserved(goal_id: str | None, observations) -> list[str]:
+    """Phase 100: tools of this goal's audit rows that none of `observations` accounts for -- a step the Executor started whose
+    Observation never got made because the planning layer raised around it -- and that did or may have changed something: one with no
+    recorded outcome, or one the audit says succeeded (this run never saw its result, so it is reported as unknown rather than dropped).
+    A step that failed or never ran changed nothing and needs no account; a step that has an Observation is reported from it."""
+    if not goal_id:
+        return []
+    seen = {i for o in observations for i in (getattr(o, "audit_ids", None) or [])}
+    S = steps.StepState
+    try:
+        return [
+            s.tool for s in steps.ledger_for_goal(goal_id)
+            if s.state in (S.UNKNOWN, S.RUNNING, S.COMPLETED, S.VERIFIED) and not seen.intersection(s.audit)
+        ]
+    except Exception:
+        log_exception(log, "plan.run: could not read the goal's steps from the audit log (non-fatal)")
+        return []
+
+
+def _planner_error_speech(observations, report) -> str:
+    """Phase 100: what the user hears when the planning layer raised: that it went wrong, what had really been done, and (as for any run
+    that did not finish cleanly) where each step stands. Never the exception's own text."""
+    head = "Something unexpected went wrong while I was working on that"
+    ran = [o for o in observations if o.error not in NOT_EXECUTED_ERRORS]
+    done = [o for o in ran if o.ok and o.speech]
+    if not report.steps:
+        speech = f"{head}, before I had done anything."
+    elif done:
+        speech = f"{head}. So far: " + " ".join(o.speech for o in done)[:500]
+    elif ran:
+        speech = f"{head}, and none of the steps I had run had worked."
+    else:  # every step known is one this run has no result for (found in the audit log)
+        speech = f"{head}, and I can't tell what became of the step I had started."
+    return f"{speech} {report.tail()}".strip() if report.needs_account else speech
+
+
 def _finish_goal(
     goal_id: str | None, goal: str, context: str, observations, stopped: str, *,
     ok: bool, duration_ms: int, contract: "GoalContract | None" = None, verification=None, report=None,
@@ -1133,7 +1197,8 @@ def _finish_goal(
         # surface as a "SUCCEEDED before"/"known failure" experience for a
         # goal that was never actually attempted. The Goal row above still
         # records the truthful status and reason.
-        if observations:
+        # Phase 100: nor does a run the planner layer itself broke (the model connection dropped): that is the machine, not experience
+        if observations and stopped != "planner_error":
             episodes.record(
                 goal, goal_id=goal_id, context=context, steps=observations,
                 stopped=stopped, ok=ok, duration_ms=duration_ms,

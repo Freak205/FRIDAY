@@ -530,11 +530,39 @@ def _audit_rows(goal_id: str) -> list[dict[str, Any]]:
     return out
 
 
+def _cancelled_unproven(row: dict[str, Any]) -> bool:
+    """Phase 100: a row that ended `cancelled` for a skill that does NOT define that word. Only `shell.run` does (its tree was confirmed
+    gone); for any other skill the audit records that a cancel (a stop or a timeout) was seen, and its docstring says a partial effect is
+    not ruled out -- so the row cannot say the step failed. (`status_of` calls it `failed` for older readers.)"""
+    from friday import audit
+
+    return row.get("outcome") == audit.CANCELLED and audit.CANCELLED not in audit._STATUS_OUTCOMES.get(row.get("skill"), ())
+
+
+def _failure_is_definitive(row: dict[str, Any]) -> bool:
+    """Phase 100: does this failed-reading row really say the step did not happen / did not succeed? The skill's own failure, a call that
+    never started, a blocked call, a shell timeout or a shell cancel (process tree confirmed gone) do; a cancel of a non-shell skill does
+    not. A row with NO outcome (written before Phase 94, or never classified) is read exactly as before -- its `ok` is all it has, and
+    `audit.status_of` documents that it decides (such a row cannot be told from a cancelled one, which is a known limit)."""
+    from friday import audit
+
+    if row.get("status") == "blocked":
+        return True
+    outcome = row.get("outcome")
+    if outcome is None:
+        return True
+    if outcome in (audit.FAILURE, audit.NOT_STARTED, audit.TIMEOUT):
+        return True
+    return outcome == audit.CANCELLED and not _cancelled_unproven(row)
+
+
 def _row_state(row: dict[str, Any], probe: Any) -> StepState:
     """The state an audit row alone supports. An open row is `running` only if its owner is demonstrably alive."""
     from friday import owner
 
     state = _AUDIT_STATE.get(row["status"])
+    if state is StepState.FAILED and row["status"] == "failed" and _cancelled_unproven(row):
+        return StepState.UNKNOWN               # Phase 100: cancelled in flight, a partial effect not ruled out (live: UNKNOWN too)
     if state is not None:
         return state
     if row.get("session_id") and row.get("s_pid") is not None:  # unfinished
@@ -571,10 +599,15 @@ def _contradicted(ver: Any) -> bool:
     return isinstance(checks, list) and any(isinstance(c, (list, tuple)) and len(c) > 1 and c[1] is False for c in checks)
 
 
-def _merge(stored: StepState, row_state: StepState | None, ver: dict | None) -> tuple[StepState, str]:
+def _merge(
+    stored: StepState, row_state: StepState | None, ver: dict | None, *, definitive_failure: bool = True,
+) -> tuple[StepState, str]:
     """Reconcile a stored state with what its audit row says now. The row decides what happened; the stored state can only
     confirm it, or supply what the row cannot (`verified`, or the read-back verdict that contradicted a success the row only
-    repeats). Disagreement is never resolved in favour of success."""
+    repeats). Disagreement is never resolved in favour of success.
+
+    Phase 100: a stored UNKNOWN becomes FAILED only when the row's failure is `definitive_failure` (see `_failure_is_definitive`); a row
+    that merely reads `failed` because a non-shell skill was cancelled in flight leaves it unknown."""
     if row_state is None:                      # references a row that is gone
         if stored in _OK_STATES:
             return StepState.UNKNOWN, "its audit record is no longer available, so a stored success cannot be confirmed"
@@ -589,6 +622,8 @@ def _merge(stored: StepState, row_state: StepState | None, ver: dict | None) -> 
             return StepState.COMPLETED, ""
         return StepState.UNKNOWN, "the stored outcome and the audit record disagree"
     if row_state is StepState.FAILED:
+        if stored is StepState.UNKNOWN and not definitive_failure:
+            return StepState.UNKNOWN, "the audit record does not say definitively that it failed"
         if stored in (StepState.FAILED, StepState.UNKNOWN, StepState.RUNNING):
             return StepState.FAILED, ""
         return StepState.UNKNOWN, "the stored outcome and the audit record disagree"
@@ -644,7 +679,7 @@ def reconstruct(
             row_state = None
         else:                                  # never reached the Executor: nothing to contradict the stored state
             row_state = stored if stored in (StepState.FAILED, StepState.NEEDS_INPUT, StepState.NOT_ATTEMPTED) else None
-        state, why = _merge(stored, row_state, p.get("ver"))
+        state, why = _merge(stored, row_state, p.get("ver"), definitive_failure=_failure_is_definitive(found[-1]) if found else True)
         if not ids and stored in _OK_STATES:
             state, why = StepState.UNKNOWN, "no audit record was ever linked to a stored success"
         if why:

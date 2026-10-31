@@ -556,7 +556,8 @@ async def main_async() -> None:
                 if not in_except and not any(k.arg == "exc" for k in node.keywords):
                     stray.append(f"{mod}:{node.lineno}")
     check("G1 no `log.exception(...)` and no `exc_info=` on a logger in any of the execution-path modules", not offenders, ", ".join(offenders))
-    check("G2 the sites converted are really there (52 calls across the modules)", sum(uses.values()) == 52, str(uses))
+    check("G2 the sites converted are really there (57 calls across the modules: the 52 of Phase 98 + 3 audit-write guards in permissions and "
+          "2 planner-failure paths in skills/plan, Phase 100)", sum(uses.values()) == 57, str(uses))
     check("G3 every converted call is inside an `except` block or names its exception (so none logs 'no exception was active')", not stray, ", ".join(stray))
 
     # ------------------------------------------------------------------------------------------------ E

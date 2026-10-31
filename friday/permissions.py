@@ -302,21 +302,30 @@ class Executor:
             # a step timeout through plan.run: the audit said "failed" while the skill went on to finish). Its row is
             # "outcome unknown" instead, and when the thread ends its real outcome replaces the marker.
             elapsed = int((time.perf_counter() - started) * 1000)
-            if detach.started:
-                audit.mark_outcome_unknown(audit_id, detached=True)
-            else:
-                # Phase 96: a worker-thread skill whose job the cancel removed from the queue never ran (not_started); any other
-                # cancelled call was seen to end by cancellation -- whether it had a partial effect is not established, so it is
-                # `cancelled`, never a plain failure. The cancel carries no reason, so a timeout and a stop request read alike.
-                audit.complete(
-                    audit_id, ok=False, error="interrupted before it finished (cancelled)", duration_ms=elapsed,
-                    outcome=audit.NOT_STARTED if detach.never_ran else audit.CANCELLED,
-                )
+            try:
+                if detach.started:
+                    audit.mark_outcome_unknown(audit_id, detached=True)
+                else:
+                    # Phase 96: a worker-thread skill whose job the cancel removed from the queue never ran (not_started); any other
+                    # cancelled call was seen to end by cancellation -- whether it had a partial effect is not established, so it is
+                    # `cancelled`, never a plain failure. The cancel carries no reason, so a timeout and a stop request read alike.
+                    audit.complete(
+                        audit_id, ok=False, error="interrupted before it finished (cancelled)", duration_ms=elapsed,
+                        outcome=audit.NOT_STARTED if detach.never_ran else audit.CANCELLED,
+                    )
+            except Exception:
+                # Phase 100: a write that fails here must not replace the cancel (the task would end as an error, not as cancelled);
+                # the row is left as it was and no outcome is made up for it
+                log_exception(log, "could not record how %s ended on cancel (audit %d)", skill.name, audit_id)
             _record_action(skill.name, args, actor=actor, status="cancelled")
             raise
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
-            audit.complete(audit_id, ok=False, error=str(exc), duration_ms=elapsed, outcome=audit.FAILURE)
+            try:
+                audit.complete(audit_id, ok=False, error=str(exc), duration_ms=elapsed, outcome=audit.FAILURE)
+            except Exception:
+                # Phase 100: the skill's own exception is what the caller must see, not the failure to write it down
+                log_exception(log, "could not close the audit row of %s (audit %d)", skill.name, audit_id)
             # Phase 61: the event goes to every bus consumer (GUI, every websocket client); an exception message is library text the
             # user never asked to hear and may carry a key or token (an HTTP error quotes its URL), so it gets the credential check
             await BUS.publish("skill.error", skill=skill.name, error=toolview.safe_speech(str(exc)))
@@ -336,7 +345,12 @@ class Executor:
         # result as the skill returned it, before the credential check can touch its data (as the late-outcome path does).
         outcome = audit.NOT_STARTED if refused else audit.outcome_of_result(skill.name, result.ok, result.data)
         _check_failed(result)
-        audit.complete(audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed, outcome=outcome)
+        try:
+            audit.complete(audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed, outcome=outcome)
+        except Exception:
+            # Phase 100: the skill has run and this is what it said; a failure to write that down is not a failure of the skill. The row
+            # stays open (read as unknown, never as a success or a failure) and the result goes on to its caller.
+            log_exception(log, "could not record the result of %s (audit %d)", skill.name, audit_id)
         _record_action(
             skill.name, args, actor=actor, status="success" if result.ok else "failed",
         )
