@@ -26,7 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, get_args, get_origin, get_type_hints
 
-from friday.log import get
+from friday.log import get, log_exception
 
 log = get(__name__)
 
@@ -216,7 +216,7 @@ class Registry:
             try:
                 importlib.import_module(f"{package}.{mod.name}")
             except Exception:
-                log.exception("failed to load skill module %s", mod.name)
+                log_exception(log, "failed to load skill module %s", mod.name)
         added = len(self._skills) - before
         log.info("registry: %d skills loaded (%d modules)", len(self._skills), added)
         return added

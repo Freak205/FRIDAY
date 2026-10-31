@@ -17,7 +17,7 @@ from friday.brain import BRAIN
 from friday import directroute
 from friday.brain.engine import Action, Understanding
 from friday.bus import BUS
-from friday.log import get
+from friday.log import get, log_exception
 from friday.orchestrator import run_verified
 from friday.permissions import EXECUTOR, PermissionError_
 from friday.registry import REGISTRY, Skill, SkillResult
@@ -198,7 +198,7 @@ class Session:
             if INTEL.goal_running:
                 return True
         except Exception:
-            log.exception("stop check failed (non-fatal)")
+            log_exception(log, "stop check failed (non-fatal)")
         p = self.pending
         return p is not None and p.kind == "confirm" and p.future is not None and not p.future.done()
 
@@ -237,7 +237,7 @@ class Session:
             )
             audit.complete(audit_id, ok=True, result=speech)
         except Exception:
-            log.exception("stop audit failed (non-fatal)")
+            log_exception(log, "stop audit failed (non-fatal)")
         await BUS.publish(
             "session.stop_requested", source=source, goal_running=running, declined_confirmation=declined,
         )
@@ -268,7 +268,7 @@ class Session:
 
             INTEL.record_turn(actor, text)
         except Exception:
-            log.exception("intelligence state update failed (non-fatal)")
+            log_exception(log, "intelligence state update failed (non-fatal)")
 
         # A pending question takes priority over fresh intent matching.
         if self.pending is not None:
@@ -408,7 +408,7 @@ class Session:
             corrections.record(text, goal_id=goal.id if goal else None)
             self._apply_context_correction(text)
         except Exception:
-            log.exception("correction recording failed (non-fatal)")
+            log_exception(log, "correction recording failed (non-fatal)")
 
     def _apply_context_correction(self, text: str) -> None:
         """Phase 11.4: steer *future* reference resolution toward what the
@@ -554,7 +554,7 @@ class Session:
             if intent.derive_expansion(text, scope) is None:
                 return None
         except Exception:
-            log.exception("scope expansion check failed (non-fatal)")
+            log_exception(log, "scope expansion check failed (non-fatal)")
             return None
         await BUS.publish("session.scope_expansion", goal_id=goal_id, text=text, actor=actor)
         return await self._run(
@@ -575,7 +575,7 @@ class Session:
         try:
             route = recoveryroute.classify(text)
         except Exception:
-            log.exception("recovery routing failed (non-fatal)")
+            log_exception(log, "recovery routing failed (non-fatal)")
             return None
         if route is None:
             return None
@@ -632,7 +632,7 @@ class Session:
                 understanding.skill == "meta.undo" and intent.is_confirmation_like(text) and not intent.asks_for_undo(text)
             )
         except Exception:
-            log.exception("confirmation guard failed (non-fatal)")
+            log_exception(log, "confirmation guard failed (non-fatal)")
             return None
         if not (bare or lexical_undo):
             return None
@@ -672,7 +672,7 @@ class Session:
             if record is not None and record.contract.action_scope.get("read_only"):
                 self._followup = (goal_id, record.objective)
         except Exception:
-            log.exception("remembering the follow-up goal failed (non-fatal)")
+            log_exception(log, "remembering the follow-up goal failed (non-fatal)")
 
     async def _maybe_continue_read(self, text: str, *, actor: str) -> SkillResult | None:
         """"Read more" / "next page" / "continue": re-issue the last call with its page
@@ -691,7 +691,7 @@ class Session:
                 return None
             args = intent.next_page_args(self.last_skill, self.last_args, self.last_data)
         except Exception:
-            log.exception("continuation check failed (non-fatal)")
+            log_exception(log, "continuation check failed (non-fatal)")
             return None
         if args is None:
             return None
@@ -712,7 +712,7 @@ class Session:
                 return None
             result = context_resolver.resolve_temporal_repeat()
         except Exception:
-            log.exception("temporal reference resolution failed (non-fatal)")
+            log_exception(log, "temporal reference resolution failed (non-fatal)")
             return None
 
         if not result.resolved or self.last_skill is None:
@@ -824,7 +824,7 @@ class Session:
             understanding = directroute.refine(text, understanding)
             verdict = directroute.assess(text, understanding)
         except Exception:
-            log.exception("direct-route gate failed (non-fatal; the route is left as it was)")
+            log_exception(log, "direct-route gate failed (non-fatal; the route is left as it was)")
             return understanding
         if verdict.safe:
             return understanding
@@ -951,7 +951,7 @@ class Session:
                 text, matched_span, entity_type, referent,
             )
         except Exception:
-            log.exception("context-aware routing failed (non-fatal)")
+            log_exception(log, "context-aware routing failed (non-fatal)")
             return None
 
     def _resolve_context_reference(self, text: str) -> tuple[str, Any]:
@@ -968,7 +968,7 @@ class Session:
             consequential = risk.is_consequential(text)
             return context_resolver.resolve_pronoun_in_text(text, consequential=consequential)
         except Exception:
-            log.exception("context reference resolution failed (non-fatal)")
+            log_exception(log, "context reference resolution failed (non-fatal)")
             return text, None
 
     async def _ask_context_clarification(self, result: Any, original_text: str, *, actor: str) -> SkillResult:
@@ -1003,7 +1003,7 @@ class Session:
 
             context_memory.record_from_skill(skill_name, args, result.data, turn_id=self._turn_id)
         except Exception:
-            log.exception("context memory recording failed (non-fatal)")
+            log_exception(log, "context memory recording failed (non-fatal)")
 
     # -- acting ---------------------------------------------------------------
 
@@ -1049,7 +1049,7 @@ class Session:
         except KeyError:
             return SkillResult(speech="That skill isn't available.", ok=False)
         except Exception as exc:
-            log.exception("skill %s failed", skill_name)
+            log_exception(log, "skill %s failed", skill_name)
             from friday import toolview
 
             return SkillResult(speech=f"That failed: {toolview.safe_speech(str(exc))}", ok=False)  # Phase 61: library text

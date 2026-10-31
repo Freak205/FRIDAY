@@ -23,7 +23,7 @@ from typing import Any
 from friday import audit, auditview, toolview
 from friday.bus import BUS
 from friday.config import CFG
-from friday.log import get
+from friday.log import get, log_exception
 from friday.registry import DETACH, REGISTRY, Detach, Skill, SkillResult
 
 log = get(__name__)
@@ -113,7 +113,7 @@ def _record_late_outcome(audit_id: int, skill_name: str, fut: Any, started: floa
             audit.complete(audit_id, ok=result.ok, result=_check_failed(result).speech, duration_ms=elapsed, outcome=outcome)
         log.info("late outcome recorded for %s (audit %d)", skill_name, audit_id)
     except Exception:
-        log.exception("could not record the late outcome of %s (audit %d)", skill_name, audit_id)
+        log_exception(log, "could not record the late outcome of %s (audit %d)", skill_name, audit_id)
 
 
 def _record_action(skill_name: str, args: dict[str, Any], *, actor: str, status: str) -> None:
@@ -141,7 +141,7 @@ def _record_action(skill_name: str, args: dict[str, Any], *, actor: str, status:
             goal_id=INTEL.state.current_goal_id,
         )
     except Exception:
-        log.exception("action recording failed (non-fatal)")
+        log_exception(log, "action recording failed (non-fatal)")
 
 
 @dataclass(slots=True)
@@ -167,7 +167,7 @@ def evaluate(skill: Skill, actor: str, args: dict[str, Any] | None = None) -> De
                 effective_tier, escalated = "L3", True
         except Exception:
             # A broken classifier must never fail open — treat as the riskiest case.
-            log.exception("risk classifier failed for %s; failing safe to L3", skill.name)
+            log_exception(log, "risk classifier failed for %s; failing safe to L3", skill.name)
             effective_tier, escalated = "L3", True
 
     # A per-tool override is an explicit user choice — it beats both the tier
@@ -282,7 +282,7 @@ class Executor:
                     error="not started: cancelled before it began" if isinstance(exc, asyncio.CancelledError) else str(exc),
                 )
             except Exception:
-                log.exception("could not close the audit row of %s (audit %d)", skill.name, audit_id)  # never replaces the cancel
+                log_exception(log, "could not close the audit row of %s (audit %d)", skill.name, audit_id)  # never replaces the cancel
             raise
         started = time.perf_counter()
         actor_token = _CURRENT_ACTOR.set(actor)
@@ -320,7 +320,7 @@ class Executor:
             # Phase 61: the event goes to every bus consumer (GUI, every websocket client); an exception message is library text the
             # user never asked to hear and may carry a key or token (an HTTP error quotes its URL), so it gets the credential check
             await BUS.publish("skill.error", skill=skill.name, error=toolview.safe_speech(str(exc)))
-            log.exception("skill %s failed", skill.name)
+            log_exception(log, "skill %s failed", skill.name)
             _record_action(skill.name, args, actor=actor, status="error")
             raise
         finally:
@@ -354,7 +354,7 @@ class Executor:
                 if inverse:
                     audit.register_undo(audit_id, skill.name, inverse)
             except Exception:
-                log.exception("undo registration failed for %s", skill.name)
+                log_exception(log, "undo registration failed for %s", skill.name)
 
         await BUS.publish(
             "skill.done", skill=skill.name, speech=result.speech, ms=elapsed

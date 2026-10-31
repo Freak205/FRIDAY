@@ -41,7 +41,7 @@ from friday.decision import (
     parse_and_validate,
     scan_json_values,
 )
-from friday.log import get
+from friday.log import get, log_exception
 from friday.registry import SkillResult
 
 if TYPE_CHECKING:
@@ -1483,7 +1483,7 @@ class Orchestrator:
                     try:
                         checkpoint(observations)
                     except Exception:
-                        log.exception("orchestrator: checkpoint failed (ignored)")
+                        log_exception(log, "orchestrator: checkpoint failed (ignored)")
             if stop == "cancelled" or (cancel_check is not None and cancel_check()):
                 # Phase 28.0: a stop request that landed while the step ran (or that cut it
                 # off) ends the goal HERE -- before the step is evaluated, replanned around
@@ -1551,7 +1551,7 @@ class Orchestrator:
             try:
                 live = await provider()
             except Exception:
-                log.debug("orchestrator: live browser state unavailable", exc_info=True)
+                log_exception(log, "orchestrator: live browser state unavailable", level=10)
         return toolfamily.browser_context(goal, observations, live)
 
     async def _cancelled_result(
@@ -2436,7 +2436,7 @@ class Orchestrator:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.exception("orchestrator: tool %s raised", step.tool)
+            log_exception(log, "orchestrator: tool %s raised", step.tool)
             obs = Observation(step, False, str(exc), error=type(exc).__name__)
             return obs, "failure"
         finally:
@@ -2506,7 +2506,7 @@ class Orchestrator:
                 step.tool, step.args, dict(obs.data or {}), before, timeout_s=CFG.planner.verify_timeout_s,
             )
         except Exception:
-            log.exception("orchestrator: verification of %s failed to run (treated as unverified)", step.tool)
+            log_exception(log, "orchestrator: verification of %s failed to run (treated as unverified)", step.tool)
             v = verify.Verification(
                 verify.VerifyStatus.UNVERIFIED,
                 [verify.Check("read-back", None, detail="the verifier itself failed")], "the verifier itself failed",

@@ -23,7 +23,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from friday import auditview, notify, store
 from friday.bus import BUS
-from friday.log import get
+from friday.log import get, log_exception
 
 log = get(__name__)
 
@@ -184,7 +184,7 @@ async def run_job(job_id: int, *, actor: str = "scheduler") -> bool:
             ok = False
             break
         except Exception as exc:
-            log.exception("job '%s' action %s failed", job.name, skill_name)
+            log_exception(log, "job '%s' action %s failed", job.name, skill_name)
             results.append(f"{skill_name}: error — {exc}")
             stored.append(f"{skill_name}: error — {auditview.sanitize_error(str(exc)) or ''}")
             ok = False
@@ -276,7 +276,7 @@ class Scheduler:
                 )
                 count += 1
             except Exception:
-                log.exception("could not schedule job '%s'", job.name)
+                log_exception(log, "could not schedule job '%s'", job.name)
 
         log.info("scheduler: %d timed jobs active", count)
 

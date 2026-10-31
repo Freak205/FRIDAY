@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from friday.log import get
+from friday.log import get, log_exception
 
 log = get(__name__)
 
@@ -852,7 +852,7 @@ async def capture_before(tool: str, args: dict[str, Any], *, timeout_s: float) -
     try:
         return dict(await asyncio.wait_for(asyncio.to_thread(v.prepare, dict(args or {})), timeout=timeout_s) or {})
     except Exception as exc:  # incl. timeout — a missing baseline is "unknown", not "failed"
-        log.debug("verify: baseline for %s unavailable: %s", tool, exc)
+        log_exception(log, "verify: baseline for %s unavailable", tool, exc=exc, level=10)
         return {}
 
 
@@ -890,7 +890,7 @@ async def verify_call(
                 "the read-back timed out",
             )
         except Exception as exc:
-            log.debug("verify: check for %s raised: %s", tool, exc)
+            log_exception(log, "verify: check for %s raised", tool, exc=exc, level=10)
             return Verification(
                 VerifyStatus.UNVERIFIED, [Check("read-back", None, detail=f"the read-back failed: {type(exc).__name__}")],
                 f"the read-back failed: {type(exc).__name__}",

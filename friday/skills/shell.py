@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Annotated
 
 from friday import shellproc
-from friday.log import get
+from friday.log import get, log_exception
 from friday.registry import SkillResult, skill
 from friday.intent import GIT_RULE
 
@@ -142,7 +142,7 @@ def _stop_scope() -> tuple[str | None, Callable[[], bool] | None]:
         gid = INTEL.state.current_goal_id   # may be "" for a goal started without tracking; still THE running goal
         return str(gid), lambda: INTEL.goal_running and INTEL.state.current_goal_id == gid and INTEL.is_cancel_requested()
     except Exception:
-        log.exception("stop scope failed (non-fatal)")
+        log_exception(log, "stop scope failed (non-fatal)")
         return None, None
 
 

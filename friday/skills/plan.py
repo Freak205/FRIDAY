@@ -85,7 +85,7 @@ from typing import TYPE_CHECKING, Annotated
 
 from friday import audit, auditview, steps, toolview
 from friday.config import CFG
-from friday.log import get
+from friday.log import get, log_exception
 from friday.orchestrator import _HELD_MAX, NOT_EXECUTED_ERRORS, Orchestrator, calls_to_hold
 from friday.permissions import current_actor
 from friday.registry import REGISTRY, SkillResult, skill
@@ -507,7 +507,7 @@ def _expand_goal(
         _save_contract(resume_goal_id, contract)
         return resume_goal_id, contract, widened, f"{original}. Follow-up from the user: {text}", hint[:900]
     except Exception:
-        log.exception("plan.run: expanding the goal scope failed (non-fatal, treated as a new goal)")
+        log_exception(log, "plan.run: expanding the goal scope failed (non-fatal, treated as a new goal)")
         return None
 
 
@@ -554,7 +554,7 @@ def _start_goal(goal: str) -> str | None:
         INTEL.start_goal(goal, record.id)
         return record.id
     except Exception:
-        log.exception("plan.run: goal tracking failed to start (non-fatal)")
+        log_exception(log, "plan.run: goal tracking failed to start (non-fatal)")
         return None
 
 
@@ -569,7 +569,7 @@ def _ensure_stoppable(goal: str, goal_id: str | None) -> None:
         if not INTEL.goal_running:
             INTEL.start_goal(goal, goal_id or "")
     except Exception:
-        log.exception("plan.run: could not mark the goal running (non-fatal)")
+        log_exception(log, "plan.run: could not mark the goal running (non-fatal)")
 
 
 async def _maybe_decompose(orch: Orchestrator, goal: str, context: str) -> list["Subgoal"] | None:
@@ -591,7 +591,7 @@ async def _maybe_decompose(orch: Orchestrator, goal: str, context: str) -> list[
             goal, model=CFG.planner.model, context=context, max_subgoals=CFG.planner.max_subgoals,
         )
     except Exception:
-        log.exception("plan.run: decomposition failed (non-fatal, falling back to direct execution)")
+        log_exception(log, "plan.run: decomposition failed (non-fatal, falling back to direct execution)")
         return None
     return subgoals if len(subgoals) > 1 else None
 
@@ -602,7 +602,7 @@ def _save_subgoals(goal_id: str | None, subgoals: list["Subgoal"], *, current_in
 
         goals_mod.set_subgoals(goal_id, subgoals, current_index=max(current_index, 0))
     except Exception:
-        log.exception("plan.run: saving subgoal state failed (non-fatal)")
+        log_exception(log, "plan.run: saving subgoal state failed (non-fatal)")
 
 
 # -- Phase 17.0: Goal Contract, discovery, and clarification wiring --------
@@ -686,7 +686,7 @@ def _action_scope_for(goal_id: str | None, goal: str, contract: "GoalContract") 
             _save_contract(goal_id, contract)
         return scope
     except Exception:
-        log.exception("plan.run: deriving the action scope failed; defaulting to read-only")
+        log_exception(log, "plan.run: deriving the action scope failed; defaulting to read-only")
         return intent.GoalScope(goal, frozenset(), frozenset(), (), "error")
 
 
@@ -696,7 +696,7 @@ def _save_contract(goal_id: str | None, contract: "GoalContract") -> None:
 
         goals_mod.set_contract(goal_id, contract)
     except Exception:
-        log.exception("plan.run: saving goal contract failed (non-fatal)")
+        log_exception(log, "plan.run: saving goal contract failed (non-fatal)")
 
 
 # Phase 95: a RESUMED goal (a clarification answer, "yes, fix it") runs `run_goal` again with a fresh observation list, so the repeat
@@ -724,7 +724,7 @@ def _remember_held(goal_id: str | None, carried: list, observations: list) -> No
             while len(_HELD) > _HELD_GOALS:
                 _HELD.popitem(last=False)
     except Exception:  # noqa: BLE001 -- bookkeeping must never fail a run
-        log.exception("could not remember the held calls of goal %s", goal_id)
+        log_exception(log, "could not remember the held calls of goal %s", goal_id)
 
 
 def _resume_goal(resume_goal_id: str, clarification_answer: str) -> "tuple[str | None, GoalContract, str]":
@@ -752,7 +752,7 @@ def _resume_goal(resume_goal_id: str, clarification_answer: str) -> "tuple[str |
         _save_contract(resume_goal_id, contract)
         return resume_goal_id, contract, hint
     except Exception:
-        log.exception("plan.run: resuming goal failed (non-fatal, starting fresh)")
+        log_exception(log, "plan.run: resuming goal failed (non-fatal, starting fresh)")
         return None, GoalContract(), ""
 
 
@@ -766,7 +766,7 @@ def _await_clarification(goal_id: str | None, question: str) -> SkillResult:
         if goal_id is not None:
             goals_mod.update_status(goal_id, goals_mod.GoalStatus.BLOCKED)
     except Exception:
-        log.exception("plan.run: marking goal BLOCKED failed (non-fatal)")
+        log_exception(log, "plan.run: marking goal BLOCKED failed (non-fatal)")
     speech = question.strip() or "I need more information before I can continue — could you clarify?"
     return SkillResult(
         speech=speech, ok=False,
@@ -811,7 +811,7 @@ async def _run_discovery(
                 timeout=CFG.planner.max_discovery_time_s,
             )
     except Exception:
-        log.exception("plan.run: discovery phase failed (non-fatal, falling back to direct execution)")
+        log_exception(log, "plan.run: discovery phase failed (non-fatal, falling back to direct execution)")
         return context, contract, None
 
     if result.stopped == "clarification_required":
@@ -897,7 +897,7 @@ def _finish_discovery_only(
             )
         INTEL.end_goal(ok=ok, status=status.value)
     except Exception:
-        log.exception("plan.run: discovery-only finalization failed (non-fatal)")
+        log_exception(log, "plan.run: discovery-only finalization failed (non-fatal)")
 
     _remember_plan_entities(goal_id, result.observations)
 
@@ -944,7 +944,7 @@ def _cancel_goal(goal_id: str | None, goal: str, subgoals: list["Subgoal"] | Non
             )
         INTEL.end_goal(ok=False, status="cancelled")
     except Exception:
-        log.exception("plan.run: cancellation bookkeeping failed (non-fatal)")
+        log_exception(log, "plan.run: cancellation bookkeeping failed (non-fatal)")
     log.info("plan.run: goal %s cancelled (%d chars)", goal_id, len(goal))
 
 
@@ -958,7 +958,7 @@ def _append_working_memory(goal: str, context: str, observation: object | None) 
             return context
         return f"{context} {wm_context}".strip() if context else wm_context
     except Exception:
-        log.exception("plan.run: working-memory context failed (non-fatal)")
+        log_exception(log, "plan.run: working-memory context failed (non-fatal)")
         return context
 
 
@@ -973,7 +973,7 @@ def _append_context_memory(context: str) -> str:
             return context
         return f"{context} {ctx_block}".strip() if context else ctx_block
     except Exception:
-        log.exception("plan.run: context-memory block failed (non-fatal)")
+        log_exception(log, "plan.run: context-memory block failed (non-fatal)")
         return context
 
 
@@ -998,7 +998,7 @@ def _remember_plan_entities(goal_id: str | None, observations) -> None:
                     o.step.tool, o.step.args, o.data, goal_id=goal_id, turn_id=goal_id,
                 )
     except Exception:
-        log.exception("plan.run: context-memory recording failed (non-fatal)")
+        log_exception(log, "plan.run: context-memory recording failed (non-fatal)")
 
 
 def _append_experience(goal: str, context: str) -> str:
@@ -1013,7 +1013,7 @@ def _append_experience(goal: str, context: str) -> str:
             return context
         return f"{context}\n\n{exp_context}".strip() if context else exp_context
     except Exception:
-        log.exception("plan.run: experience context failed (non-fatal)")
+        log_exception(log, "plan.run: experience context failed (non-fatal)")
         return context
 
 
@@ -1047,7 +1047,7 @@ def _unknown_from_audit(goal_id: str | None) -> list[str]:
     try:
         return [s.tool for s in steps.ledger_for_goal(goal_id) if s.state in (steps.StepState.UNKNOWN, steps.StepState.RUNNING)]
     except Exception:
-        log.exception("plan.run: could not read the goal's steps from the audit log (non-fatal)")
+        log_exception(log, "plan.run: could not read the goal's steps from the audit log (non-fatal)")
         return []
 
 
@@ -1147,6 +1147,6 @@ def _finish_goal(
         )
         INTEL.end_goal(ok=ok, status=end_status)
     except Exception:
-        log.exception("plan.run: goal/episode finalization failed (non-fatal)")
+        log_exception(log, "plan.run: goal/episode finalization failed (non-fatal)")
 
     _remember_plan_entities(goal_id, observations)

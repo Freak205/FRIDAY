@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from friday import store
-from friday.log import get
+from friday.log import get, log_exception
 
 log = get(__name__)
 
@@ -114,7 +114,7 @@ async def undo_last(count: int = 1) -> list[str]:
         try:
             inverse = json.loads(entry["inverse"])
         except Exception:
-            log.exception("undo entry %s has malformed inverse", entry["id"])
+            log_exception(log, "undo entry %s has malformed inverse", entry["id"])
             _save(entry["id"], {"unreadable": True}, applied=-1)
             done.append(f"Couldn't reverse {entry['skill']}: its undo record is unreadable.")
             continue
@@ -133,7 +133,7 @@ async def undo_last(count: int = 1) -> list[str]:
                 # actor="undo" so reversals are distinguishable in the audit log.
                 result = await EXECUTOR.run(step["skill"], step.get("args", {}), actor="undo")
             except Exception as exc:
-                log.exception("failed to undo %s", entry["skill"])
+                log_exception(log, "failed to undo %s", entry["skill"])
                 failure = str(exc)
                 break
             if result.data.get("confirmation_declined"):
