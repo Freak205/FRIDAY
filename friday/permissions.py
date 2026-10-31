@@ -55,24 +55,62 @@ class PermissionError_(Exception):
     """Raised when a call is refused by policy."""
 
 
+def _check_failed(result: SkillResult) -> SkillResult:
+    """The credential check every FAILED result gets before anything reads it (the one `Executor.run` and `_record_late_outcome`
+    share, so the two cannot drift apart). Phase 61: a FAILURE reply is an error message, not content the user asked to read back,
+    and skills build it from library exceptions ("I couldn't fetch it: HTTP 401 for https://...?api_key=..."); it gets the
+    credential check once, here. A successful reply is left alone: "what's in my clipboard" is exactly what the user asked to hear.
+    Phase 64: the same for the structured part -- callers return `data` to API clients as is. A copy with the strings
+    credential-checked; keys, flags, numbers and ids (a recovery token, `confirmation_declined`) are untouched.
+    Phase 97: if the check itself fails, the original is never kept (`safe_speech` already withholds; `data` is dropped)."""
+    if result.ok:
+        return result
+    try:
+        result.speech = toolview.safe_speech(result.speech)
+    except Exception:  # noqa: BLE001 -- `safe_speech` never raises; if it somehow does, the text is withheld, not kept
+        result.speech = toolview.WITHHELD
+    if result.data:
+        try:
+            result.data = auditview.scrub_tree(result.data)
+        except Exception:  # noqa: BLE001 -- unchecked data must not be handed on; `scrub_tree` itself never raises
+            result.data = {}
+    return result
+
+
+# Phase 97: stands in for the text of an exception that cannot be turned into text at all (a broken `__str__`).
+LATE_ERROR_UNREADABLE = "the worker ended with an error whose message could not be read safely"
+
+
+def _late_error_text(exc: BaseException) -> str:
+    """The text of an abandoned worker's exception, credential-checked like the exception text `Executor.run` publishes
+    (`safe_speech`); a message that cannot be read, or checked, is replaced, never kept as it was."""
+    try:
+        return toolview.safe_speech(str(exc))
+    except Exception:  # noqa: BLE001
+        return LATE_ERROR_UNREADABLE
+
+
 def _record_late_outcome(audit_id: int, skill_name: str, fut: Any, started: float) -> None:
     """Phase 53: the worker thread of an abandoned step has now ended (`registry.Detach`): write its real outcome over the
     "outcome unknown" marker of its audit row. Runs in that thread, once. Records the outcome only -- no undo entry is
     registered (the run that would have reported the result is long gone, and an inverse nobody was told about is a surprise),
-    nothing is retried, and a row that has meanwhile been given any other text is still just overwritten with the truth."""
+    nothing is retried, and a row that has meanwhile been given any other text is still just overwritten with the truth.
+
+    Phase 97: the audit row is the ONLY place a late result goes (no event, no memory, no log of its content). What reaches it has
+    had the same checks as at the end of `Executor.run`: a failed result's speech and data (`_check_failed`), an exception's text
+    (`safe_speech`), and then the audit's own storage rules (`audit.complete`: omitted-argument echoes, bounds, the shell's
+    read-back rule). The outcome is classified from the result as the worker returned it, never from the checked copy."""
     try:
         if fut.cancelled():
             return
         elapsed = int((time.perf_counter() - started) * 1000)
         exc = fut.exception()
         if exc is not None:
-            audit.complete(audit_id, ok=False, error=str(exc), duration_ms=elapsed, outcome=audit.FAILURE)
+            audit.complete(audit_id, ok=False, error=_late_error_text(exc), duration_ms=elapsed, outcome=audit.FAILURE)
         else:
             result = SkillResult.coerce(fut.result())
-            audit.complete(
-                audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed,
-                outcome=audit.outcome_of_result(skill_name, result.ok, result.data),
-            )
+            outcome = audit.outcome_of_result(skill_name, result.ok, result.data)
+            audit.complete(audit_id, ok=result.ok, result=_check_failed(result).speech, duration_ms=elapsed, outcome=outcome)
         log.info("late outcome recorded for %s (audit %d)", skill_name, audit_id)
     except Exception:
         log.exception("could not record the late outcome of %s (audit %d)", skill_name, audit_id)
@@ -291,22 +329,14 @@ class Executor:
             audit.reset_context(_CURRENT_ACTOR, actor_token)
 
         elapsed = int((time.perf_counter() - started) * 1000)
-        if not result.ok:
-            # Phase 61: a FAILURE reply is an error message, not content the user asked to read back, and skills build it from
-            # library exceptions ("I couldn't fetch it: HTTP 401 for https://...?api_key=..."). Every direct caller (GUI, voice,
-            # /say, /invoke, the event stream, plan steps) receives it from here, so it gets the credential check once, here.
-            # A successful reply is left alone: "what's in my clipboard" is exactly what the user asked to hear.
-            result.speech = toolview.safe_speech(result.speech)
-            if result.data:
-                # Phase 64: the same for the structured part -- callers return `data` to API clients as is. A copy with the
-                # strings credential-checked; keys, flags, numbers and ids (a recovery token, `confirmation_declined`) are untouched.
-                result.data = auditview.scrub_tree(result.data)
+        # Phase 61/64: every direct caller (GUI, voice, /say, /invoke, the event stream, plan steps) receives a failed result from
+        # here, so it gets the credential check once, here (see `_check_failed`, which the late-outcome path shares).
         # Phase 94: the explicit outcome (a shell command that was never started / ended unknown / timed out / was cancelled is
-        # not just "ok=False"); an unknown outcome keeps `ok` NULL in the row -- see `audit.complete`.
-        audit.complete(
-            audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed,
-            outcome=audit.NOT_STARTED if refused else audit.outcome_of_result(skill.name, result.ok, result.data),
-        )
+        # not just "ok=False"); an unknown outcome keeps `ok` NULL in the row -- see `audit.complete`. Phase 97: read from the
+        # result as the skill returned it, before the credential check can touch its data (as the late-outcome path does).
+        outcome = audit.NOT_STARTED if refused else audit.outcome_of_result(skill.name, result.ok, result.data)
+        _check_failed(result)
+        audit.complete(audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed, outcome=outcome)
         _record_action(
             skill.name, args, actor=actor, status="success" if result.ok else "failed",
         )
