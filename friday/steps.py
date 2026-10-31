@@ -210,6 +210,12 @@ def classify(obs: Any) -> StepState | None:
     if error == "timeout":
         # a read that ran out of time changed nothing; anything that can change state may still do so
         return StepState.UNKNOWN if _changes_state(obs.step.tool, obs.step.args) else StepState.FAILED
+    # Phase 94: a call whose own outcome is unknown (a shell command stopped or timed out without the process tree confirmed gone)
+    # is UNKNOWN live, as its audit row now says after a restart -- not a failure nobody established.
+    from friday import audit
+
+    if audit.outcome_of_result(obs.step.tool, bool(obs.ok), getattr(obs, "data", None)) == audit.UNKNOWN_OUTCOME:
+        return StepState.UNKNOWN
     if obs.ok:
         v = getattr(obs, "verification", None)
         status = getattr(getattr(v, "status", None), "value", None)

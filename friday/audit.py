@@ -118,6 +118,34 @@ def record(
     return audit_id
 
 
+# Phase 94: the explicit execution outcome stored in `audit.outcome`. One fixed word per row, never free text (so it needs no
+# redaction); NULL means "not classified" and is read exactly as before Phase 94 -- nothing is back-filled or inferred.
+SUCCESS = "success"
+FAILURE = "failure"                # the skill ran and said it did not succeed
+NOT_STARTED = "not_started"        # the command was never started (friday.shellproc could not own its process tree first)
+UNKNOWN_OUTCOME = "unknown_outcome"  # stopped or timed out, the process tree not confirmed gone: it MAY have run -- neither done nor failed
+TIMEOUT = "timeout"                # the time limit ran out and the process tree was confirmed gone
+CANCELLED = "cancelled"            # a stop request ended it and the process tree was confirmed gone
+OUTCOMES = frozenset({SUCCESS, FAILURE, NOT_STARTED, UNKNOWN_OUTCOME, TIMEOUT, CANCELLED})
+
+# Where the execution layer itself establishes more than ok/not ok: a skill's own `data["status"]`, accepted only for the skills
+# that define these words (friday.skills.shell). Any other skill's `status` is its own business and never becomes an outcome.
+_STATUS_OUTCOMES: dict[str, frozenset[str]] = {
+    "shell.run": frozenset({NOT_STARTED, UNKNOWN_OUTCOME, TIMEOUT, CANCELLED}),
+}
+
+
+def outcome_of_result(skill: str, ok: bool, data: dict[str, Any] | None) -> str:
+    """The outcome of a skill call that RETURNED a result: success when `ok`; else the skill's own established status
+    (`_STATUS_OUTCOMES`), else a plain failure."""
+    if ok:
+        return SUCCESS
+    status = (data or {}).get("status") if isinstance(data, dict) else None
+    if isinstance(status, str) and status in _STATUS_OUTCOMES.get(skill, ()):
+        return status
+    return FAILURE
+
+
 def complete(
     audit_id: int,
     *,
@@ -125,18 +153,24 @@ def complete(
     result: str | None = None,
     error: str | None = None,
     duration_ms: int | None = None,
+    outcome: str | None = None,
 ) -> None:
-    """Fill in the outcome once the skill has run. `ok` is the skill's own verdict, passed through untouched;
-    only the free text (what it said, what went wrong) is minimised before it is stored."""
+    """Fill in the outcome once the skill has run. `ok` is the skill's own verdict, passed through untouched --
+    except for an `unknown_outcome`: that is neither done nor failed, so `ok` stays NULL, as for every other unknown (Phase 48/53).
+    `outcome` is one of `OUTCOMES` (anything else is stored as NULL = not classified); it always replaces what the row had, so a
+    real outcome written later overwrites an "unknown" marker. Only the free text (what it said, what went wrong) is minimised."""
     c = store.conn()
     row = c.execute("SELECT skill FROM audit WHERE id=?", (audit_id,)).fetchone()
     skill = row["skill"] if row is not None else ""
     with _echo_lock:
         echoes = _echo.pop(audit_id, [])
+    if outcome is not None and outcome not in OUTCOMES:
+        log.warning("audit: %r is not an execution outcome; storing the row unclassified", outcome)
+        outcome = None
     c.execute(
-        "UPDATE audit SET ok=?, result=?, error=?, duration_ms=? WHERE id=?",
-        (1 if ok else 0, auditview.sanitize_result(skill, result, echoes), auditview.sanitize_error(error, echoes),
-         duration_ms, audit_id),
+        "UPDATE audit SET ok=?, result=?, error=?, duration_ms=?, outcome=? WHERE id=?",
+        (None if outcome == UNKNOWN_OUTCOME else (1 if ok else 0), auditview.sanitize_result(skill, result, echoes),
+         auditview.sanitize_error(error, echoes), duration_ms, outcome, audit_id),
     )
     c.commit()
 
@@ -247,9 +281,9 @@ def mark_outcome_unknown(audit_id: int, *, detached: bool = False) -> bool:
     ran (denied / blocked), so it is safe to repeat; a real `complete` that arrives later simply replaces the marker."""
     c = store.conn()
     cur = c.execute(
-        "UPDATE audit SET error=? WHERE id=? AND ok IS NULL AND result IS NULL AND error IS NULL "
+        "UPDATE audit SET error=?, outcome=? WHERE id=? AND ok IS NULL AND result IS NULL AND error IS NULL "
         "AND decision IN ('auto','confirmed')",
-        (OUTCOME_UNKNOWN_DETACHED if detached else OUTCOME_UNKNOWN, audit_id),
+        (OUTCOME_UNKNOWN_DETACHED if detached else OUTCOME_UNKNOWN, UNKNOWN_OUTCOME, audit_id),
     )
     c.commit()
     return cur.rowcount > 0
@@ -270,13 +304,18 @@ def status_of(row: dict[str, Any]) -> str:
 
     - ``denied`` / ``blocked`` -- the decision; the skill never ran (``ok`` stays NULL);
     - ``succeeded`` / ``failed`` -- the skill's own verdict (``ok`` 1 / 0), exactly as recorded;
-    - ``outcome_unknown`` -- it started and was still running when FRIDAY closed (the Phase 48 marker, matched exactly);
+    - ``outcome_unknown`` -- it started and its outcome is not known: it was still running when FRIDAY closed (the Phase 48 marker,
+      matched exactly), or (Phase 94) its stored `outcome` is ``unknown_outcome``;
     - ``interrupted`` -- it started in an earlier process that ended without recording it (the Phase 51/52 marker);
     - ``unfinished`` -- it started and nothing has been recorded for it (yet).
-    A missing result is never read as success or failure."""
+    A missing result is never read as success or failure. A stored ``not_started`` / ``timeout`` / ``cancelled`` outcome is a
+    definite end that did not succeed, so it reads as ``failed`` here (the word is for older readers); the distinction itself
+    is the row's `outcome`. A row without an `outcome` (every older row) is read exactly as before."""
     decision = row.get("decision")
     if decision in ("denied", "blocked"):
         return decision
+    if row.get("outcome") == UNKNOWN_OUTCOME:
+        return "outcome_unknown"
     ok = row.get("ok")
     if ok is not None:
         return "succeeded" if ok else "failed"

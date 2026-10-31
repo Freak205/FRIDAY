@@ -66,10 +66,13 @@ def _record_late_outcome(audit_id: int, skill_name: str, fut: Any, started: floa
         elapsed = int((time.perf_counter() - started) * 1000)
         exc = fut.exception()
         if exc is not None:
-            audit.complete(audit_id, ok=False, error=str(exc), duration_ms=elapsed)
+            audit.complete(audit_id, ok=False, error=str(exc), duration_ms=elapsed, outcome=audit.FAILURE)
         else:
             result = SkillResult.coerce(fut.result())
-            audit.complete(audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed)
+            audit.complete(
+                audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed,
+                outcome=audit.outcome_of_result(skill_name, result.ok, result.data),
+            )
         log.info("late outcome recorded for %s (audit %d)", skill_name, audit_id)
     except Exception:
         log.exception("could not record the late outcome of %s (audit %d)", skill_name, audit_id)
@@ -259,7 +262,7 @@ class Executor:
             raise
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
-            audit.complete(audit_id, ok=False, error=str(exc), duration_ms=elapsed)
+            audit.complete(audit_id, ok=False, error=str(exc), duration_ms=elapsed, outcome=audit.FAILURE)
             # Phase 61: the event goes to every bus consumer (GUI, every websocket client); an exception message is library text the
             # user never asked to hear and may carry a key or token (an HTTP error quotes its URL), so it gets the credential check
             await BUS.publish("skill.error", skill=skill.name, error=toolview.safe_speech(str(exc)))
@@ -282,8 +285,11 @@ class Executor:
                 # Phase 64: the same for the structured part -- callers return `data` to API clients as is. A copy with the
                 # strings credential-checked; keys, flags, numbers and ids (a recovery token, `confirmation_declined`) are untouched.
                 result.data = auditview.scrub_tree(result.data)
+        # Phase 94: the explicit outcome (a shell command that was never started / ended unknown / timed out / was cancelled is
+        # not just "ok=False"); an unknown outcome keeps `ok` NULL in the row -- see `audit.complete`.
         audit.complete(
-            audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed
+            audit_id, ok=result.ok, result=result.speech, duration_ms=elapsed,
+            outcome=audit.outcome_of_result(skill.name, result.ok, result.data),
         )
         _record_action(
             skill.name, args, actor=actor, status="success" if result.ok else "failed",

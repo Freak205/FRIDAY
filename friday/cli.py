@@ -491,6 +491,8 @@ def _audit_table(limit: int) -> None:
             ok, text = "[yellow]?[/yellow]", "outcome unknown: FRIDAY closed while it ran"
         elif audit.is_interrupted(r):  # Phase 51
             ok, text = "[yellow]?[/yellow]", "interrupted: ended before an outcome was recorded"
+        elif r.get("outcome") == audit.UNKNOWN_OUTCOME:  # Phase 94: it ended, but whether it took effect is not known
+            ok, text = "[yellow]?[/yellow]", "outcome unknown: it may have taken effect"
         table.add_row(
             r["at"][:19].replace("T", " "),
             r["skill"],

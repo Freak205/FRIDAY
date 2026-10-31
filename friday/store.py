@@ -191,6 +191,9 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     # Phase 54: the checkpointed step progress of a goal (friday.steps): states, audit-row references, verification
     # verdicts. JSON; NULL = none recorded (every older goal). Holds no arguments, results or content.
     ("goals", "progress", "ALTER TABLE goals ADD COLUMN progress TEXT"),
+    # Phase 94: the explicit execution outcome of an action (friday.audit.OUTCOMES: one fixed word, never free text). NULL = not
+    # classified -- every older row, and any path that cannot establish one; such a row is read exactly as before (`audit.status_of`).
+    ("audit", "outcome", "ALTER TABLE audit ADD COLUMN outcome TEXT"),
 ]
 
 # Applied after the column migrations (an index on a column an old database does not have yet would fail before them).
